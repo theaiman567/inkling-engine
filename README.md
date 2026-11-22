@@ -47,7 +47,7 @@ Before installing, check where InkEngine shines — and where you are better off
 
 ### 1. Clone the Repository
 ```cmd
-git clone https://github.com/<your-username>/inkling-engine.git
+git clone https://github.com/theaiman567/inkling-engine.git
 cd inkling-engine
 ```
 
