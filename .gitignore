@@ -1,0 +1,23 @@
+# Compiled binaries & build artifacts
+build/
+*.obj
+*.exe
+*.pdb
+*.ilk
+
+# Runtime logs & swap / KV checkpoints
+logs/
+*.log
+*.ckpt
+*.bin
+
+# Model weights & third-party predictor checkpoints (download from Hugging Face)
+*.gguf
+models/*.moepred
+models/checks/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.vs/
