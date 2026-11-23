@@ -308,6 +308,28 @@ bool send_all(SOCKET sock, const std::string& data) {
     return true;
 }
 
+// Non-blocking <1 us Winsock check: immediately detects TCP FIN/RST if client aborted or timed out!
+bool is_client_alive(SOCKET sock) {
+    fd_set rfds, efds;
+    FD_ZERO(&rfds);
+    FD_ZERO(&efds);
+    FD_SET(sock, &rfds);
+    FD_SET(sock, &efds);
+    timeval tv{0, 0};
+    int rc = select(0, &rfds, nullptr, &efds, &tv);
+    if (rc < 0) return false;
+    if (rc > 0) {
+        if (FD_ISSET(sock, &efds)) return false;
+        if (FD_ISSET(sock, &rfds)) {
+            char b = 0;
+            int r = recv(sock, &b, 1, MSG_PEEK);
+            if (r == 0) return false; // Peer cleanly closed TCP connection (FIN)
+            if (r == SOCKET_ERROR && WSAGetLastError() != WSAEWOULDBLOCK) return false;
+        }
+    }
+    return true;
+}
+
 void send_json(SOCKET sock, int code, const std::string& json_body) {
     std::ostringstream oss;
     oss << "HTTP/1.1 " << code << (code == 200 ? " OK" : (code == 400 ? " Bad Request" : " Error")) << "\r\n"
@@ -643,14 +665,20 @@ bool OpenAIServer::run() {
                 include_usage = so->get_bool("include_usage", false);
             }
 
+            // Official Inkling-2-Mini recommended defaults: temp=1.0, top_p=1.0, top_k=0, min_p=0.0
             SamplingParams sp;
-            sp.temperature = (float)root.get_num("temperature", 0.6);
-            sp.top_p       = (float)root.get_num("top_p", 0.95);
-            sp.top_k       = (int)root.get_num("top_k", 40);
-            sp.min_p       = (float)root.get_num("min_p", 0.05);
+            sp.temperature = (float)root.get_num("temperature", 1.0);
+            sp.top_p       = (float)root.get_num("top_p", 1.0);
+            sp.top_k       = (int)root.get_num("top_k", 0);
+            sp.min_p       = (float)root.get_num("min_p", 0.0);
             int max_tok    = (int)root.get_num("max_completion_tokens", root.get_num("max_tokens", 4096));
             sp.max_tokens  = std::max(1, std::min(max_tok, 32768));
-            sp.seed        = (uint64_t)root.get_num("seed", (double)(42 + req_counter.load()));
+            uint64_t def_seed = (uint64_t)std::chrono::high_resolution_clock::now().time_since_epoch().count()
+                                ^ (0x9E3779B97F4A7C15ULL * (req_counter.load() + 1));
+            if (def_seed == 0) def_seed = 42;
+            sp.seed        = (root.get("seed") && root.get("seed")->is_num())
+                                ? (uint64_t)root.get_num("seed", (double)def_seed)
+                                : def_seed;
 
             std::string effort = root.get_str("reasoning_effort", default_effort_);
             std::string tools_json;
@@ -744,6 +772,15 @@ bool OpenAIServer::run() {
                 client_alive = send_all(cli, ev.str());
             };
 
+            // Real OpenAI SSE data-event heartbeat: resets client SSE chunkTimeout AND detects FIN/RST in <1 us!
+            auto emit_sse_heartbeat = [&]() {
+                if (!client_alive) return;
+                if (!is_client_alive(cli)) { client_alive = false; return; }
+                if (!stream) return;
+                if (is_chat) emit_sse_delta("{}");
+                else         client_alive = send_all(cli, ": keepalive\n\n");
+            };
+
             auto flush_tool_call = [&]() {
                 std::string tname, targs;
                 if (parse_inkling_tool_invocation(tool_buf, header_buf, tname, targs)) {
@@ -765,15 +802,23 @@ bool OpenAIServer::run() {
                 header_buf.clear();
             };
 
-            std::printf("[HTTP] Incoming %s (id=%llu): prompt=%zu tok (full_sys=%d, static=%d, tools=%d) | stream=%d | effort=%s | has_tools=%d\n",
+            std::printf("[HTTP] Incoming %s (id=%llu): prompt=%zu tok (full_sys=%d, static=%d, tools=%d) | stream=%d | effort=%s | has_tools=%d | T=%.2f p=%.2f k=%d mp=%.2f\n",
                         path.c_str(), (unsigned long long)rid, prompt_ids.size(), full_sys_prefix_tokens, static_prefix_tokens, tools_prefix_tokens,
-                        stream ? 1 : 0, effort.c_str(), tools_json.empty() ? 0 : 1);
+                        stream ? 1 : 0, effort.c_str(), tools_json.empty() ? 0 : 1,
+                        sp.temperature, sp.top_p, sp.top_k, sp.min_p);
             std::fflush(stdout);
+
+            int silent_toks = 0;
+            int poll_toks = 0;
 
             auto res = engine_.generate(
                 prompt_ids, sp,
                 [&](int32_t tok_id, const std::string& piece) -> bool {
                     if (!client_alive) return false;
+                    if ((++poll_toks & 7) == 0 && !is_client_alive(cli)) {
+                        client_alive = false;
+                        return false;
+                    }
                     if (!is_chat) {
                         full_text += piece;
                         if (stream && !piece.empty()) emit_sse_delta("\"" + json_escape(piece) + "\"");
@@ -796,34 +841,44 @@ bool OpenAIServer::run() {
                     if (tok_id == id_tjson) {
                         st = ST_TOOL_JSON;
                         tool_buf.clear();
-                        return true;
+                        silent_toks = 0;
+                        emit_sse_heartbeat();
+                        return client_alive;
                     }
                     if (tok_id == id_ttext) {
                         st = ST_TOOL_TEXT;
                         tool_buf.clear();
-                        return true;
+                        silent_toks = 0;
+                        emit_sse_heartbeat();
+                        return client_alive;
                     }
                     if (tok_id == id_endm) {
                         if (st == ST_TOOL_JSON || st == ST_TOOL_TEXT) {
                             flush_tool_call();
+                            silent_toks = 0;
                         }
                         st = ST_HEADER;
                         header_buf.clear();
-                        return true;
+                        return client_alive;
                     }
 
-                    if (piece.empty()) return true;
+                    if (piece.empty()) return client_alive;
 
                     if (st == ST_HEADER) {
                         header_buf += piece;
+                        if (++silent_toks >= 16) { silent_toks = 0; emit_sse_heartbeat(); }
                     } else if (st == ST_THINKING) {
                         full_reasoning += piece;
+                        silent_toks = 0;
                         emit_sse_delta("{\"reasoning_content\":\"" + json_escape(piece) + "\"}");
                     } else if (st == ST_TEXT) {
                         full_text += piece;
+                        silent_toks = 0;
                         emit_sse_delta("{\"content\":\"" + json_escape(piece) + "\"}");
                     } else if (st == ST_TOOL_JSON || st == ST_TOOL_TEXT) {
                         tool_buf += piece;
+                        // Keep SSE stream alive while buffering large file writes/edits (~every 0.7s)!
+                        if (++silent_toks >= 16) { silent_toks = 0; emit_sse_heartbeat(); }
                     }
                     return client_alive;
                 },
@@ -831,8 +886,12 @@ bool OpenAIServer::run() {
                 true,  // reuse_kv_prefix (incremental KV + full Global/SWA/ShortConv RAM checkpoint!)
                 static_prefix_tokens,
                 [&](int done, int total) -> bool {
-                    if (stream && client_alive) {
-                        client_alive = send_all(cli, ": keepalive\n\n");
+                    emit_sse_heartbeat();
+                    if (!client_alive) {
+                        std::printf("[HTTP] Client disconnected mid-prefill (id=%llu at %d/%d tokens) - aborting immediately\n",
+                                    (unsigned long long)rid, done, total);
+                        std::fflush(stdout);
+                        return false;
                     }
                     if (total >= 256 && ((done % 256) == 0 || done == total)) {
                         std::printf("[HTTP] Prefill id=%llu: %d / %d tokens\n", (unsigned long long)rid, done, total);
@@ -843,11 +902,13 @@ bool OpenAIServer::run() {
                 tools_prefix_tokens,
                 full_sys_prefix_tokens);
 
-            if ((st == ST_TOOL_JSON || st == ST_TOOL_TEXT) && !tool_buf.empty()) {
+            if (client_alive && (st == ST_TOOL_JSON || st == ST_TOOL_TEXT) && !tool_buf.empty()) {
                 flush_tool_call();
             }
 
-            std::string finish_reason = !emitted_tools.empty() ? "tool_calls" : "stop";
+            std::string finish_reason = !emitted_tools.empty()
+                ? "tool_calls"
+                : (res.gen_tokens >= sp.max_tokens ? "length" : "stop");
             double tps = res.decode_ms > 0 ? (res.gen_tokens * 1000.0 / res.decode_ms) : 0.0;
             int new_prompt = res.prompt_tokens - res.cached_tokens;
             double ptps = (res.prefill_ms > 0 && new_prompt > 0) ? (new_prompt * 1000.0 / res.prefill_ms) : 0.0;
@@ -869,14 +930,16 @@ bool OpenAIServer::run() {
                         done << "data: [DONE]\n\n";
                     } else {
                         done << "data: {\"id\":\"" << chat_id << "\",\"object\":\"text_completion\",\"created\":" << created
-                             << ",\"model\":\"Inkling-2-Mini\",\"choices\":[{\"index\":0,\"text\":\"\",\"finish_reason\":\"stop\"}]}\n\n"
+                             << ",\"model\":\"Inkling-2-Mini\",\"choices\":[{\"index\":0,\"text\":\"\",\"finish_reason\":\""
+                             << finish_reason << "\"}]}\n\n"
                              << "data: [DONE]\n\n";
                     }
                     send_all(cli, done.str());
                 }
-                std::printf("[HTTP] %s stream: prompt=%d (cached=%d, new=%d @ %.1f tok/s) | gen=%d (%.2f tok/s) | spec=%d/%d | tools=%zu\n",
+                std::printf("[HTTP] %s stream: prompt=%d (cached=%d, new=%d @ %.1f tok/s) | gen=%d (%.2f tok/s) | spec=%d/%d | tools=%zu%s\n",
                             path.c_str(), res.prompt_tokens, res.cached_tokens, new_prompt, ptps,
-                            res.gen_tokens, tps, res.spec_accepted, res.spec_drafted, emitted_tools.size());
+                            res.gen_tokens, tps, res.spec_accepted, res.spec_drafted, emitted_tools.size(),
+                            client_alive ? "" : " | ABORTED(client_closed)");
                 std::fflush(stdout);
             } else {
                 std::ostringstream j;

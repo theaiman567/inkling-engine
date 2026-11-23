@@ -220,6 +220,7 @@ void HybridPagedKV::reset() {
     next_ssd_slot_ = 0;
     cur_pos_ = 0;
     clock_ = 0;
+    reset_epoch_++;
 }
 
 void HybridPagedKV::reset_counters() {
@@ -356,6 +357,73 @@ bool HybridPagedKV::restore_checkpoint(const KVCheckpoint& ckpt, cudaStream_t st
     return true;
 }
 
+void HybridPagedKV::save_turn_snapshot(TurnRewindSnapshot& snap, int pos, cudaStream_t stream) {
+    if (pos <= 0 || (pos % INK_PAGE_TOKENS) != 0) return;
+    int n_pages = pos / INK_PAGE_TOKENS;
+    for (int g = 0; g < n_glob_layers_; ++g) {
+        if (glob_num_pages_[g] < n_pages) return;
+    }
+
+    INK_CUDA_CHECK(cudaStreamSynchronize(stream));
+    snap.pos = pos;
+    snap.epoch = reset_epoch_;
+
+    size_t conv_n = (size_t)n_layers_ * conv_layer_floats_;
+    snap.conv_state.resize(conv_n);
+    INK_CUDA_CHECK(cudaMemcpy(snap.conv_state.data(), d_conv_state_, conv_n * sizeof(float), cudaMemcpyDeviceToHost));
+
+    size_t swa_bytes = (size_t)n_swa_layers_ * (size_t)swa_window_ * tok_k_bytes_;
+    snap.swa_k.resize(swa_bytes);
+    snap.swa_v.resize(swa_bytes);
+    INK_CUDA_CHECK(cudaMemcpy(snap.swa_k.data(), d_swa_k_, swa_bytes, cudaMemcpyDeviceToHost));
+    INK_CUDA_CHECK(cudaMemcpy(snap.swa_v.data(), d_swa_v_, swa_bytes, cudaMemcpyDeviceToHost));
+
+    size_t spos_n = (size_t)n_swa_layers_ * (size_t)swa_window_;
+    snap.swa_pos.resize(spos_n);
+    INK_CUDA_CHECK(cudaMemcpy(snap.swa_pos.data(), d_swa_pos_, spos_n * sizeof(int32_t), cudaMemcpyDeviceToHost));
+    snap.swa_counts = swa_counts_;
+}
+
+bool HybridPagedKV::rewind_to_turn_snapshot(const TurnRewindSnapshot& snap, cudaStream_t stream) {
+    if (snap.pos <= 0 || (snap.pos % INK_PAGE_TOKENS) != 0 || snap.epoch != reset_epoch_ ||
+        cur_pos_ < snap.pos || snap.conv_state.empty()) {
+        return false;
+    }
+    int snap_pages = snap.pos / INK_PAGE_TOKENS;
+    for (int g = 0; g < n_glob_layers_; ++g) {
+        if (glob_num_pages_[g] < snap_pages) return false;
+    }
+
+    INK_CUDA_CHECK(cudaStreamSynchronize(stream));
+    INK_CUDA_CHECK(cudaMemcpyAsync(d_conv_state_, snap.conv_state.data(), snap.conv_state.size() * sizeof(float), cudaMemcpyHostToDevice, stream));
+    INK_CUDA_CHECK(cudaMemcpyAsync(d_swa_k_,      snap.swa_k.data(),      snap.swa_k.size(), cudaMemcpyHostToDevice, stream));
+    INK_CUDA_CHECK(cudaMemcpyAsync(d_swa_v_,      snap.swa_v.data(),      snap.swa_v.size(), cudaMemcpyHostToDevice, stream));
+    INK_CUDA_CHECK(cudaMemcpyAsync(d_swa_pos_,    snap.swa_pos.data(),    snap.swa_pos.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    swa_counts_ = snap.swa_counts;
+
+    // Free only pages strictly beyond `snap_pages` — pages [0..snap_pages) remain 100% intact across VRAM/RAM/SSD!
+    for (int g = 0; g < n_glob_layers_; ++g) {
+        int cur_np = glob_num_pages_[g];
+        for (int p = snap_pages; p < cur_np; ++p) {
+            PageMeta& pm = pages_[g][p];
+            if (pm.tier == TIER_VRAM && pm.slot >= 0 && pm.slot < vram_page_cap_) {
+                if (vram_owner_[pm.slot].first == g && vram_owner_[pm.slot].second == p) {
+                    vram_owner_[pm.slot] = {-1, -1};
+                }
+            } else if (pm.tier == TIER_RAM && pm.slot >= 0 && pm.slot < ram_page_cap_) {
+                if (ram_owner_[pm.slot].first == g && ram_owner_[pm.slot].second == p) {
+                    ram_owner_[pm.slot] = {-1, -1};
+                }
+            }
+            pm = PageMeta{};
+        }
+        glob_num_pages_[g] = snap_pages;
+    }
+    cur_pos_ = snap.pos;
+    INK_CUDA_CHECK(cudaStreamSynchronize(stream));
+    return true;
+}
+
 namespace {
 struct DiskCkptHeader {
     uint32_t magic;       // 'KCK1' = 0x314B434B
@@ -397,7 +465,7 @@ bool HybridPagedKV::save_checkpoint_disk(const KVCheckpoint& ckpt, const std::st
 
     DiskCkptHeader hdr{};
     hdr.magic         = 0x314B434Bu;
-    hdr.version       = 1u;
+    hdr.version       = 2u; // v2: exact unbiased Q4_0 KV rounding (+8.0f with __float2int_rn)
     hdr.model_sig     = model_sig;
     hdr.pos           = ckpt.pos;
     hdr.glob_n_pages  = ckpt.glob_n_pages;
@@ -451,7 +519,7 @@ bool HybridPagedKV::load_checkpoint_disk(KVCheckpoint& ckpt, const std::string& 
     size_t expected_swa  = (size_t)n_swa_layers_ * (size_t)swa_window_ * tok_k_bytes_;
     size_t expected_glob = (size_t)n_glob_layers_ * (size_t)hdr.glob_n_pages * page_full_bytes_;
 
-    if (hdr.magic != 0x314B434Bu || hdr.version != 1u ||
+    if (hdr.magic != 0x314B434Bu || hdr.version != 2u ||
         hdr.model_sig != model_sig || hdr.pos != expect_pos ||
         hdr.kv_mode != (int32_t)kv_mode_ || hdr.n_swa_layers != n_swa_layers_ ||
         hdr.n_glob_layers != n_glob_layers_ || hdr.swa_window != swa_window_ ||

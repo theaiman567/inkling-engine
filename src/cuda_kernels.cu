@@ -1444,7 +1444,7 @@ __device__ __forceinline__ void quant_block32_q4_0(const float* src, uint8_t* ds
     }
     float d = signed_max / -8.0f;
     float id = (d != 0.0f) ? (1.0f / d) : 0.0f;
-    int q = __float2int_rn(v * id + 8.5f);
+    int q = __float2int_rn(v * id + 8.0f);
     q = max(0, min(15, q));
     int q_hi = __shfl_down_sync(0xFFFFFFFFu, q, 16);
     if (lane == 0) {

@@ -42,10 +42,10 @@ struct EngineConfig {
 };
 
 struct SamplingParams {
-    float temperature = 0.0f;  // 0.0 = greedy argmax
-    int   top_k = 40;
-    float top_p = 0.95f;
-    float min_p = 0.05f;
+    float temperature = 0.0f;  // 0.0 = greedy argmax (CLI); HTTP server defaults to official 1.0
+    int   top_k = 0;
+    float top_p = 1.0f;
+    float min_p = 0.0f;
     int   max_tokens = 256;
     uint64_t seed = 42;
 };
@@ -311,6 +311,7 @@ private:
     KVCheckpoint full_sys_ckpt_;     // tier-1 RAM checkpoint at end of ALL system msgs (~99% prompt hit!)
     KVCheckpoint prefix_ckpt_;       // tier-2 RAM checkpoint before dynamic <env> (~80% fallback!)
     KVCheckpoint tools_ckpt_;        // tier-3 RAM checkpoint at tool_declare boundary (survives agent switches!)
+    TurnRewindSnapshot turn_snap_;   // ~49 MiB zero-Global-copy in-place rewind snapshot (~4 ms retry recovery!)
     uint64_t     model_sig_ = 0;     // 64-bit model+hparams fingerprint for persistent NVMe KV cache
     std::string  kv_cache_dir_;      // NVMe directory for persistent KV checkpoints
 

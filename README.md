@@ -124,7 +124,10 @@ build\inkengine.exe --model "C:\path\to\Inkling-2-Mini-UD-IQ3_XXS.gguf" --ctx 65
          "npm": "@ai-sdk/openai-compatible",
          "options": {
            "baseURL": "http://127.0.0.1:8787/v1",
-           "apiKey": "inkengine-local"
+           "apiKey": "inkengine-local",
+           "timeout": false,
+           "headerTimeout": false,
+           "chunkTimeout": false
          },
          "models": {
            "Inkling-2-Mini": {
