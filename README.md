@@ -1,4 +1,4 @@
-# InkEngine v3.0
+# InkEngine v3.1
 
 **A standalone C++17 / CUDA / AVX2 3-tier (VRAM → RAM → SSD) serving engine built from scratch for [Inkling-2-Mini](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) (`general.architecture = inkling2`), with zero `llama.cpp` or `ggml` dependencies.**
 
