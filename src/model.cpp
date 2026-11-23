@@ -73,6 +73,7 @@ void InklingEngine::unload() {
     full_sys_ckpt_ = KVCheckpoint{};
     prefix_ckpt_ = KVCheckpoint{};
     tools_ckpt_ = KVCheckpoint{};
+    turn_snap_ = TurnRewindSnapshot{};
     gguf_.close();
 }
 
@@ -1620,27 +1621,40 @@ int32_t InklingEngine::sample_from_logits(
         return argmax_val;
     }
 
-    int keep = (sp.top_k > 0 && (int)cand.size() > sp.top_k) ? sp.top_k : (int)cand.size();
-    std::partial_sort(cand.begin(), cand.begin() + keep, cand.end(),
+    if (sp.top_k > 0 || sp.top_p < 1.0f) {
+        int keep = (sp.top_k > 0 && (int)cand.size() > sp.top_k) ? sp.top_k : (int)cand.size();
+        if (keep < (int)cand.size()) {
+            std::partial_sort(cand.begin(), cand.begin() + keep, cand.end(),
+                              [](const auto& a, const auto& b) { return a.first > b.first; });
+            cand.resize(keep);
+        } else {
+            std::sort(cand.begin(), cand.end(),
                       [](const auto& a, const auto& b) { return a.first > b.first; });
-    cand.resize(keep);
+        }
+    }
 
-    float sum = 0.0f;
-    for (auto& c : cand) { c.first = std::exp(c.first - max_l); sum += c.first; }
-    for (auto& c : cand) c.first /= sum;
+    double sum = 0.0;
+    for (auto& c : cand) {
+        float w = std::exp(c.first - max_l);
+        c.first = w;
+        sum += (double)w;
+    }
+    float inv_sum = (sum > 0.0) ? (float)(1.0 / sum) : 0.0f;
+    for (auto& c : cand) c.first *= inv_sum;
 
     if (sp.top_p < 1.0f && cand.size() > 1) {
-        float cum = 0.0f;
+        double cum = 0.0;
         size_t cut = 0;
         for (size_t i = 0; i < cand.size(); ++i) {
-            cum += cand[i].first;
+            cum += (double)cand[i].first;
             cut = i + 1;
-            if (cum >= sp.top_p) break;
+            if (cum >= (double)sp.top_p) break;
         }
         cand.resize(cut);
-        sum = 0.0f;
-        for (auto& c : cand) sum += c.first;
-        for (auto& c : cand) c.first /= sum;
+        double renorm = 0.0;
+        for (const auto& c : cand) renorm += (double)c.first;
+        float inv_r = (renorm > 0.0) ? (float)(1.0 / renorm) : 0.0f;
+        for (auto& c : cand) c.first *= inv_r;
     }
 
     auto next_u = [&]() -> double {
@@ -1662,27 +1676,30 @@ int32_t InklingEngine::sample_from_logits(
             return draft_tok;
         }
         *out_accepted = false;
-        // Sample residual distribution p'(x) = p(x) / (1 - p(draft)) for x != draft
-        if (d_idx >= 0 && cand.size() > 1) {
-            float rem = 1.0f - p_draft;
-            double r = next_u() * (double)rem;
-            float acc = 0.0f;
-            for (size_t i = 0; i < cand.size(); ++i) {
-                if ((int)i == d_idx) continue;
-                acc += cand[i].first;
-                if (r <= acc) return cand[i].second;
+        // Sample exact residual distribution p'(x) = p(x) / (1 - p(draft)) for x != draft.
+        // When d_idx < 0 (p_draft == 0), p'(x) == p(x), so fall through to normal random sampling!
+        if (d_idx >= 0) {
+            if (cand.size() > 1 && p_draft < 1.0f - 1e-7f) {
+                double rem = std::max(0.0, 1.0 - (double)p_draft);
+                double r = next_u() * rem;
+                double acc = 0.0;
+                for (size_t i = 0; i < cand.size(); ++i) {
+                    if ((int)i == d_idx) continue;
+                    acc += (double)cand[i].first;
+                    if (r <= acc) return cand[i].second;
+                }
+                for (int i = (int)cand.size() - 1; i >= 0; --i) {
+                    if (i != d_idx) return cand[i].second;
+                }
             }
-            for (int i = (int)cand.size() - 1; i >= 0; --i) {
-                if (i != d_idx) return cand[i].second;
-            }
+            return cand[0].second;
         }
-        return cand[0].second;
     }
 
     double r = next_u();
-    float acc = 0.0f;
+    double acc = 0.0;
     for (const auto& c : cand) {
-        acc += c.first;
+        acc += (double)c.first;
         if (r <= acc) return c.second;
     }
     return cand.back().second;
@@ -1760,10 +1777,29 @@ InklingEngine::GenResult InklingEngine::generate(
             return true;
         };
 
+        auto try_rewind_turn = [&]() -> bool {
+            if (turn_snap_.pos <= 0 || P <= turn_snap_.pos) return false;
+            if (turn_snap_.epoch != kv_.reset_epoch()) return false;
+            if (turn_snap_.pos < full_sys_ckpt_.pos) return false;
+            if ((int)turn_snap_.tokens.size() != turn_snap_.pos) return false;
+            if (!std::equal(turn_snap_.tokens.begin(), turn_snap_.tokens.end(), prompt_tokens.begin())) return false;
+            double t_rw0 = now_ms();
+            if (!kv_.rewind_to_turn_snapshot(turn_snap_, stream_)) return false;
+            kv_tokens_ = turn_snap_.tokens;
+            start_pos = turn_snap_.pos;
+            res.cached_tokens = turn_snap_.pos;
+            std::printf("[KV] Turn-rewind snapshot restored: %d tokens in %.1f ms (zero Global KV copy!)\n",
+                        turn_snap_.pos, now_ms() - t_rw0);
+            std::fflush(stdout);
+            return true;
+        };
+
         if (L > 0 && P > L && std::equal(kv_tokens_.begin(), kv_tokens_.end(), prompt_tokens.begin())) {
             // Exact incremental continuation (e.g. tool-call follow-up turn -> 0 ms restore!)
             start_pos = L;
             res.cached_tokens = L;
+        } else if (try_rewind_turn()) {
+            // Tier-0 In-Place Rewind (~4 ms!): recovers up to 512K tokens on retries/cancels without re-prefilling!
         } else if (try_restore(full_sys_ckpt_, "Full-system")) {
             // Tier-1 RAM: Full tools + ALL system messages checkpoint (~99% prompt hit in ~30 ms!)
         } else if (try_restore(prefix_ckpt_, "Static-prefix")) {
@@ -1819,6 +1855,27 @@ InklingEngine::GenResult InklingEngine::generate(
         }
     };
 
+    const int want_turn_snap = (reuse_kv_prefix && P >= 128) ? (((P - 1) / 64) * 64) : 0;
+    auto maybe_save_turn_snap = [&](int cur_len) {
+        if (!reuse_kv_prefix || cur_len < 128 || (cur_len % 64) != 0) return;
+        bool at_end_boundary = (cur_len == want_turn_snap);
+        bool at_mid_milestone = (cur_len >= 4096 && (cur_len % 4096) == 0 && cur_len < want_turn_snap);
+        if (!at_end_boundary && !at_mid_milestone) return;
+        bool same = (turn_snap_.epoch == kv_.reset_epoch() &&
+                     turn_snap_.pos == cur_len &&
+                     (int)turn_snap_.tokens.size() == cur_len &&
+                     std::equal(turn_snap_.tokens.begin(), turn_snap_.tokens.end(), kv_tokens_.begin()));
+        if (!same) {
+            kv_.save_turn_snapshot(turn_snap_, cur_len, stream_);
+            if (turn_snap_.pos == cur_len && turn_snap_.epoch == kv_.reset_epoch()) {
+                turn_snap_.tokens = kv_tokens_;
+            }
+        }
+    };
+    if (start_pos > 0 && start_pos == want_turn_snap) {
+        maybe_save_turn_snap(start_pos);
+    }
+
     double t_pf0 = now_ms();
     int total_new = P - start_pos;
     if (predictor_active() && total_new > 0) {
@@ -1826,12 +1883,12 @@ InklingEngine::GenResult InklingEngine::generate(
         run_start_predictor(prompt_tokens.data() + start_pos, total_new);
     }
 
-    // Stage 4: Batched GEMM + Grouped Hybrid MoE Prefill (B <= 64, ~3x faster TTFT!)
+    // Stage 4: Batched GEMM + Grouped Hybrid MoE Prefill (B <= 128, ~3x faster TTFT!)
     if (cfg_.use_batched_prefill && total_new > 1) {
         int i = start_pos;
         while (i < P) {
             int chunk = std::min(BATCH_MAX, P - i);
-            // Align chunk boundaries cleanly on all 3 prefix KV checkpoints!
+            // Align chunk boundaries cleanly on all 3 prefix KV checkpoints + turn rewind boundary!
             if (want_tools_ckpt >= 256 && i < want_tools_ckpt && i + chunk > want_tools_ckpt) {
                 chunk = want_tools_ckpt - i;
             }
@@ -1840,6 +1897,9 @@ InklingEngine::GenResult InklingEngine::generate(
             }
             if (want_full_ckpt >= 128 && i < want_full_ckpt && i + chunk > want_full_ckpt) {
                 chunk = want_full_ckpt - i;
+            }
+            if (want_turn_snap >= 128 && i < want_turn_snap && i + chunk > want_turn_snap) {
+                chunk = want_turn_snap - i;
             }
             bool is_last = (i + chunk == P);
             forward_batch(prompt_tokens.data() + i, chunk, i,
@@ -1852,6 +1912,7 @@ InklingEngine::GenResult InklingEngine::generate(
             maybe_save_ckpt(tools_ckpt_,    want_tools_ckpt, i, "tools-prefix");
             maybe_save_ckpt(prefix_ckpt_,   want_ckpt,       i, "static-prefix");
             maybe_save_ckpt(full_sys_ckpt_, want_full_ckpt,  i, "full-system");
+            maybe_save_turn_snap(i);
 
             int done = i - start_pos;
             if (on_prefill) {
@@ -1870,6 +1931,7 @@ InklingEngine::GenResult InklingEngine::generate(
             maybe_save_ckpt(tools_ckpt_,    want_tools_ckpt, i + 1, "tools-prefix");
             maybe_save_ckpt(prefix_ckpt_,   want_ckpt,       i + 1, "static-prefix");
             maybe_save_ckpt(full_sys_ckpt_, want_full_ckpt,  i + 1, "full-system");
+            maybe_save_turn_snap(i + 1);
 
             int done = i - start_pos + 1;
             if (on_prefill && ((done & 15) == 0 || is_last)) {

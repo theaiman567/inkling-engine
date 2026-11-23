@@ -43,6 +43,19 @@ struct KVCheckpoint {
     std::vector<int32_t> tokens;
 };
 
+// Lightweight ~49 MiB in-place rewind snapshot (ShortConv + SWA only, ZERO Global KV copy!)
+// Enables ~4 ms rewind to any 64-token page boundary up to 512K+ context on client retries/cancels!
+struct TurnRewindSnapshot {
+    int pos = 0;
+    uint64_t epoch = 0;
+    std::vector<float>   conv_state;
+    std::vector<uint8_t> swa_k;
+    std::vector<uint8_t> swa_v;
+    std::vector<int32_t> swa_pos;
+    std::vector<int>     swa_counts;
+    std::vector<int32_t> tokens;
+};
+
 class HybridPagedKV {
 public:
     HybridPagedKV() = default;
@@ -77,6 +90,11 @@ public:
     // so multi-turn agent sessions (OpenCode) NEVER re-prefill the giant system+tools prompt!
     void save_checkpoint(KVCheckpoint& ckpt, int pos, cudaStream_t stream);
     bool restore_checkpoint(const KVCheckpoint& ckpt, cudaStream_t stream);
+
+    // Lightweight turn-level in-place rewind (preserves live Global KV pages across VRAM/RAM/SSD!)
+    uint64_t reset_epoch() const { return reset_epoch_; }
+    void save_turn_snapshot(TurnRewindSnapshot& snap, int pos, cudaStream_t stream);
+    bool rewind_to_turn_snapshot(const TurnRewindSnapshot& snap, cudaStream_t stream);
 
     // Persistent NVMe disk checkpoint save/load (InkEngine v3.0: survives full restarts & reboots in <100 ms!)
     bool save_checkpoint_disk(const KVCheckpoint& ckpt, const std::string& path, uint64_t model_sig) const;
@@ -240,6 +258,7 @@ private:
     void*     ssd_sync_event_ = nullptr;
 
     int cur_pos_ = 0;
+    uint64_t reset_epoch_ = 1;
     uint64_t clock_ = 0;
     uint64_t stat_vram_hits_ = 0;
     uint64_t stat_ram_hits_ = 0;
