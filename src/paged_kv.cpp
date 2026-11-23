@@ -82,6 +82,7 @@ bool HybridPagedKV::init(
     head_dim_ = head_dim;
     n_embd_ = n_embd;
     swa_window_ = swa_window;
+    swa_ring_cap_ = swa_window_ + SWA_BATCH_PAD;
     max_ctx_ = max_ctx;
     kv_mode_ = kv_mode;
     attn_mode_ = attn_mode;
@@ -107,11 +108,11 @@ bool HybridPagedKV::init(
     conv_layer_floats_ = (size_t)n_sconv_ch * 3;
     INK_CUDA_CHECK(cudaMalloc(&d_conv_state_, (size_t)n_layers_ * conv_layer_floats_ * sizeof(float)));
 
-    // 2. Fixed-size SWA ring buffers in VRAM (never grows with context!)
-    size_t swa_layer_bytes = (size_t)swa_window_ * tok_k_bytes_;
+    // 2. Fixed-size SWA ring buffers in VRAM (swa_window + 128 physical slots so batched prefill/verify NEVER overwrites live keys!)
+    size_t swa_layer_bytes = (size_t)swa_ring_cap_ * tok_k_bytes_;
     INK_CUDA_CHECK(cudaMalloc(&d_swa_k_, (size_t)n_swa_layers_ * swa_layer_bytes));
     INK_CUDA_CHECK(cudaMalloc(&d_swa_v_, (size_t)n_swa_layers_ * swa_layer_bytes));
-    INK_CUDA_CHECK(cudaMalloc(&d_swa_pos_, (size_t)n_swa_layers_ * swa_window_ * sizeof(int32_t)));
+    INK_CUDA_CHECK(cudaMalloc(&d_swa_pos_, (size_t)n_swa_layers_ * swa_ring_cap_ * sizeof(int32_t)));
     swa_counts_.assign(n_swa_layers_, 0);
 
     // 3. Global Paged KV pools
@@ -164,12 +165,14 @@ bool HybridPagedKV::init(
     glob_num_pages_.assign(n_glob_layers_, 0);
 
     // Scratch buffers for Split-K FlashDecoding (single + batched up to 256 B*splits = 3.0 MiB!)
+    // Per-global-layer page tables [n_glob_layers_ * max_pages_per_layer_] so async zero-sync layers
+    // NEVER overwrite another global layer's in-flight H2D page pointer table!
     INK_CUDA_CHECK(cudaMalloc(&d_split_out_, (size_t)256 * n_head_ * head_dim_ * sizeof(float)));
     INK_CUDA_CHECK(cudaMalloc(&d_split_ml_,  (size_t)256 * n_head_ * 2 * sizeof(float)));
-    INK_CUDA_CHECK(cudaMalloc(&d_page_k_ptrs_, (size_t)max_pages_per_layer_ * sizeof(uint64_t)));
-    INK_CUDA_CHECK(cudaMalloc(&d_page_v_ptrs_, (size_t)max_pages_per_layer_ * sizeof(uint64_t)));
-    INK_CUDA_CHECK(cudaMalloc(&d_page_pos0_,   (size_t)max_pages_per_layer_ * sizeof(int32_t)));
-    INK_CUDA_CHECK(cudaMalloc(&d_page_lens_,   (size_t)max_pages_per_layer_ * sizeof(int32_t)));
+    INK_CUDA_CHECK(cudaMalloc(&d_page_k_ptrs_, (size_t)total_max_pages * sizeof(uint64_t)));
+    INK_CUDA_CHECK(cudaMalloc(&d_page_v_ptrs_, (size_t)total_max_pages * sizeof(uint64_t)));
+    INK_CUDA_CHECK(cudaMalloc(&d_page_pos0_,   (size_t)total_max_pages * sizeof(int32_t)));
+    INK_CUDA_CHECK(cudaMalloc(&d_page_lens_,   (size_t)total_max_pages * sizeof(int32_t)));
 
     // Speculative verification rollback buffers (23 MiB ShortConv history + 0.27 MiB SWA slot backup)
     INK_CUDA_CHECK(cudaMalloc(&d_conv_spec_,   (size_t)SPEC_MAX_B * (size_t)n_layers_ * conv_layer_floats_ * sizeof(float)));
@@ -177,10 +180,10 @@ bool HybridPagedKV::init(
     INK_CUDA_CHECK(cudaMalloc(&d_swa_bak_v_,   (size_t)n_swa_layers_ * (size_t)SPEC_MAX_B * tok_k_bytes_));
     INK_CUDA_CHECK(cudaMalloc(&d_swa_bak_pos_, (size_t)n_swa_layers_ * (size_t)SPEC_MAX_B * sizeof(int32_t)));
 
-    INK_CUDA_CHECK(cudaHostAlloc(&h_page_k_ptrs_, (size_t)max_pages_per_layer_ * sizeof(uint64_t), cudaHostAllocWriteCombined));
-    INK_CUDA_CHECK(cudaHostAlloc(&h_page_v_ptrs_, (size_t)max_pages_per_layer_ * sizeof(uint64_t), cudaHostAllocWriteCombined));
-    INK_CUDA_CHECK(cudaHostAlloc(&h_page_pos0_,   (size_t)max_pages_per_layer_ * sizeof(int32_t),  cudaHostAllocWriteCombined));
-    INK_CUDA_CHECK(cudaHostAlloc(&h_page_lens_,   (size_t)max_pages_per_layer_ * sizeof(int32_t),  cudaHostAllocWriteCombined));
+    INK_CUDA_CHECK(cudaHostAlloc(&h_page_k_ptrs_, (size_t)total_max_pages * sizeof(uint64_t), cudaHostAllocDefault));
+    INK_CUDA_CHECK(cudaHostAlloc(&h_page_v_ptrs_, (size_t)total_max_pages * sizeof(uint64_t), cudaHostAllocDefault));
+    INK_CUDA_CHECK(cudaHostAlloc(&h_page_pos0_,   (size_t)total_max_pages * sizeof(int32_t),  cudaHostAllocDefault));
+    INK_CUDA_CHECK(cudaHostAlloc(&h_page_lens_,   (size_t)total_max_pages * sizeof(int32_t),  cudaHostAllocDefault));
     INK_CUDA_CHECK(cudaHostAlloc(&h_page_bounce_, page_full_bytes_, cudaHostAllocDefault));
     INK_CUDA_CHECK(cudaHostAlloc(&h_ssd_async_buf_, (size_t)SSD_ASYNC_QD * page_full_bytes_, cudaHostAllocDefault));
     for (int i = 0; i < SSD_ASYNC_QD; ++i) {
@@ -207,7 +210,7 @@ void HybridPagedKV::reset() {
         INK_CUDA_CHECK(cudaMemset(d_conv_state_, 0, (size_t)n_layers_ * conv_layer_floats_ * sizeof(float)));
     }
     if (d_swa_pos_) {
-        INK_CUDA_CHECK(cudaMemset(d_swa_pos_, 0xFF, (size_t)n_swa_layers_ * swa_window_ * sizeof(int32_t))); // -1
+        INK_CUDA_CHECK(cudaMemset(d_swa_pos_, 0xFF, (size_t)n_swa_layers_ * swa_ring_cap_ * sizeof(int32_t))); // -1
     }
     std::fill(swa_counts_.begin(), swa_counts_.end(), 0);
     std::fill(vram_owner_.begin(), vram_owner_.end(), std::make_pair(-1, -1));
@@ -251,13 +254,13 @@ void HybridPagedKV::save_checkpoint(KVCheckpoint& ckpt, int pos, cudaStream_t st
     ckpt.conv_state.resize(conv_n);
     INK_CUDA_CHECK(cudaMemcpy(ckpt.conv_state.data(), d_conv_state_, conv_n * sizeof(float), cudaMemcpyDeviceToHost));
 
-    size_t swa_bytes = (size_t)n_swa_layers_ * (size_t)swa_window_ * tok_k_bytes_;
+    size_t swa_bytes = (size_t)n_swa_layers_ * (size_t)swa_ring_cap_ * tok_k_bytes_;
     ckpt.swa_k.resize(swa_bytes);
     ckpt.swa_v.resize(swa_bytes);
     INK_CUDA_CHECK(cudaMemcpy(ckpt.swa_k.data(), d_swa_k_, swa_bytes, cudaMemcpyDeviceToHost));
     INK_CUDA_CHECK(cudaMemcpy(ckpt.swa_v.data(), d_swa_v_, swa_bytes, cudaMemcpyDeviceToHost));
 
-    size_t spos_n = (size_t)n_swa_layers_ * (size_t)swa_window_;
+    size_t spos_n = (size_t)n_swa_layers_ * (size_t)swa_ring_cap_;
     ckpt.swa_pos.resize(spos_n);
     INK_CUDA_CHECK(cudaMemcpy(ckpt.swa_pos.data(), d_swa_pos_, spos_n * sizeof(int32_t), cudaMemcpyDeviceToHost));
     ckpt.swa_counts = swa_counts_;
@@ -372,13 +375,13 @@ void HybridPagedKV::save_turn_snapshot(TurnRewindSnapshot& snap, int pos, cudaSt
     snap.conv_state.resize(conv_n);
     INK_CUDA_CHECK(cudaMemcpy(snap.conv_state.data(), d_conv_state_, conv_n * sizeof(float), cudaMemcpyDeviceToHost));
 
-    size_t swa_bytes = (size_t)n_swa_layers_ * (size_t)swa_window_ * tok_k_bytes_;
+    size_t swa_bytes = (size_t)n_swa_layers_ * (size_t)swa_ring_cap_ * tok_k_bytes_;
     snap.swa_k.resize(swa_bytes);
     snap.swa_v.resize(swa_bytes);
     INK_CUDA_CHECK(cudaMemcpy(snap.swa_k.data(), d_swa_k_, swa_bytes, cudaMemcpyDeviceToHost));
     INK_CUDA_CHECK(cudaMemcpy(snap.swa_v.data(), d_swa_v_, swa_bytes, cudaMemcpyDeviceToHost));
 
-    size_t spos_n = (size_t)n_swa_layers_ * (size_t)swa_window_;
+    size_t spos_n = (size_t)n_swa_layers_ * (size_t)swa_ring_cap_;
     snap.swa_pos.resize(spos_n);
     INK_CUDA_CHECK(cudaMemcpy(snap.swa_pos.data(), d_swa_pos_, spos_n * sizeof(int32_t), cudaMemcpyDeviceToHost));
     snap.swa_counts = swa_counts_;
@@ -465,14 +468,14 @@ bool HybridPagedKV::save_checkpoint_disk(const KVCheckpoint& ckpt, const std::st
 
     DiskCkptHeader hdr{};
     hdr.magic         = 0x314B434Bu;
-    hdr.version       = 2u; // v2: exact unbiased Q4_0 KV rounding (+8.0f with __float2int_rn)
+    hdr.version       = 3u; // v3: 1152-slot SWA ring (swa_window + 128) fixing batched overwrite past 1024 tokens!
     hdr.model_sig     = model_sig;
     hdr.pos           = ckpt.pos;
     hdr.glob_n_pages  = ckpt.glob_n_pages;
     hdr.kv_mode       = (int32_t)kv_mode_;
     hdr.n_swa_layers  = n_swa_layers_;
     hdr.n_glob_layers = n_glob_layers_;
-    hdr.swa_window    = swa_window_;
+    hdr.swa_window    = swa_ring_cap_;
     hdr.n_tokens      = ckpt.tokens.size();
     hdr.conv_floats   = ckpt.conv_state.size();
     hdr.swa_bytes     = ckpt.swa_k.size();
@@ -516,17 +519,18 @@ bool HybridPagedKV::load_checkpoint_disk(KVCheckpoint& ckpt, const std::string& 
 
     uint64_t want_hash = fnv1a_tokens(expect_tokens, (size_t)expect_pos);
     size_t expected_conv = (size_t)n_layers_ * conv_layer_floats_;
-    size_t expected_swa  = (size_t)n_swa_layers_ * (size_t)swa_window_ * tok_k_bytes_;
+    size_t expected_swa  = (size_t)n_swa_layers_ * (size_t)swa_ring_cap_ * tok_k_bytes_;
+    size_t expected_spos = (size_t)n_swa_layers_ * (size_t)swa_ring_cap_;
     size_t expected_glob = (size_t)n_glob_layers_ * (size_t)hdr.glob_n_pages * page_full_bytes_;
 
-    if (hdr.magic != 0x314B434Bu || hdr.version != 2u ||
+    if (hdr.magic != 0x314B434Bu || hdr.version != 3u ||
         hdr.model_sig != model_sig || hdr.pos != expect_pos ||
         hdr.kv_mode != (int32_t)kv_mode_ || hdr.n_swa_layers != n_swa_layers_ ||
-        hdr.n_glob_layers != n_glob_layers_ || hdr.swa_window != swa_window_ ||
+        hdr.n_glob_layers != n_glob_layers_ || hdr.swa_window != swa_ring_cap_ ||
         hdr.n_tokens != (uint64_t)expect_pos || hdr.token_hash != want_hash ||
         hdr.glob_n_pages <= 0 || hdr.glob_n_pages > max_pages_per_layer_ ||
         hdr.conv_floats != expected_conv || hdr.swa_bytes != expected_swa ||
-        hdr.glob_bytes != expected_glob) {
+        hdr.spos_count != expected_spos || hdr.glob_bytes != expected_glob) {
         std::fclose(f);
         return false;
     }
@@ -608,24 +612,24 @@ bool HybridPagedKV::benchmark_populate(int target_pos, cudaStream_t stream) {
         for (size_t i = 0; i < n_h; ++i) hp[i] = fp32_to_fp16_host(0.02f * (float)((int)(i % 9) - 4));
     }
 
-    // 2. Populate all 40 SWA ring buffers in VRAM up to min(target_pos, swa_window_)
-    int swa_len = std::min(target_pos, swa_window_);
-    std::vector<int32_t> swa_pos(swa_window_, -1);
+    // 2. Populate all 40 SWA ring buffers in VRAM up to min(target_pos, swa_ring_cap_)
+    int swa_len = std::min(target_pos, swa_ring_cap_);
+    std::vector<int32_t> swa_pos(swa_ring_cap_, -1);
     for (int i = 0; i < swa_len; ++i) {
         int p = target_pos - swa_len + i;
-        swa_pos[p % swa_window_] = p;
+        swa_pos[p % swa_ring_cap_] = p;
     }
-    std::vector<uint8_t> swa_buf((size_t)swa_window_ * tok_k_bytes_);
-    for (int s = 0; s < swa_window_; ++s) {
+    std::vector<uint8_t> swa_buf((size_t)swa_ring_cap_ * tok_k_bytes_);
+    for (int s = 0; s < swa_ring_cap_; ++s) {
         std::memcpy(swa_buf.data() + (size_t)s * tok_k_bytes_,
                     synth_page.data() + (size_t)(s % INK_PAGE_TOKENS) * tok_k_bytes_,
                     tok_k_bytes_);
     }
-    size_t swa_layer_bytes = (size_t)swa_window_ * tok_k_bytes_;
+    size_t swa_layer_bytes = (size_t)swa_ring_cap_ * tok_k_bytes_;
     for (int si = 0; si < n_swa_layers_; ++si) {
         INK_CUDA_CHECK(cudaMemcpyAsync(d_swa_k_ + (size_t)si * swa_layer_bytes, swa_buf.data(), swa_layer_bytes, cudaMemcpyHostToDevice, stream));
         INK_CUDA_CHECK(cudaMemcpyAsync(d_swa_v_ + (size_t)si * swa_layer_bytes, swa_buf.data(), swa_layer_bytes, cudaMemcpyHostToDevice, stream));
-        INK_CUDA_CHECK(cudaMemcpyAsync(d_swa_pos_ + (size_t)si * swa_window_, swa_pos.data(), (size_t)swa_window_ * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+        INK_CUDA_CHECK(cudaMemcpyAsync(d_swa_pos_ + (size_t)si * swa_ring_cap_, swa_pos.data(), (size_t)swa_ring_cap_ * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
         swa_counts_[si] = swa_len;
     }
 
@@ -757,7 +761,7 @@ void HybridPagedKV::begin_spec_verify(int pos0, int B, cudaStream_t stream) {
     ink_cuda_swa_spec_backup_restore(
         d_swa_k_, d_swa_v_, d_swa_pos_,
         d_swa_bak_k_, d_swa_bak_v_, d_swa_bak_pos_,
-        n_swa_layers_, swa_window_, pos0, 0, B, SPEC_MAX_B, tok_k_bytes_, /*is_restore=*/false, stream);
+        n_swa_layers_, swa_ring_cap_, pos0, 0, B, SPEC_MAX_B, tok_k_bytes_, /*is_restore=*/false, stream);
 }
 
 void HybridPagedKV::commit_spec_verify(int accepted, cudaStream_t stream) {
@@ -777,10 +781,10 @@ void HybridPagedKV::commit_spec_verify(int accepted, cudaStream_t stream) {
         ink_cuda_swa_spec_backup_restore(
             d_swa_k_, d_swa_v_, d_swa_pos_,
             d_swa_bak_k_, d_swa_bak_v_, d_swa_bak_pos_,
-            n_swa_layers_, swa_window_, spec_pos0_, accepted, spec_B_, SPEC_MAX_B,
+            n_swa_layers_, swa_ring_cap_, spec_pos0_, accepted, spec_B_, SPEC_MAX_B,
             tok_k_bytes_, /*is_restore=*/true, stream);
         for (int si = 0; si < n_swa_layers_; ++si) {
-            swa_counts_[si] = std::min(swa_window_, new_pos);
+            swa_counts_[si] = std::min(swa_ring_cap_, new_pos);
         }
 
         // 3. Truncate Global KV pages back to exact `new_pos`
@@ -822,7 +826,7 @@ void HybridPagedKV::begin_draft_snapshot(int pos0, int max_k, cudaStream_t strea
     ink_cuda_swa_spec_backup_restore(
         d_swa_k_, d_swa_v_, d_swa_pos_,
         d_swa_bak_k_, d_swa_bak_v_, d_swa_bak_pos_,
-        n_swa_layers_, swa_window_, pos0, 0, max_k, SPEC_MAX_B, tok_k_bytes_, /*is_restore=*/false, stream);
+        n_swa_layers_, swa_ring_cap_, pos0, 0, max_k, SPEC_MAX_B, tok_k_bytes_, /*is_restore=*/false, stream);
 }
 
 void HybridPagedKV::rollback_draft_snapshot(int pos0, int drafted, cudaStream_t stream) {
@@ -836,9 +840,9 @@ void HybridPagedKV::rollback_draft_snapshot(int pos0, int drafted, cudaStream_t 
     ink_cuda_swa_spec_backup_restore(
         d_swa_k_, d_swa_v_, d_swa_pos_,
         d_swa_bak_k_, d_swa_bak_v_, d_swa_bak_pos_,
-        n_swa_layers_, swa_window_, pos0, 0, drafted, SPEC_MAX_B, tok_k_bytes_, /*is_restore=*/true, stream);
+        n_swa_layers_, swa_ring_cap_, pos0, 0, drafted, SPEC_MAX_B, tok_k_bytes_, /*is_restore=*/true, stream);
     for (int si = 0; si < n_swa_layers_; ++si) {
-        swa_counts_[si] = std::min(swa_window_, pos0);
+        swa_counts_[si] = std::min(swa_ring_cap_, pos0);
     }
     if (pos0 > 0) {
         int last_p = (pos0 - 1) / INK_PAGE_TOKENS;
@@ -1116,12 +1120,12 @@ void HybridPagedKV::append_and_attend(
 
     if (is_swa_[il]) {
         int si = layer_to_swa_idx_[il];
-        size_t swa_layer_bytes = (size_t)swa_window_ * tok_k_bytes_;
+        size_t swa_layer_bytes = (size_t)swa_ring_cap_ * tok_k_bytes_;
         uint8_t* k_ring = d_swa_k_ + (size_t)si * swa_layer_bytes;
         uint8_t* v_ring = d_swa_v_ + (size_t)si * swa_layer_bytes;
-        int32_t* pos_ring = d_swa_pos_ + (size_t)si * swa_window_;
+        int32_t* pos_ring = d_swa_pos_ + (size_t)si * swa_ring_cap_;
 
-        int slot = pos % swa_window_;
+        int slot = pos % swa_ring_cap_;
         ink_cuda_kv_store(d_K, d_V,
                           k_ring + (size_t)slot * tok_k_bytes_,
                           v_ring + (size_t)slot * tok_k_bytes_,
@@ -1129,7 +1133,7 @@ void HybridPagedKV::append_and_attend(
                           pos_ring + slot, pos,
                           n_head_kv_, head_dim_, kv_mode_, stream);
 
-        if (swa_counts_[si] < swa_window_) swa_counts_[si] = std::min(swa_window_, pos + 1);
+        if (swa_counts_[si] < swa_ring_cap_) swa_counts_[si] = std::min(swa_ring_cap_, pos + 1);
         ink_cuda_attn_swa(d_Q, k_ring, v_ring, pos_ring, d_rel_table, d_sinks, d_split_out_, d_split_ml_, d_out,
                           n_head_, n_head_kv_, head_dim_, swa_counts_[si], pos, rel_extent, kv_mode_, stream);
         return;
@@ -1188,16 +1192,26 @@ void HybridPagedKV::append_and_attend(
     bool use_quest = (!all_in_vram && attn_mode_ != KV_ATTN_EXACT_STREAM) ||
                      (attn_mode_ == KV_ATTN_QUEST && n_pages > quest_top_pages_ + 20);
 
+    const size_t pt_off = (size_t)g * (size_t)max_pages_per_layer_;
+    uint64_t* h_pk = h_page_k_ptrs_ + pt_off;
+    uint64_t* h_pv = h_page_v_ptrs_ + pt_off;
+    int32_t*  h_p0 = h_page_pos0_   + pt_off;
+    int32_t*  h_pl = h_page_lens_   + pt_off;
+    uint64_t* d_pk = d_page_k_ptrs_ + pt_off;
+    uint64_t* d_pv = d_page_v_ptrs_ + pt_off;
+    int32_t*  d_p0 = d_page_pos0_   + pt_off;
+    int32_t*  d_pl = d_page_lens_   + pt_off;
+
     int n_sel = 0;
     if (!use_quest) {
         // 100% EXACT FULL ATTENTION over all n_pages!
         for (int i = 0; i < n_pages; ++i) {
             int vs = ensure_page_in_vram(g, i, recent_start, stream);
             uint8_t* pb = d_vram_pages_ + (size_t)vs * page_full_bytes_;
-            h_page_k_ptrs_[n_sel] = (uint64_t)(uintptr_t)pb;
-            h_page_v_ptrs_[n_sel] = (uint64_t)(uintptr_t)(pb + page_half_bytes_);
-            h_page_pos0_[n_sel]   = pages_[g][i].pos0;
-            h_page_lens_[n_sel]   = pages_[g][i].len;
+            h_pk[n_sel] = (uint64_t)(uintptr_t)pb;
+            h_pv[n_sel] = (uint64_t)(uintptr_t)(pb + page_half_bytes_);
+            h_p0[n_sel] = pages_[g][i].pos0;
+            h_pl[n_sel] = pages_[g][i].len;
             n_sel++;
         }
     } else {
@@ -1247,20 +1261,20 @@ void HybridPagedKV::append_and_attend(
         for (int pid : chosen) {
             int vs = ensure_page_in_vram(g, pid, recent_start, stream);
             uint8_t* pb = d_vram_pages_ + (size_t)vs * page_full_bytes_;
-            h_page_k_ptrs_[n_sel] = (uint64_t)(uintptr_t)pb;
-            h_page_v_ptrs_[n_sel] = (uint64_t)(uintptr_t)(pb + page_half_bytes_);
-            h_page_pos0_[n_sel]   = pages_[g][pid].pos0;
-            h_page_lens_[n_sel]   = pages_[g][pid].len;
+            h_pk[n_sel] = (uint64_t)(uintptr_t)pb;
+            h_pv[n_sel] = (uint64_t)(uintptr_t)(pb + page_half_bytes_);
+            h_p0[n_sel] = pages_[g][pid].pos0;
+            h_pl[n_sel] = pages_[g][pid].len;
             n_sel++;
         }
     }
 
-    INK_CUDA_CHECK(cudaMemcpyAsync(d_page_k_ptrs_, h_page_k_ptrs_, (size_t)n_sel * sizeof(uint64_t), cudaMemcpyHostToDevice, stream));
-    INK_CUDA_CHECK(cudaMemcpyAsync(d_page_v_ptrs_, h_page_v_ptrs_, (size_t)n_sel * sizeof(uint64_t), cudaMemcpyHostToDevice, stream));
-    INK_CUDA_CHECK(cudaMemcpyAsync(d_page_pos0_,   h_page_pos0_,   (size_t)n_sel * sizeof(int32_t),  cudaMemcpyHostToDevice, stream));
-    INK_CUDA_CHECK(cudaMemcpyAsync(d_page_lens_,   h_page_lens_,   (size_t)n_sel * sizeof(int32_t),  cudaMemcpyHostToDevice, stream));
+    INK_CUDA_CHECK(cudaMemcpyAsync(d_pk, h_pk, (size_t)n_sel * sizeof(uint64_t), cudaMemcpyHostToDevice, stream));
+    INK_CUDA_CHECK(cudaMemcpyAsync(d_pv, h_pv, (size_t)n_sel * sizeof(uint64_t), cudaMemcpyHostToDevice, stream));
+    INK_CUDA_CHECK(cudaMemcpyAsync(d_p0, h_p0, (size_t)n_sel * sizeof(int32_t),  cudaMemcpyHostToDevice, stream));
+    INK_CUDA_CHECK(cudaMemcpyAsync(d_pl, h_pl, (size_t)n_sel * sizeof(int32_t),  cudaMemcpyHostToDevice, stream));
 
-    ink_cuda_attn_global_paged(d_Q, d_page_k_ptrs_, d_page_v_ptrs_, d_page_pos0_, d_page_lens_, n_sel,
+    ink_cuda_attn_global_paged(d_Q, d_pk, d_pv, d_p0, d_pl, n_sel,
                                d_rel_table, d_sinks, d_split_out_, d_split_ml_, d_out,
                                n_head_, n_head_kv_, head_dim_, pos, rel_extent, kv_mode_, stream);
 }
@@ -1279,14 +1293,14 @@ void HybridPagedKV::append_and_attend_batch(
 
     if (is_swa_[il]) {
         int si = layer_to_swa_idx_[il];
-        size_t swa_layer_bytes = (size_t)swa_window_ * tok_k_bytes_;
+        size_t swa_layer_bytes = (size_t)swa_ring_cap_ * tok_k_bytes_;
         uint8_t* k_ring = d_swa_k_ + (size_t)si * swa_layer_bytes;
         uint8_t* v_ring = d_swa_v_ + (size_t)si * swa_layer_bytes;
-        int32_t* pos_ring = d_swa_pos_ + (size_t)si * swa_window_;
+        int32_t* pos_ring = d_swa_pos_ + (size_t)si * swa_ring_cap_;
 
-        ink_cuda_kv_store_swa_batch(d_K, d_V, k_ring, v_ring, pos_ring, swa_window_, pos0, B,
+        ink_cuda_kv_store_swa_batch(d_K, d_V, k_ring, v_ring, pos_ring, swa_ring_cap_, pos0, B,
                                     n_head_kv_, head_dim_, kv_mode_, stream);
-        swa_counts_[si] = std::min(swa_window_, pos0 + B);
+        swa_counts_[si] = std::min(swa_ring_cap_, pos0 + B);
         ink_cuda_attn_swa_batch(d_Q, k_ring, v_ring, pos_ring, d_rel_table, d_sinks,
                                 d_split_out_, d_split_ml_, d_out, B,
                                 n_head_, n_head_kv_, head_dim_, swa_counts_[si], pos0, rel_extent, kv_mode_, stream);
@@ -1347,15 +1361,25 @@ void HybridPagedKV::append_and_attend_batch(
     bool use_quest = (!all_in_vram && attn_mode_ != KV_ATTN_EXACT_STREAM) ||
                      (attn_mode_ == KV_ATTN_QUEST && n_pages > quest_top_pages_ + 20);
 
+    const size_t pt_off = (size_t)g * (size_t)max_pages_per_layer_;
+    uint64_t* h_pk = h_page_k_ptrs_ + pt_off;
+    uint64_t* h_pv = h_page_v_ptrs_ + pt_off;
+    int32_t*  h_p0 = h_page_pos0_   + pt_off;
+    int32_t*  h_pl = h_page_lens_   + pt_off;
+    uint64_t* d_pk = d_page_k_ptrs_ + pt_off;
+    uint64_t* d_pv = d_page_v_ptrs_ + pt_off;
+    int32_t*  d_p0 = d_page_pos0_   + pt_off;
+    int32_t*  d_pl = d_page_lens_   + pt_off;
+
     int n_sel = 0;
     if (!use_quest) {
         for (int i = 0; i < n_pages; ++i) {
             int vs = ensure_page_in_vram(g, i, recent_start, stream);
             uint8_t* pb = d_vram_pages_ + (size_t)vs * page_full_bytes_;
-            h_page_k_ptrs_[n_sel] = (uint64_t)(uintptr_t)pb;
-            h_page_v_ptrs_[n_sel] = (uint64_t)(uintptr_t)(pb + page_half_bytes_);
-            h_page_pos0_[n_sel]   = pages_[g][i].pos0;
-            h_page_lens_[n_sel]   = pages_[g][i].len;
+            h_pk[n_sel] = (uint64_t)(uintptr_t)pb;
+            h_pv[n_sel] = (uint64_t)(uintptr_t)(pb + page_half_bytes_);
+            h_p0[n_sel] = pages_[g][i].pos0;
+            h_pl[n_sel] = pages_[g][i].len;
             n_sel++;
         }
     } else {
@@ -1391,20 +1415,20 @@ void HybridPagedKV::append_and_attend_batch(
         for (int pid : chosen) {
             int vs = ensure_page_in_vram(g, pid, recent_start, stream);
             uint8_t* pb = d_vram_pages_ + (size_t)vs * page_full_bytes_;
-            h_page_k_ptrs_[n_sel] = (uint64_t)(uintptr_t)pb;
-            h_page_v_ptrs_[n_sel] = (uint64_t)(uintptr_t)(pb + page_half_bytes_);
-            h_page_pos0_[n_sel]   = pages_[g][pid].pos0;
-            h_page_lens_[n_sel]   = pages_[g][pid].len;
+            h_pk[n_sel] = (uint64_t)(uintptr_t)pb;
+            h_pv[n_sel] = (uint64_t)(uintptr_t)(pb + page_half_bytes_);
+            h_p0[n_sel] = pages_[g][pid].pos0;
+            h_pl[n_sel] = pages_[g][pid].len;
             n_sel++;
         }
     }
 
-    INK_CUDA_CHECK(cudaMemcpyAsync(d_page_k_ptrs_, h_page_k_ptrs_, (size_t)n_sel * sizeof(uint64_t), cudaMemcpyHostToDevice, stream));
-    INK_CUDA_CHECK(cudaMemcpyAsync(d_page_v_ptrs_, h_page_v_ptrs_, (size_t)n_sel * sizeof(uint64_t), cudaMemcpyHostToDevice, stream));
-    INK_CUDA_CHECK(cudaMemcpyAsync(d_page_pos0_,   h_page_pos0_,   (size_t)n_sel * sizeof(int32_t),  cudaMemcpyHostToDevice, stream));
-    INK_CUDA_CHECK(cudaMemcpyAsync(d_page_lens_,   h_page_lens_,   (size_t)n_sel * sizeof(int32_t),  cudaMemcpyHostToDevice, stream));
+    INK_CUDA_CHECK(cudaMemcpyAsync(d_pk, h_pk, (size_t)n_sel * sizeof(uint64_t), cudaMemcpyHostToDevice, stream));
+    INK_CUDA_CHECK(cudaMemcpyAsync(d_pv, h_pv, (size_t)n_sel * sizeof(uint64_t), cudaMemcpyHostToDevice, stream));
+    INK_CUDA_CHECK(cudaMemcpyAsync(d_p0, h_p0, (size_t)n_sel * sizeof(int32_t),  cudaMemcpyHostToDevice, stream));
+    INK_CUDA_CHECK(cudaMemcpyAsync(d_pl, h_pl, (size_t)n_sel * sizeof(int32_t),  cudaMemcpyHostToDevice, stream));
 
-    ink_cuda_attn_global_paged_batch(d_Q, d_page_k_ptrs_, d_page_v_ptrs_, d_page_pos0_, d_page_lens_, n_sel,
+    ink_cuda_attn_global_paged_batch(d_Q, d_pk, d_pv, d_p0, d_pl, n_sel,
                                      d_rel_table, d_sinks, d_split_out_, d_split_ml_, d_out, B,
                                      n_head_, n_head_kv_, head_dim_, pos0, rel_extent, kv_mode_, stream);
 }
@@ -1413,7 +1437,7 @@ PagedKVStats HybridPagedKV::stats() const {
     PagedKVStats s{};
     s.max_ctx = max_ctx_;
     s.cur_pos = cur_pos_;
-    s.swa_vram_mb = (double)(2 * (size_t)n_swa_layers_ * swa_window_ * tok_k_bytes_) / (1024.0 * 1024.0);
+    s.swa_vram_mb = (double)(2 * (size_t)n_swa_layers_ * swa_ring_cap_ * tok_k_bytes_) / (1024.0 * 1024.0);
     s.global_vram_mb = (double)((size_t)vram_page_cap_ * page_full_bytes_) / (1024.0 * 1024.0);
     if (d_k_mins_q8_) {
         size_t tot_p = (size_t)n_glob_layers_ * max_pages_per_layer_;

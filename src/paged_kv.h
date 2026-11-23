@@ -137,6 +137,7 @@ public:
 
     // Exact 0.02 ms GPU-side rollback helpers for Stage 5 / v3.0 lossless speculative verification (B <= 8 -> K <= 6!)
     static constexpr int SPEC_MAX_B = 8;
+    static constexpr int SWA_BATCH_PAD = 128; // >= InklingEngine::BATCH_MAX so batched SWA never overwrites live keys!
     static constexpr int SSD_ASYNC_QD = 16;
     void begin_spec_verify(int pos0, int B, cudaStream_t stream);
     void commit_spec_verify(int accepted, cudaStream_t stream);
@@ -176,7 +177,8 @@ private:
     int n_head_kv_ = 8;
     int head_dim_ = 128;
     int n_embd_ = 2304;
-    int swa_window_ = 1024;
+    int swa_window_ = 1024;    // Logical sliding window length (1024)
+    int swa_ring_cap_ = 1152;  // Physical ring capacity = swa_window_ + SWA_BATCH_PAD (prevents batched overwrite!)
     int max_ctx_ = 32768;
     int quest_top_pages_ = 128;
     KVQuantMode kv_mode_ = KV_QUANT_Q4_0;
@@ -197,11 +199,11 @@ private:
     float* d_conv_state_ = nullptr;
     size_t conv_layer_floats_ = 0;
 
-    // SWA Ring Buffers in VRAM
+    // SWA Ring Buffers in VRAM (physical capacity = swa_ring_cap_ = swa_window_ + 128)
     uint8_t* d_swa_k_ = nullptr;
     uint8_t* d_swa_v_ = nullptr;
-    int32_t* d_swa_pos_ = nullptr; // [n_swa_layers, swa_window]
-    std::vector<int> swa_counts_;  // valid tokens per SWA layer
+    int32_t* d_swa_pos_ = nullptr; // [n_swa_layers, swa_ring_cap_]
+    std::vector<int> swa_counts_;  // valid physical ring entries (up to swa_ring_cap_) per SWA layer
 
     // Global Paged KV: Tier 0 (VRAM), Tier 1 (RAM), Tier 2 (SSD)
     uint8_t* d_vram_pages_ = nullptr;

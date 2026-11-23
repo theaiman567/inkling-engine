@@ -1,3 +1,103 @@
+# Changelog / PR Notes — InkEngine v3.3 ("Correct & Safe" — Long-Context Parity, Security Hardening & Async Race Fixes)
+
+> **Suggested PR Title:** `v3.3: Fix SWA ring wrap, RAM pinning, silent global-KV page-table race, harden local HTTP API auth/timeouts/overflow/UTF-8, and add --verify-suite long-context parity gate`
+
+This release implements **Milestone 1 ("Correct & Safe")** of the senior-agent architecture audit (`R0`, `R1`, `R2`, `R3`, `R5`, `R7`, `R9`), hardening correctness past position `1,024`, eliminating local HTTP security & stability hazards, and adding a permanent automated `--verify-suite` long-context regression gate — which immediately uncovered and fixed **3 deeper GPU/CPU concurrency & coherency bugs** (including a silent cross-layer Global-KV page-table race).
+
+---
+
+## Summary of Fixes & Improvements (v3.3)
+
+### 1. Eliminated Batched SWA Ring Overwrite Past `pos = 1,024` (`R1 / SR3-01` — `src/paged_kv.h`, `src/paged_kv.cpp`, `src/cuda_kernels.cu`)
+- **Root Cause**: Sliding-Window Attention (SWA) ring buffers previously allocated exactly `swa_window = 1,024` slots. During batched prefill (`B <= 128`) or speculative verification (`K <= 6`) past position `1,024`, writing the whole chunk before attention overwrote `B` oldest slots still inside query `0`'s `1,024`-token window.
+- **Fix**:
+  - Expanded `swa_ring_cap_ = swa_window_ + 128 = 1,152` slots (`+5.6 MiB` VRAM total at `Q4_0`: `45.0 → 50.6 MiB`; `160.0 → 180.0 MiB` at `F16`) and indexed SWA writes/reads modulo `swa_ring_cap_`, guaranteeing zero overlap for any batch up to `B = 128`.
+  - Bumped the persistent NVMe KV checkpoint format `v2 → v3` (`hdr.version = 3u`) so legacy 1,024-slot checkpoints auto-invalidate and rebuild cleanly.
+
+### 2. Fixed Cold Expert RAM Slot Eviction Before Read During Prefill (`R5 / SR3-04` — `src/expert_cache.h`, `src/expert_cache.cpp`, `src/model.cpp`)
+- **Root Cause**: Under tight RAM budgets where not all cold experts fit in RAM simultaneously, loading a later micro-batch expert during `forward_batch` could evict an earlier expert's RAM slot before the GPU/CPU finished reading it.
+- **Fix**: Added `pin_ram_expert()` / `unpin_ram_slots()` ref-counted pinning in `ExpertCache` and micro-batch pinning around batched MoE execution in `forward_batch()`.
+
+### 3. Hardened Local HTTP API Security & OpenCode Auto-Auth (`R2 / SR1-09` — `src/server.h`, `src/server.cpp`, `src/vision.h`, `src/vision.cpp`, `src/main.cpp`, `inkcode.ps1`)
+- **Bearer Token Auth by Default**: Generates a CSPRNG token (`--api-key <tok>` to set explicitly, `--no-auth` to opt out) and enforces `Authorization: Bearer <token>` across **all** endpoints — including `/health`, `/stats`, and `/shutdown`.
+- **Blocked DNS Rebinding & Wildcard CORS**: Removed `Access-Control-Allow-Origin: *`, validated the HTTP `Host` header against local loopback allowlist (returning `403` on mismatched hosts), rejected cross-origin requests by default (`403`), and added opt-in `--cors-origin <origin>`.
+- **Blocked Local / UNC Image Exfiltration Over HTTP**: `VisionEncoder::encode()` now defaults to `allow_local_files = false` over HTTP (blocking raw local file paths, `file:///`, and UNC `\\host\share` / device paths with HTTP `400`), while keeping CLI `--image` local files working (`allow_local_files = true`) with UNC/device paths always blocked everywhere.
+- **Seamless `inkcode.ps1` Token Sync**: Automatically creates a per-user CSPRNG token at `%LOCALAPPDATA%\InkEngine\api_token` and syncs strictly `provider.inkengine.options.apiKey` in `%USERPROFILE%\.config\opencode\opencode.jsonc` without touching any other configured providers.
+
+### 4. Context Overflow Protection & Accurate `finish_reason: "length"` (`R3 / SR1-02` — `src/model.h`, `src/model.cpp`, `src/server.cpp`)
+- Prompts with `prompt_ids.size() >= max_ctx` now return HTTP `400` with standard OpenAI `error.code = "context_length_exceeded"` instead of overflowing KV structures.
+- Clamps `max_tokens` to remaining context capacity and propagates `GenResult::hit_max_ctx` so OpenAI responses accurately emit `"finish_reason": "length"`.
+
+### 5. Split Multi-Byte UTF-8 Buffering in SSE Streaming (`R7 / SR1-12` — `src/server.cpp`)
+- Added `Utf8StreamBuffer` independently for both `reasoning_content` and `content` streams, holding incomplete trailing UTF-8 byte sequences across token boundaries until complete (and flushing safely at end-of-stream) so emojis and non-ASCII characters never emit broken `\uFFFD` chunks.
+
+### 6. Socket Timeouts, Anti-Smuggling Parser & Concurrent Worker Threads (`R9 / SR1-10` — `src/server.cpp`)
+- Added `SO_RCVTIMEO = 10s`, `SO_SNDTIMEO = 30s`, and a 10s HTTP header deadline so stalled/slowloris TCP connections can never hang the server.
+- Replaced naive header parsing with a strict line-by-line parser that explicitly rejects conflicting `Transfer-Encoding` + `Content-Length` smuggling requests (`400`).
+- Handled connections on bounded per-connection worker threads (up to 16 concurrent sockets), acquiring `gen_mu` **only** around vision + inference so `/health` and `/stats` respond in `<1 ms` even when a slow client stalls a socket.
+
+### 7. Permanent Long-Context (`>1,024`) Parity Regression Gate (`R0 / SR1-01` — `src/model.cpp`, `src/main.cpp`)
+- Added `--verify-suite` covering four automated correctness gates:
+  - **Gate 1A**: SWA ring-wrap Query-0 parity (`pos=1024 B=7` and `pos=1100 B=128` crossing the `1,152` ring boundary vs. scalar `B=1`).
+  - **Gate 1B**: Post-wrap multi-chunk prefill parity across `pos [1024..1151]` (`B=128`, `B=32`, `B=7` vs. `B=1`).
+  - **Gate 2**: Speculative decoding ON vs. OFF past `pos=1024` (`2,017`-token prompt, 96 greedy tokens from identical KV).
+  - **Gate 3**: In-place Turn-Rewind (`1088→1089`) and Disk v3 Checkpoint save/restore parity (bit-exact `0.000000`).
+
+### 8. Three Bonus Concurrency & Coherency Bugs Caught & Fixed by R0!
+Running `--verify-suite` immediately surfaced and allowed us to eliminate three subtle bugs that only triggered on fast VRAM-resident paths:
+1. **Silent Async Global-KV Page-Table Race (`src/paged_kv.cpp`)**: All 8 Global Attention layers (`il = 5, 11, 17, 23, 29, 35, 41, 47`) previously shared a single `h_page_k_ptrs_` / `d_page_k_ptrs_` buffer. When core layers ran 100% in VRAM (zero-sync fast path), the CPU launched all 8 global layers asynchronously in microseconds and overwrote `h_page_*` while earlier layers' `cudaMemcpyAsync` were still reading it, causing global layers to attend to other layers' KV pages. **Fix**: Disjoint per-global-layer host+device page tables (`8 × max_pages_per_layer_`, zero extra GPU syncs). Result: `Q4_0` Gate 2 jumped from `2/18` failure to **`96/96` exact (`77/77 = 100%` accepted)** and Gate 3 jumped to **`0.000000` BIT-EXACT**.
+2. **Per-Thread System Memory Fence in `k_moe_split_hits` (`src/cuda_kernels.cu`)**: Previously only `threadIdx.x == 0` issued `__threadfence_system()` after all 256 threads wrote zero-copy pinned `d_mapped_ffn_in`. **Fix**: Every thread now calls `__threadfence_system()` before `__syncthreads()`.
+3. **Write-Combining Coherency & Unaligned CPU MoE Slices (`src/model.cpp`, `src/paged_kv.cpp`, `src/expert_cache.cpp`, `src/vision.cpp`, `src/cpu_kernels.cpp`)**: Replaced `cudaHostAllocWriteCombined` with coherent `cudaHostAllocDefault` on host staging buffers (including `h_moe_cpu_out_`, which 10 CPU threads read-modify-write), aligned `run_moe_experts` / `run_moe_experts_grouped` row slices to 64-byte (16-float) cache lines, switched 4-byte stack `d_tau_global_` copies to synchronous `cudaMemcpy`, and synced at end-of-token when `need_logits == false`.
+
+---
+
+## Files Changed (v3.3)
+
+| File | Changes |
+|---|---|
+| `src/paged_kv.h`, `src/paged_kv.cpp` | `swa_ring_cap_ = 1152` (+5.6 MiB Q4_0), Disk checkpoint `v2 → v3`, disjoint per-global-layer `[8 × max_pages]` page tables, `cudaHostAllocDefault` |
+| `src/expert_cache.h`, `src/expert_cache.cpp` | `pin_ram_expert()` / `unpin_ram_slots()` ref-counted RAM slot pinning, `set_swaps_frozen()` for deterministic parity gates, `cudaHostAllocDefault` |
+| `src/cuda_kernels.cu` | Per-thread `__threadfence_system()` in `k_moe_split_hits`, `swa_ring_cap` modular indexing |
+| `src/cpu_kernels.cpp` | 64-byte (16-float) cache-line aligned slices in `run_moe_experts` and `run_moe_experts_grouped` |
+| `src/vision.h`, `src/vision.cpp` | `allow_local_files = false` default (HTTP safe), UNC/device path blocking everywhere, `cudaHostAllocDefault` |
+| `src/model.h`, `src/model.cpp` | `run_parity_suite()` (`--verify-suite`), `GenResult::hit_max_ctx`, micro-batch RAM pinning in `forward_batch()`, `cudaHostAllocDefault`, safe `d_tau_global_` copy & `!need_logits` sync, v3.3 banner |
+| `src/server.h`, `src/server.cpp` | CSPRNG Bearer auth on all routes, `Host` header check, no wildcard CORS + `--cors-origin`, block local `image_url`, HTTP 400 `context_length_exceeded` + `"length"` `finish_reason`, `Utf8StreamBuffer`, socket timeouts + strict anti-smuggling parser + 16-worker concurrency |
+| `src/main.cpp` | Added `--verify-suite`, `--api-key`, `--no-auth`, `--cors-origin`; CLI `--image` enables `allow_local_files=true` |
+| `inkcode.ps1` | Auto-creates `%LOCALAPPDATA%\InkEngine\api_token`, safely syncs only `provider.inkengine.options.apiKey` in `opencode.jsonc`, passes `--api-key` and Bearer headers on `/health`, `/stats`, `/shutdown` |
+| `README.md`, `CHANGELOG.md`, `INKENGINE_OVERVIEW.txt` | Updated all documentation for v3.3 |
+
+---
+
+## Verification (v3.3)
+
+- **Build**: Clean compile with `build.bat` (`sm_89`, CUDA 12.8 + MSVC x64 AVX2, zero warnings/errors).
+- **Test A — Full `F16` Golden + R0 Parity Suite (`--ctx 4096 --kv-quant f16 --no-fp16-loop --verify --verify-suite`) — `exit 0` (ALL GATES PASSED)**:
+  - Golden `--verify`: `29/29` tokenizer match, `"17 * 23 is 391."` (**100% EXACT MATCH**).
+  - Gate 1A: `pos=1024 B=7[0] vs B=1`: `L0_SWA_err=0.000001 | top1=2623 MATCH | cos=0.989895`; `pos=1100 B=128[0]` crossing `1,152` wrap: `L0_SWA_err=0.015070` (**PASS**).
+  - Gate 1B (`pos [1024..1151]`): `B=128` (`cos=0.998532, mean|d|=0.22962`), `B=32` (`cos=0.999458, mean|d|=0.12473`), `B=7` (`cos=0.999126, mean|d|=0.15095`) — all `top1=152914 MATCH` (**PASS**).
+  - Gate 2 (`2,017`-tok prompt, 96 greedy tokens): `spec_off=96 | spec_on=96 (accepted=77/77 = 100%) | exact=YES` (**PASS**).
+  - Gate 3: Turn-Rewind (`1088→1089`) **`max|dlogit|=0.000000` (BIT-EXACT)**; Disk v3 Checkpoint (`1088→1089`) **`max|dlogit|=0.000000` (BIT-EXACT)**.
+- **Test B — Production `Q4_0` R0 Parity Suite (`--ctx 4096 --kv-quant q4 --verify-suite`) — `exit 0` (ALL GATES PASSED)**:
+  - Gate 1A: `pos=1024 B=7[0]`: `L0_SWA_err=0.000001 | top1=2623 MATCH | cos=0.994599`; `pos=1100 B=128[0]`: `L0_SWA_err=0.014219` (**PASS**).
+  - Gate 1B: `B=128` (`cos=0.998255, mean|d|=0.21061`), `B=32` (`cos=0.993900, mean|d|=0.39767`), `B=7` (`cos=0.994518, mean|d|=0.39723`) — all `top1=152914 MATCH` (**PASS**).
+  - Gate 2: `spec_off=96 | spec_on=96 (accepted=77/77 = 100%) | exact=YES` (**PASS**).
+  - Gate 3: Turn-Rewind **`max|dlogit|=0.000000` (BIT-EXACT)**; Disk v3 Checkpoint **`max|dlogit|=0.000000` (BIT-EXACT)**.
+- **Test C — Tight-RAM R5 Pinning Stress (`--ctx 4096 --ram-mb 96 --no-preload-ram --kv-quant f16 --no-fp16-loop --verify`) — `exit 0`**:
+  - Only `29` RAM slots (`93.4 MiB`), `"17 * 23 is 391."` (**100% EXACT MATCH**).
+- **Test D — Live HTTP Security, Timeout, Overflow, UTF-8 & Vision Suite (15/15 PASS)**:
+  - Missing/wrong Bearer token & unauthenticated `/shutdown` → `401`; authenticated `/health` → `200`, no wildcard CORS.
+  - Cross-origin `OPTIONS` & DNS-rebinding `Host: evil.attacker.com:8799` → `403`; conflicting `Transfer-Encoding` + `Content-Length` → `400`.
+  - Local path, `file:///`, and UNC `\\127.0.0.1\c$\test.png` HTTP `image_url` → all blocked (`400`).
+  - `/health` during a stalled partial-header TCP connection → **`200` in `0.6 ms`**.
+  - Prompt `>= max_ctx` → `400` with `error.code = "context_length_exceeded"`.
+  - Multi-byte emoji SSE stream → `invalid=0`, 12 SSE chunks, exact `'🚀 🔥 🎉 🌊 🧠'`.
+  - Authenticated `data:image/png;base64` vision → `200`, accurate `'INKENGINE 3.2'`; authenticated `/shutdown` → `200`, clean exit.
+- **Test E — `inkcode.ps1` End-to-End Flow (`start` → token & `opencode.jsonc` check → `status` → `stop`)**:
+  - Auto-created `%LOCALAPPDATA%\InkEngine\api_token` (`ink-...`), synced `provider.inkengine.options.apiKey` in `opencode.jsonc` while leaving all other providers (`cerebras`, `modal`, `tokenrouter`) completely untouched.
+  - `inkcode status` reported `Vision=ON (0 MiB idle)`, `SWA 50.6 MiB` (`KV=723.2 MiB`, `Experts=4,838.2 MiB`), and `inkcode stop` cleanly freed all VRAM and RAM.
+
+---
+
 # Changelog / PR Notes — InkEngine v3.2 (Native Multimodal Vision — Zero Permanent VRAM/RAM)
 
 > **Suggested PR Title:** `v3.2: Add standalone GPU-streamed inkling2v multimodal vision encoder (0 MiB permanent VRAM/RAM), OpenAI image_url API, and OpenCode image support`

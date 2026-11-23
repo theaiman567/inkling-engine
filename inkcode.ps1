@@ -21,6 +21,41 @@ $Port       = 8787
 $BaseUrl    = "http://127.0.0.1:$Port"
 $ModelSpec  = "inkengine/Inkling-2-Mini"
 
+# Per-user CSPRNG Bearer token (R2 security): stored in %LOCALAPPDATA%\InkEngine\api_token and auto-synced with OpenCode!
+$InkDataDir = Join-Path $env:LOCALAPPDATA "InkEngine"
+$TokenFile  = Join-Path $InkDataDir "api_token"
+$ApiToken   = $env:INKENGINE_API_KEY
+if (-not $ApiToken) {
+    if (Test-Path $TokenFile) {
+        $ApiToken = (Get-Content -Path $TokenFile -Raw).Trim()
+    }
+    if (-not $ApiToken -or $ApiToken.Length -lt 16) {
+        if (-not (Test-Path $InkDataDir)) { New-Item -ItemType Directory -Path $InkDataDir -Force | Out-Null }
+        $bytes = New-Object byte[] 16
+        $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+        $rng.GetBytes($bytes)
+        $rng.Dispose()
+        $ApiToken = "ink-" + (($bytes | ForEach-Object { $_.ToString("x2") }) -join "")
+        Set-Content -Path $TokenFile -Value $ApiToken -NoNewline
+    }
+}
+$AuthHeaders = @{ Authorization = "Bearer $ApiToken" }
+
+function Sync-OpenCodeApiKey {
+    param([string]$Token)
+    $ocCfg = Join-Path $env:USERPROFILE ".config\opencode\opencode.jsonc"
+    if (-not (Test-Path $ocCfg)) { return }
+    try {
+        $raw = Get-Content -Path $ocCfg -Raw
+        $pattern = '("inkengine"\s*:\s*\{[^{}]*"options"\s*:\s*\{[^{}]*"apiKey"\s*:\s*")([^"]*)(")'
+        if ($raw -match $pattern -and $Matches[2] -ne $Token) {
+            $updated = [regex]::Replace($raw, $pattern, { param($m) $m.Groups[1].Value + $Token + $m.Groups[3].Value }, 1)
+            Set-Content -Path $ocCfg -Value $updated -NoNewline
+        }
+    } catch {}
+}
+Sync-OpenCodeApiKey -Token $ApiToken
+
 $Action      = "launch"
 $Ctx         = 131072
 $CtxExplicit = $false
@@ -66,7 +101,7 @@ for ($i = 0; $i -lt $args.Count; $i++) {
 
 function Get-InkHealth {
     try {
-        return Invoke-RestMethod -Uri "$BaseUrl/health" -TimeoutSec 2 -ErrorAction Stop
+        return Invoke-RestMethod -Uri "$BaseUrl/health" -Headers $AuthHeaders -TimeoutSec 2 -ErrorAction Stop
     } catch {
         return $null
     }
@@ -76,7 +111,7 @@ function Stop-InkServer {
     $h = Get-InkHealth
     if ($h) {
         try {
-            Invoke-RestMethod -Uri "$BaseUrl/shutdown" -Method Post -TimeoutSec 3 -ErrorAction SilentlyContinue | Out-Null
+            Invoke-RestMethod -Uri "$BaseUrl/shutdown" -Method Post -Headers $AuthHeaders -TimeoutSec 3 -ErrorAction SilentlyContinue | Out-Null
             Start-Sleep -Milliseconds 600
         } catch {}
     }
@@ -96,7 +131,7 @@ function Start-InkServerBackground {
     }
     if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
 
-    $argStr = "--serve --host 127.0.0.1 --port $Port --ctx $TargetCtx --ram-kv-mb $TargetRamKv --effort $TargetEffort"
+    $argStr = "--serve --host 127.0.0.1 --port $Port --ctx $TargetCtx --ram-kv-mb $TargetRamKv --effort $TargetEffort --api-key `"$ApiToken`""
     if ($GgufPath) {
         $argStr = "--model `"$GgufPath`" " + $argStr
     }
@@ -171,7 +206,7 @@ switch ($Action) {
             Write-Host "[InkEngine] Status: STOPPED (run 'inkcode' or 'inkcode start' to load)" -ForegroundColor Yellow
             exit 0
         }
-        $st = Invoke-RestMethod -Uri "$BaseUrl/stats" -TimeoutSec 3
+        $st = Invoke-RestMethod -Uri "$BaseUrl/stats" -Headers $AuthHeaders -TimeoutSec 3
         $proc = Get-Process -Name "inkengine" -ErrorAction SilentlyContinue | Select-Object -First 1
         $effShow = if ($h.effort) { $h.effort } else { "unknown" }
         $visShow = if ($h.vision -eq $true) { "ON (0 MiB idle)" } else { "OFF" }

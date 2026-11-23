@@ -2323,10 +2323,9 @@ __global__ void k_moe_split_hits(
             dst[i] = src[i];
         }
     }
+    // Every thread that wrote zero-copy pinned host memory MUST issue a system-scope fence!
+    __threadfence_system();
     __syncthreads();
-    if (threadIdx.x == 0) {
-        __threadfence_system();
-    }
 }
 
 template <uint32_t TYPE, int G>

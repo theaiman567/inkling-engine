@@ -1,5 +1,5 @@
 ================================================================================
-  INKENGINE — COMPLETE OVERVIEW, VERSION HISTORY (v1.0 -> v3.2) & BENCHMARKS
+  INKENGINE — COMPLETE OVERVIEW, VERSION HISTORY (v1.0 -> v3.3) & BENCHMARKS
 ================================================================================
 
 Last Updated : 2026-11-23
@@ -59,35 +59,39 @@ InkEngine exploits two unique structural facts about Inkling-2-Mini:
 
   B) Hybrid Sliding-Window + Global Attention:
      - 40 of the 48 logical layers are Sliding-Window Attention (SWA = 1,024
-       tokens). Their KV cache NEVER grows beyond 45 MiB total in VRAM — even
-       at 1,000,000 tokens!
+       tokens, backed by a wrap-safe 1,152-slot ring buffer in v3.3). Their KV
+       cache NEVER grows beyond 50.6 MiB total in VRAM — even at 1,000,000
+       tokens!
      - Only 8 logical layers are Global Attention. InkEngine pages those 8
-       layers in 64-token blocks across VRAM -> RAM -> NVMe SSD, using INT8
-       Quest summaries + GPU Radix-Select Top-K to fetch only the most relevant
-       historical pages on ultra-long contexts (256K–1M).
+       layers in 64-token blocks across VRAM -> RAM -> NVMe SSD (with disjoint
+       per-layer page tables), using INT8 Quest summaries + GPU Radix-Select
+       Top-K to fetch only the most relevant historical pages on ultra-long
+       contexts (256K–1M).
 
 Exact 3-Tier Memory Split at 128K Context (RTX 4060 8 GB + 16 GB RAM, Q4_0 KV):
   - GPU VRAM (~7,590 / 8,188 MiB used, ~250–370 MiB Windows safety headroom):
       * Dense weights (attention, loop controllers, routers, LM head): 988 MiB
-      * KV Cache (40 SWA = 45 MiB + 8 Global = 640 MiB + Quest = 32.6 MiB): 718 MiB
-      * Dynamic Expert VRAM Pool (1,494 / 3,072 experts = 48.6%): 4,842 MiB
+      * KV Cache (40 SWA = 50.6 MiB + 8 Global = 640.0 MiB + Quest = 32.6 MiB): 723.2 MiB
+      * Dynamic Expert VRAM Pool (1,493 / 3,072 experts = 48.6%): 4,838 MiB
       * CUDA context, 97 Graphs, batch/PCIe staging buffers: ~1,042 MiB
   - System RAM (~5.6–6.2 GiB total process working set):
-      * Tier-1 Expert RAM Pool (all 1,578 remaining cold experts): 5,363 MiB
+      * Tier-1 Expert RAM Pool (all 1,579 remaining cold experts): 5,367 MiB
       * Tier-1 Global KV RAM Pool: 512 MiB (up to 1,024 MiB cap)
       * Live prefix & turn-rewind snapshots: ~250–400 MiB
   - SSD Storage:
       * Model GGUF (read-only on SATA S:): 10.86 GiB (0 steady-state reads @ 128K!)
-      * Persistent NVMe OpenCode KV Prefix Cache (%LOCALAPPDATA%\InkEngine\kv_cache): ~369–383 MiB
+      * Persistent NVMe OpenCode KV Prefix Cache (%LOCALAPPDATA%\InkEngine\kv_cache): ~369–383 MiB (v3)
       * NVMe KV Page Swap (%TEMP%\inkengine_kv_swap.bin): 0 MiB @ 128K;
         grows automatically past 128K (~3.05 GiB @ 512K).
 
 Everyday Serving Integration:
-  - Runs as a lightweight headless OpenAI-compatible HTTP server on
-    http://127.0.0.1:8787/v1 (zero browser/GUI overhead).
-  - Global `inkcode` command auto-starts InkEngine in the background and
-    launches the OpenCode CLI pre-connected to Inkling-2-Mini with full tool
-    calling, thinking/reasoning streaming, and KV prefix caching.
+  - Runs as a hardened headless OpenAI-compatible HTTP server on
+    http://127.0.0.1:8787/v1 (CSPRNG Bearer auth, Host allowlist, no wildcard
+    CORS, 10s/30s socket timeouts, zero browser/GUI overhead).
+  - Global `inkcode` command auto-manages the per-user API token in
+    %LOCALAPPDATA%\InkEngine\api_token (syncing only inkengine in opencode.jsonc),
+    auto-starts InkEngine in the background, and launches OpenCode CLI with full
+    multimodal vision, tool calling, reasoning streaming, and KV prefix caching.
 
 
 ================================================================================
@@ -353,6 +357,74 @@ Key Verified Results (v3.1 -> v3.2):
         cached KV tokens restored in 10.0 ms (TTFT dropped 19.9s -> 2.0s!).
   - Text-Only Exact Parity (`--verify`): 100% EXACT MATCH (29/29 + "17 * 23 is 391.").
 
+--------------------------------------------------------------------------------
+VERSION 3.3: "Correct & Safe" — Long-Context Parity, Security & Async Race Fixes
+--------------------------------------------------------------------------------
+Implemented Milestone 1 (R0, R1, R2, R3, R5, R7, R9) from the senior-agent
+architecture review (`improvement paper.txt`) — eliminating long-context (>1,024)
+corruption bugs, hardening the local HTTP server, and adding an automated
+`--verify-suite` regression gate that uncovered 3 deeper concurrency/coherency
+bugs on fast VRAM-resident paths!
+
+What was added / fixed on top of v3.2:
+  1. Wrap-Safe 1,152-Slot SWA Ring Buffer (R1 / SR3-01):
+     - Expanded SWA ring capacity from 1,024 -> 1,152 slots (+128 batch slack,
+       only +5.6 MiB VRAM at Q4_0 -> 50.6 MiB total) so batched prefill (B<=128)
+       and speculative verification never overwrite live window slots past
+       position 1,024. Bumped Disk KV checkpoints v2 -> v3.
+  2. Cold Expert RAM Slot Pinning (R5 / SR3-04):
+     - Added ref-counted `pin_ram_expert` / `unpin_ram_slots` + micro-batch
+       pinning in `forward_batch()`, preventing tight-RAM eviction of a cold
+       expert before its batched read completes.
+  3. Local HTTP Security Hardening & Seamless OpenCode Token Sync (R2 / SR1-09):
+     - Enabled default CSPRNG Bearer token auth on ALL endpoints (/health,
+       /stats, /shutdown, /v1/*; `--api-key` / `--no-auth`).
+     - Removed wildcard CORS (`--cors-origin` opt-in), enforced loopback `Host`
+       allowlist (blocks DNS rebinding with HTTP 403), and blocked local paths,
+       `file:///`, and UNC shares in HTTP `image_url` (CLI `--image` kept safe
+       with UNC/device paths blocked everywhere).
+     - `inkcode.ps1` auto-generates `%LOCALAPPDATA%\InkEngine\api_token` and
+       syncs strictly `provider.inkengine.options.apiKey` in `opencode.jsonc`.
+  4. Context Overflow Guard, UTF-8 SSE Buffering & Non-Blocking Worker Threads
+     (R3, R7, R9):
+     - Prompts `>= max_ctx` return HTTP 400 (`context_length_exceeded`),
+       `max_tokens` is clamped, and `finish_reason: "length"` is accurate.
+     - Per-stream `Utf8StreamBuffer` prevents broken multi-byte emojis in SSE.
+     - Added `SO_RCVTIMEO=10s`, `SO_SNDTIMEO=30s`, strict anti-smuggling header
+       parser (rejects TE+CL), and 16 bounded worker threads so `/health`
+       answers in <1 ms even during stalled sockets.
+  5. Automated Long-Context Parity Gate (`--verify-suite`, R0 / SR1-01):
+     - Verifies SWA ring-wrap Query-0 parity (Gate 1A), post-wrap multi-chunk
+       prefill `B=128/32/7` (Gate 1B), Speculative ON vs OFF past `pos=1024`
+       (Gate 2), and Turn-Rewind + Disk v3 Checkpoint restore (Gate 3).
+  6. Three Bonus Concurrency/Coherency Bugs Caught & Fixed by R0:
+     - Silent Async Global-KV Page-Table Race (`src/paged_kv.cpp`): gave all 8
+       global attention layers disjoint host+device page tables (`8 x max_pages`,
+       zero extra syncs) so the zero-sync core fast path can never overwrite an
+       earlier layer's in-flight `cudaMemcpyAsync` page table.
+     - Per-Thread `__threadfence_system()` in `k_moe_split_hits` (was thread 0
+       only before `__syncthreads()`).
+     - Replaced `cudaHostAllocWriteCombined` with coherent `cudaHostAllocDefault`
+       on host staging buffers + 64-byte cache-line aligned CPU MoE slices +
+       safe `d_tau_global_` sync copy & `!need_logits` sync.
+
+Key Verified Results (v3.2 -> v3.3):
+  - F16 Golden + R0 Parity (`--verify --verify-suite`): ALL GATES PASSED (exit 0),
+    `L0_SWA_err=0.000001`, Speculative `96/96` exact (`77/77=100%`), Turn-Rewind
+    & Disk v3 Checkpoint `0.000000` BIT-EXACT.
+  - Production Q4_0 R0 Parity (`--kv-quant q4 --verify-suite`): ALL GATES PASSED
+    (exit 0), Speculative `96/96` exact (`77/77=100%`), Turn-Rewind & Disk v3
+    Checkpoint `0.000000` BIT-EXACT.
+  - Tight-RAM R5 Stress (`--ram-mb 96 --no-preload-ram`, 29 RAM slots): 100%
+    EXACT MATCH (`"17 * 23 is 391."`).
+  - Live HTTP Security/Timeout/Overflow/UTF-8/Vision Suite: 15/15 PASS
+    (401 unauth, 403 DNS-rebind/CORS, 400 TE+CL & local/UNC `image_url`, `/health`
+    0.6 ms during stalled TCP client, exact `'🚀 🔥 🎉 🌊 🧠'` SSE stream,
+    authenticated base64 vision `'INKENGINE 3.2'`, clean `/shutdown`).
+  - `inkcode.ps1` end-to-end: auto-synced token into `opencode.jsonc` without
+    touching `cerebras` / `modal` / `tokenrouter`, `Vision=ON (0 MiB idle)`,
+    `SWA 50.6 MiB`, clean stop.
+
 
 ================================================================================
 4. COMPLETE BENCHMARK & SPEED PROGRESSION SUMMARY
@@ -361,7 +433,7 @@ Key Verified Results (v3.1 -> v3.2):
 All speeds measured on RTX 4060 8 GB + Ryzen 5 5500 + 16 GB DDR4, Q4_0 KV,
 Inkling-2-Mini-UD-IQ3_XXS.gguf (10.86 GiB):
 
-Benchmark                     | llama.cpp  |   v1.0   |   v2.0   |   v3.0   | v3.2 (Latest)       | Total Gain vs llama.cpp
+Benchmark                     | llama.cpp  |   v1.0   |   v2.0   |   v3.0   | v3.3 (Latest)       | Total Gain vs llama.cpp
 ------------------------------+------------+----------+----------+----------+---------------------+------------------------
 64K steady decode             | 10.64 t/s* | 26.03    | 32.34    | 32.65    | ~32.65 t/s          | 3.07x faster
 128K full context (pos=130K)  | OOM        | 20.15    | 27.57    | 27.58    | ~27.58 t/s          | 2.59x (2.7x context)
@@ -372,9 +444,11 @@ Batched prefill (2K prompt)   | ~55 t/s    | ~24      | 71.80    | 120.69   | ~1
 Cold server boot (128K)       | ~40s       | ~34s     | 34.4s    | 18.6s    | 16.0s - 18.6s       | ~2.2x faster boot
 OpenCode Turn 1 (10.5K, cold) | ~200s      | ~440s    | 163.3s   | 99.6s    | ~99.6s              | ~2.0x faster
 OpenCode Turn 1 (post-reboot) | ~200s      | ~440s    | 163.3s   | 29.1s    | ~29.1s (185ms load) | ~6.9x faster!
-Retry recovery (same turn)    | Re-prefill | Re-pref  | Re-pref  | Re-pref  | ~4 ms rewind (99%+) | ~300s -> ~1s!
+Retry recovery (same turn)    | Re-prefill | Re-pref  | Re-pref  | Re-pref  | ~4 ms bit-exact!    | ~300s -> ~1s!
 Client disconnect abort       | N/A        | Blocks   | Blocks   | Blocks   | 842 ms (<1s!)       | Zero zombie hangs
 Q4_0 KV rounding accuracy     | Unbiased   | +0.5d    | +0.5d    | +0.5d    | Unbiased (0 bias)   | 2x lower max KV error
+Long-ctx (>1024) parity gate  | Reference  | Untested | Untested | Untested | ALL GATES PASS (v3.3)| Bit-exact restore!
+HTTP Security / Hardening     | Optional   | Open     | Open     | Open     | Bearer+Host+15/15   | DNS-rebind/LFI safe!
 Multimodal Vision (idle cost) | ~610M VRAM | N/A      | N/A      | N/A      | 0 MiB VRAM / 0 RAM  | Zero text regression!
 HD 1080p Vision + Cache Hit   | Pinned GPU | N/A      | N/A      | N/A      | 2.99s / 0ms+10ms KV | Full OpenCode vision!
 Exact token parity (--verify) | Reference  | 100%     | 100%     | 100%     | 100% (29/29 + 391)  | Lossless exact match
@@ -393,16 +467,17 @@ Physics Perspective (RTX 4060 8 GB, 272 GB/s GDDR6):
     means InkEngine v3.x is operating near the physical hardware ceiling of an
     8 GB RTX 4060!
 
-System Resource Footprint (v2.0 vs v3.0/v3.1/v3.2 @ 128K Context):
-  - GPU VRAM Used           : ~7,680 MiB (v2.0) -> ~7,585 MiB (v3.x)
-  - VRAM Expert Slots       : 1,445 slots       -> 1,494 slots (+49 hot experts!)
-  - Vision Idle Footprint   : N/A               -> 0 MiB VRAM / 0 MiB RAM (v3.2)
+System Resource Footprint (v2.0 vs v3.3 @ 128K Context):
+  - GPU VRAM Used           : ~7,680 MiB (v2.0) -> ~7,590 MiB (v3.3)
+  - VRAM Expert Slots       : 1,445 slots       -> 1,493 slots (+48 hot experts!)
+  - KV Cache VRAM (Q4_0)    : 718 MiB (45 SWA)  -> 723.2 MiB (50.6 SWA wrap-safe!)
+  - Vision Idle Footprint   : N/A               -> 0 MiB VRAM / 0 MiB RAM (v3.2+)
   - Expert VRAM Hit Rate    : 92.0% (128K)      -> 93.1% (128K) / 93.9% (64K)
-  - Tier-1 RAM Expert Pool  : 5,450 MiB         -> 5,363 MiB (-86 MiB RAM)
+  - Tier-1 RAM Expert Pool  : 5,450 MiB         -> 5,367 MiB (-83 MiB RAM)
   - Process Working Set RAM : ~5,950 MiB        -> 5,610 MiB idle / 6,210 MiB active
   - Expert SSD Reads @ 128K : 0                 -> 0 (100% in VRAM + RAM)
   - NVMe KV Swap @ 128K     : 0 MiB             -> 0 MiB (activates >128K)
-  - NVMe Prefix Cache       : 0 MiB             -> ~369–383 MiB (3 v2 .ckpt files)
+  - NVMe Prefix Cache       : 0 MiB             -> ~369–383 MiB (3 v3 .ckpt files)
 
 
 ================================================================================
@@ -454,26 +529,26 @@ Key Files in C:\Users\User\Desktop\inkling-engine:
   build\inkengine.exe          Compiled standalone engine binary
   inkcode.ps1                  Portable background server + OpenCode launcher
   README.md                    GitHub landing page, install & tuning guide
-  CHANGELOG.md                 Detailed v3.2 + v3.1 PR notes & commit summary
+  CHANGELOG.md                 Detailed v3.3 + v3.2 + v3.1 PR notes & commit summary
   INKENGINE_OVERVIEW.txt       This complete overview & version history
   models\                      Learned MoE expert predictors (pred-v3, start-v3)
   logs\server.log              Live HTTP, vision, prefill, decode & cache telemetry
   src\cuda_kernels.cu/.cuh     Fused CUDA kernels, WMMA prefill, KV, 6 vision kernels
   src\vision.cpp/.h            Standalone WIC + GPU-streamed inkling2v vision encoder
-  src\cpu_kernels.cpp/.h       AVX2 multi-threaded fallback for missed experts
-  src\expert_cache.cpp/.h      2-bucket 3-tier VRAM/RAM/SSD expert cache + DMA
+  src\cpu_kernels.cpp/.h       AVX2 multi-threaded fallback (64B aligned slices)
+  src\expert_cache.cpp/.h      2-bucket 3-tier VRAM/RAM/SSD expert cache + RAM pinning
   src\moe_predictor.cpp/.h     Native C++17/AVX2 .moepred predictor runtime
-  src\paged_kv.cpp/.h          3-tier HybridPagedKV, Quest Top-K, NVMe + Rewind
-  src\model.cpp/.h             Inkling-2 forward, multimodal prefill, speculative
-  src\server.cpp/.h            OpenAI HTTP/SSE server, vision image_url, tools
+  src\paged_kv.cpp/.h          3-tier HybridPagedKV, 1152-SWA, per-layer page tables, v3 ckpt
+  src\model.cpp/.h             Inkling-2 forward, multimodal prefill, spec, --verify-suite
+  src\server.cpp/.h            Hardened OpenAI HTTP/SSE server, Bearer auth, UTF-8, workers
   src\tokenizer.cpp/.h         Inkling-2 BPE tokenizer & multimodal chat formatter
   src\gguf.cpp/.h              Standalone GGUF v3 parser + Win32 overlapped I/O
-  src\main.cpp                 CLI entry point (--image/--mmproj), bench & verify
+  src\main.cpp                 CLI entry point (--verify-suite/--api-key/--image), bench
 
-Potential Future Upgrades:
-  - Q8_0 vs Q4_0 KV cache A/B quality/speed comparison (--kv-quant q8 already
-    built in and ready to test!).
-  - Q4_K / Q5_K / Q6_K / IQ4_XS CPU AVX2 MoE kernels for running 15–17 GB
-    4-bit quants (UD-IQ4_XS / UD-Q4_K_M).
-  - Linux POSIX / io_uring port for cross-platform open-source contributors.
+Upcoming Roadmap (from Senior-Agent Review):
+  - Milestone 2 (v3.4 Hardening): Full Q4_0/Q8_0 KV parity, stricter GGUF/JSON
+    bounds & parser checks, SSE/socket edge-case tests, disk swap resilience.
+  - Milestone 3 (v4.0 Speedups): Faster prefill/decode kernels, deeper async
+    overlap, Q8_0 vs Q4_0 KV A/B tuning, Q4_K/Q5_K/Q6_K AVX2 CPU kernels.
+  - Cross-Platform: Linux POSIX / io_uring port for open-source contributors.
 ================================================================================

@@ -43,6 +43,7 @@ void print_usage() {
         "  --bench-prefill <N>    Benchmark batched prompt prefill speed on N tokens\n"
         "  --threads <N>          CPU AVX2 worker threads for missed experts (default: 10)\n"
         "  --verify               Run golden correctness check vs llama.cpp reference tokens\n"
+        "  --verify-suite         Run R0 long-context (>1024 SWA), speculative & checkpoint parity gate suite\n"
         "  --bench <N>            Benchmark decode throughput for N tokens (with optional --bench-pos P)\n"
         "  --bench-pos <P>        Simulate long context at position P (e.g. 32768, 65536, 131072, 262144)\n"
         "  --profile              Print per-stage millisecond breakdown during --bench / --prompt\n"
@@ -53,6 +54,9 @@ void print_usage() {
         "  --serve                Start OpenAI-compatible HTTP server\n"
         "  --host <ip>            Server bind host (default: 127.0.0.1)\n"
         "  --port <P>             Server port (default: 8080)\n"
+        "  --api-key <token>      Bearer auth token for HTTP server (default: auto-generated CSPRNG token)\n"
+        "  --no-auth              Disable HTTP Bearer authentication (NOT recommended on shared machines)\n"
+        "  --cors-origin <orig>   Allow CORS for one explicit origin (default: CORS disabled)\n"
     );
 }
 
@@ -91,6 +95,7 @@ int main(int argc, char** argv) {
 
     SamplingParams sp;
     bool do_verify = false;
+    bool do_verify_suite = false;
     bool do_verify_pred = false;
     bool do_probe_ee = false;
     bool do_serve = false;
@@ -101,8 +106,7 @@ int main(int argc, char** argv) {
     std::string prompt_str;
     std::vector<std::string> image_paths;
     std::string effort = "";
-    std::string host = "127.0.0.1";
-    int port = 8080;
+    ServerConfig srv_cfg;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -153,6 +157,7 @@ int main(int argc, char** argv) {
         else if (a == "--bench-prefill") bench_prefill_n = std::stoi(next());
         else if (a == "--threads") cfg.n_threads = std::stoi(next());
         else if (a == "--verify") do_verify = true;
+        else if (a == "--verify-suite") do_verify_suite = true;
         else if (a == "--bench") bench_n = std::stoi(next());
         else if (a == "--bench-pos") bench_pos = std::stoi(next());
         else if (a == "--profile") do_profile = true;
@@ -161,8 +166,11 @@ int main(int argc, char** argv) {
         else if (a == "--max-tokens") sp.max_tokens = std::stoi(next());
         else if (a == "--temp") sp.temperature = std::stof(next());
         else if (a == "--serve") do_serve = true;
-        else if (a == "--host") host = next();
-        else if (a == "--port") port = std::stoi(next());
+        else if (a == "--host") srv_cfg.host = next();
+        else if (a == "--port") srv_cfg.port = std::stoi(next());
+        else if (a == "--api-key") srv_cfg.api_key = next();
+        else if (a == "--no-auth") srv_cfg.require_auth = false;
+        else if (a == "--cors-origin") srv_cfg.cors_origin = next();
     }
 
     if (do_verify_pred) {
@@ -227,6 +235,11 @@ int main(int argc, char** argv) {
                     res.prompt_tokens * 1000.0 / std::max(res.prefill_ms, 0.001), res.prefill_ms,
                     res.gen_tokens * 1000.0 / std::max(res.decode_ms, 0.001), res.decode_ms, res.gen_tokens);
         if (do_profile) print_profile(engine);
+    }
+
+    if (do_verify_suite) {
+        bool ok_suite = engine.run_parity_suite();
+        if (!ok_suite) return 1;
     }
 
     if (do_probe_ee) {
@@ -342,7 +355,7 @@ int main(int argc, char** argv) {
             encoded_imgs.reserve(image_paths.size());
             for (const auto& ipath : image_paths) {
                 EncodedImage enc;
-                if (!engine.encode_image_input(ipath, enc)) {
+                if (!engine.encode_image_input(ipath, enc, /*allow_local_files=*/true)) {
                     std::fprintf(stderr, "[ERROR] Failed to encode image: %s\n", ipath.c_str());
                     return 1;
                 }
@@ -395,8 +408,8 @@ int main(int argc, char** argv) {
     }
 
     if (do_serve) {
-        std::string s_eff = effort.empty() ? "max" : effort;
-        OpenAIServer srv(engine, host, port, s_eff);
+        srv_cfg.default_effort = effort.empty() ? "max" : effort;
+        OpenAIServer srv(engine, srv_cfg);
         srv.run();
     }
 
