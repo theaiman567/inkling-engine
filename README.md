@@ -1,8 +1,8 @@
-# InkEngine v3.1
+# InkEngine v3.2
 
-**A standalone C++17 / CUDA / AVX2 3-tier (VRAM → RAM → SSD) serving engine built from scratch for [Inkling-2-Mini](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) (`general.architecture = inkling2`), with zero `llama.cpp` or `ggml` dependencies.**
+**A standalone C++17 / CUDA / AVX2 3-tier (VRAM → RAM → SSD) multimodal serving engine built from scratch for [Inkling-2-Mini](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) (`general.architecture = inkling2` + `inkling2v` vision), with zero `llama.cpp` or `ggml` dependencies.**
 
-InkEngine is engineered specifically for consumer GPUs that **cannot fit the full model + long context in VRAM** (e.g., 6–12 GB NVIDIA GPUs + 16 GB RAM + NVMe/SATA SSDs). By exploiting Inkling-2's **3× Looped-MoE architecture** (where 12 physical Core layers execute 3× per token while 12 Outer layers execute 1×), pairing a native **learned MoE expert predictor**, and paging global KV cache across VRAM → RAM → NVMe SSD with GPU Radix-Select Quest attention, InkEngine delivers **3× faster decode**, **2.2× faster prefill**, and **up to 512K–1M token context** on an 8 GB GPU — with **100% lossless token parity**.
+InkEngine is engineered specifically for consumer GPUs that **cannot fit the full model + long context in VRAM** (e.g., 6–12 GB NVIDIA GPUs + 16 GB RAM + NVMe/SATA SSDs). By exploiting Inkling-2's **3× Looped-MoE architecture** (where 12 physical Core layers execute 3× per token while 12 Outer layers execute 1×), pairing a native **learned MoE expert predictor**, paging global KV cache across VRAM → RAM → NVMe SSD with GPU Radix-Select Quest attention, and streaming **multimodal vision (`mmproj-F16.gguf`)** on-demand through GPU Tensor Cores with **0 MiB permanent VRAM/RAM overhead**, InkEngine delivers **3× faster decode**, **2.2× faster prefill**, **native image understanding**, and **up to 512K–1M token context** on an 8 GB GPU — with **100% lossless token parity**.
 
 ---
 
@@ -64,11 +64,12 @@ Run `build.bat` and pass your GPU's CUDA compute capability (`sm_XX`):
 ```cmd
 build.bat sm_89
 ```
-This compiles `src/cuda_kernels.cu` + the 9 C++17/AVX2 modules into `build\inkengine.exe` (no external libraries beyond `cudart.lib` and `ws2_32.lib`).
+This compiles `src/cuda_kernels.cu` + the 10 C++17/AVX2 modules into `build\inkengine.exe` (no external libraries beyond standard CUDA & Windows system libs: `cudart.lib`, `ws2_32.lib`, `windowscodecs.lib`, `ole32.lib`).
 
-### 3. Download the Model GGUF
+### 3. Download the Model GGUF *(+ Optional Vision Projector)*
 Download an Inkling-2-Mini GGUF (for 8 GB GPUs, **`Inkling-2-Mini-UD-IQ3_XXS.gguf`** ~10.86 GiB is recommended):
 - Hugging Face: [unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF)
+- **Multimodal Vision *(Optional, Recommended)***: Also download **`mmproj-F16.gguf`** (~610 MB) from the same repo and place it in the **same folder** as your model GGUF. InkEngine auto-detects it at startup with **0 MiB permanent VRAM and 0 MiB permanent RAM overhead** — weights stream layer-by-layer on demand through the engine's existing 14 MiB PCIe staging buffer onto GPU Tensor Cores, and all temporary activation VRAM is freed immediately after encoding each image.
 
 ### 4. Download the Learned MoE Expert Predictor *(Optional, Strongly Recommended for ≤12 GB GPUs)*
 InkEngine includes a pure C++17/AVX2 runtime for [Lanilen/Inkling-2-Mini-Expert-Predictor](https://huggingface.co/Lanilen/Inkling-2-Mini-Expert-Predictor), which lifts 8 GB VRAM hit rates from ~79% to **~93–94%** (+25% faster decode).
@@ -94,16 +95,17 @@ build\inkengine.exe --model "C:\path\to\Inkling-2-Mini-UD-IQ3_XXS.gguf" --serve 
 ```
 
 Endpoints exposed:
-- `POST /v1/chat/completions` (SSE streaming, tool calls, `reasoning_content`, automatic KV prefix caching)
+- `POST /v1/chat/completions` (SSE streaming, **multimodal `image_url` PNG/JPEG/BMP/WebP**, tool calls, `reasoning_content`, automatic KV prefix caching — including multi-turn image KV reuse!)
 - `POST /v1/completions`
 - `GET /v1/models`
-- `GET /health` (readiness, `max_ctx`, active `effort`)
+- `GET /health` (readiness, `max_ctx`, active `effort`, `vision` status)
 - `GET /stats` (live VRAM / RAM / SSD telemetry & expert cache hit rates)
 - `POST /shutdown` (clean shutdown)
 
-### Option B: Standalone CLI Prompt
+### Option B: Standalone CLI Prompt *(Text or Image)*
 ```cmd
 build\inkengine.exe --model "C:\path\to\Inkling-2-Mini-UD-IQ3_XXS.gguf" --ctx 65536 --effort medium --prompt "Explain how paged attention works." --max-tokens 512
+build\inkengine.exe --model "C:\path\to\Inkling-2-Mini-UD-IQ3_XXS.gguf" --ctx 16384 --effort low --image "C:\path\to\screenshot.png" --prompt "Inspect this UI screenshot for layout bugs."
 ```
 
 ### Option C: One-Command OpenCode CLI (`inkcode`)
@@ -134,6 +136,7 @@ build\inkengine.exe --model "C:\path\to\Inkling-2-Mini-UD-IQ3_XXS.gguf" --ctx 65
              "name": "Inkling-2-Mini (Local 3-Tier)",
              "reasoning": true,
              "tool_call": true,
+             "modalities": { "input": ["text", "image"], "output": ["text"] },
              "limit": { "context": 131072, "output": 16384 }
            }
          }
@@ -172,6 +175,9 @@ InkEngine automatically queries your free VRAM and system RAM at startup, so mos
 | `--threads <N>` | `10` | Set to your CPU's physical performance-core count (or ~75–85% of logical threads) for fastest CPU fallback on missed experts. |
 | `--self-draft-k <0\|2\|3>` | `0` (off) | Opt-in 1-Loop (24L) GPU-only lossless self-speculative drafting. Boosts code/refactoring speed (+7–10%), though cold prose may see lower acceptance. |
 | `--no-disk-kv-cache` | *(enabled)* | Disable persistent NVMe OpenCode KV prefix checkpoints in `%LOCALAPPDATA%\InkEngine\kv_cache\`. |
+| `--mmproj <path>` | *(auto-detected)* | Explicit path to `mmproj-F16.gguf` if stored outside your model GGUF directory (or set `INKENGINE_MMPROJ` for `inkcode`). |
+| `--image <path>` | *(none)* | Attach one or more local PNG/JPEG/BMP/WebP images to standalone `--prompt` CLI calls. |
+| `--no-vision` | *(vision ON)* | Disable multimodal vision auto-detection even if `mmproj-F16.gguf` is present. |
 | `--sync-preload` | *(async)* | Wait for full Tier-1 RAM expert preload to finish before opening the HTTP port. |
 
 ---
@@ -180,7 +186,7 @@ InkEngine automatically queries your free VRAM and system RAM at startup, so mos
 
 Measured on **RTX 4060 8 GB + Ryzen 5 5500 (6C/12T) + 16 GB DDR4 + SATA model SSD + NVMe OS SSD**, running `Inkling-2-Mini-UD-IQ3_XXS.gguf` (10.86 GiB) with `Q4_0` KV cache:
 
-| Benchmark | `llama.cpp` (Unsloth Studio) | InkEngine v1.0 | InkEngine v2.0 | **InkEngine v3.0** | v3.0 vs. `llama.cpp` |
+| Benchmark | `llama.cpp` (Unsloth Studio) | InkEngine v1.0 | InkEngine v2.0 | **InkEngine v3.2** | v3.2 vs. `llama.cpp` |
 |---|---:|---:|---:|---:|---:|
 | **64K steady decode** | 10.64 tok/s *(48K max)* | 26.03 tok/s | 32.34 tok/s | **32.65 tok/s** | **3.07×** |
 | **128K full context (`pos=130K`)** | OOM | 20.15 tok/s | 27.57 tok/s | **27.58 tok/s** | **2.59×** *(2.7× ctx)* |
@@ -190,6 +196,8 @@ Measured on **RTX 4060 8 GB + Ryzen 5 5500 (6C/12T) + 16 GB DDR4 + SATA model SS
 | **Batched prefill (2K code prompt)** | ~55 tok/s | ~24 tok/s | 71.8 tok/s | **120.69 tok/s** | **~2.19×** |
 | **Cold server boot (`128K`)** | ~40s | ~34s | 34.4s | **18.6s** *(async RAM warm)* | **~2.1× faster** |
 | **OpenCode Turn 1 (10.5K prompt)** | ~200s | ~440s | 163.3s | **99.6s** *(cold)* / **29.1s** *(NVMe KV hit)* | **~6.9× faster** |
+| **Multimodal Vision (`mmproj-F16`, idle)** | ~610+ MiB VRAM/RAM | N/A | N/A | **0 MiB permanent VRAM / 0 MiB RAM** | **Zero text slowdown** |
+| **Full HD 1080p encode + multi-turn cache** | Re-encodes or pins VRAM | N/A | N/A | **~3.0s** *(SATA stream)* / **0.0 ms + 10 ms KV hit** | **1,494 VRAM slots kept** |
 
 ### Exactness & Verification Commands
 You can verify token-for-token exactness and predictor math on your own machine:
@@ -212,7 +220,8 @@ build\inkengine.exe --model "C:\path\to\model.gguf" --ctx 65536 --bench 128
 4. **Layer-Wise PCIe-Streamed WMMA Tensor Core Prefill (`B = 128`)**: Cooperative 8-element dequantizer across 10 quant formats feeding `nvcuda::wmma` FP16→FP32 Tensor Cores, with a double-buffered 28 MiB PCIe staging ring for cold outer experts.
 5. **3-Tier Hybrid Paged KV (VRAM → RAM → NVMe SSD) + GPU Radix-Select Quest**: Keeps all 40 SWA layers (~45 MiB) pinned in VRAM and pages the 8 Global layers across VRAM, RAM, and Queue-Depth-16 `FILE_FLAG_OVERLAPPED` NVMe SSD using INT8 Quest summaries and O(N) GPU Radix-Select Top-K.
 6. **Zero-VRAM Lossless Speculative Decoding**: O(1) rolling 3-gram suffix hash index across the full context (`K ≤ 6`) plus opt-in 1-Loop (24L) GPU-only self-drafting (`--self-draft-k`).
-7. **Persistent NVMe OpenCode KV Checkpoints**: Atomic 3-tier prefix checkpoints (`tools-prefix`, pre-`<env>` `static-prefix`, `full-system`) restored in `<200 ms` across restarts.
+7. **Persistent NVMe OpenCode KV Checkpoints**: Atomic 3-tier prefix checkpoints (`tools-prefix`, pre-`<env>` `static-prefix`, `full-system`) restored in `<200 ms` across restarts, plus `~49 MiB` zero-Global-copy `~4–10 ms` in-place turn-rewind snapshots.
+8. **Zero-Overhead GPU-Streamed Multimodal Vision (`inkling2v`)**: Pure Windows WIC decoder + 6 custom CUDA ViT/projector kernels (23-layer Perception-Encoder ViT, exact 2D RoPE, tiled FlashAttention, 2×2 spatial merge, `tok_norm` bypass) streamed in 8–9 MiB slices through the existing prefill PCIe staging ring — leaving all 1,494 VRAM expert slots, RAM budget, and text decode speed 100% untouched. Deterministic hash-derived synthetic token IDs let OpenCode multi-turn conversations reuse both cached image embeddings (`0.0 ms`) and KV prefix caches (`~10 ms`) automatically.
 
 ---
 

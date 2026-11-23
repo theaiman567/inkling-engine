@@ -12,6 +12,12 @@
 #include "paged_kv.h"
 #include "tokenizer.h"
 #include "moe_predictor.h"
+#include "vision.h"
+
+struct MultimodalEmbeddings {
+    // Negative synthetic token ID -> raw [n_embd] FP32 vision embedding (bypasses tok_norm!)
+    std::unordered_map<int32_t, const float*> id_to_embd;
+};
 
 struct EngineConfig {
     std::string model_path;
@@ -39,6 +45,8 @@ struct EngineConfig {
     int  self_draft_k = 0;          // Opt-in 1-Loop (24L) GPU-Only lossless self-draft (--self-draft-k 2|3, up to 37.9 tok/s on code!)
     bool use_disk_kv_cache = true;  // Persistent NVMe OpenCode KV prefix cache (<100 ms cold Turn 1!)
     std::string kv_cache_dir;       // defaults to %LOCALAPPDATA%\InkEngine\kv_cache
+    bool use_vision = true;         // Auto-load mmproj-F16.gguf (0 MiB permanent VRAM/RAM, GPU-streamed!)
+    std::string mmproj_path;        // Optional explicit mmproj GGUF path (auto-detected beside model GGUF)
 };
 
 struct SamplingParams {
@@ -168,7 +176,18 @@ public:
         bool need_last_logits, bool need_all_logits,
         bool is_answer, bool capture_last_pred_hidden,
         bool save_spec_states,
-        int32_t* out_argmax_batch = nullptr);
+        int32_t* out_argmax_batch = nullptr,
+        const float* raw_embd = nullptr);
+
+    // Multimodal Vision helpers (zero permanent VRAM/RAM — streams mmproj through prefill staging!)
+    bool has_vision() const { return vision_.loaded(); }
+    bool encode_image_input(const std::string& url_or_path, EncodedImage& out);
+    static void expand_multimodal_tokens(
+        const std::vector<int32_t>& raw_tokens,
+        int32_t image_placeholder_id,
+        const std::vector<EncodedImage>& images,
+        std::vector<int32_t>& out_tokens,
+        MultimodalEmbeddings& out_mm);
 
     // Run learned expert predictor hooks (turn-start mean embedding & main hidden-state update)
     void run_start_predictor(const int32_t* turn_tokens, int n_tokens);
@@ -205,7 +224,8 @@ public:
         int static_prefix_tokens = 0,
         const std::function<bool(int, int)>& on_prefill = nullptr,
         int tools_prefix_tokens = 0,
-        int full_sys_prefix_tokens = 0);
+        int full_sys_prefix_tokens = 0,
+        const MultimodalEmbeddings* mm_embd = nullptr);
 
     // Copy current logits to host (for verification / top-K inspection)
     void copy_logits_to_host(std::vector<float>& dst) const;
@@ -236,6 +256,7 @@ private:
     std::unique_ptr<CPUThreadPool> cpu_pool_;
     ExpertCache experts_;
     HybridPagedKV kv_;
+    VisionEncoder vision_;
 
     cudaStream_t stream_ = nullptr;
 

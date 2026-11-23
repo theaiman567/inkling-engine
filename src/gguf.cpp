@@ -304,6 +304,12 @@ const std::vector<int32_t>& GGUFFile::get_i32_arr(const std::string& key) const 
     return it == kv_.end() ? empty : it->second.arr_i32;
 }
 
+const std::vector<float>& GGUFFile::get_f32_arr(const std::string& key) const {
+    static const std::vector<float> empty;
+    auto it = kv_.find(key);
+    return it == kv_.end() ? empty : it->second.arr_f32;
+}
+
 const std::vector<std::string>& GGUFFile::get_str_arr(const std::string& key) const {
     static const std::vector<std::string> empty;
     auto it = kv_.find(key);

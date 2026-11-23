@@ -28,6 +28,8 @@ $Effort      = "max"
 $EffortExplicit = $false
 $RamKvMb     = 1024
 $GgufPath    = $env:INKENGINE_MODEL
+$MmprojPath  = $env:INKENGINE_MMPROJ
+$NoVision    = $false
 $PassArgs    = New-Object System.Collections.Generic.List[string]
 
 # Parse inkcode options while preserving all OpenCode CLI arguments intact
@@ -49,6 +51,12 @@ for ($i = 0; $i -lt $args.Count; $i++) {
         }
         "--gguf" {
             if ($i + 1 -lt $args.Count) { $GgufPath = [string]$args[++$i] }
+        }
+        "--mmproj" {
+            if ($i + 1 -lt $args.Count) { $MmprojPath = [string]$args[++$i] }
+        }
+        "--no-vision" {
+            $NoVision = $true
         }
         default {
             $PassArgs.Add($a)
@@ -91,6 +99,12 @@ function Start-InkServerBackground {
     $argStr = "--serve --host 127.0.0.1 --port $Port --ctx $TargetCtx --ram-kv-mb $TargetRamKv --effort $TargetEffort"
     if ($GgufPath) {
         $argStr = "--model `"$GgufPath`" " + $argStr
+    }
+    if ($MmprojPath) {
+        $argStr = "--mmproj `"$MmprojPath`" " + $argStr
+    }
+    if ($NoVision) {
+        $argStr = "--no-vision " + $argStr
     }
     Write-Host "[InkEngine] Loading Inkling-2-Mini in background (ctx=$TargetCtx, effort=$TargetEffort)..." -ForegroundColor Cyan
 
@@ -160,7 +174,8 @@ switch ($Action) {
         $st = Invoke-RestMethod -Uri "$BaseUrl/stats" -TimeoutSec 3
         $proc = Get-Process -Name "inkengine" -ErrorAction SilentlyContinue | Select-Object -First 1
         $effShow = if ($h.effort) { $h.effort } else { "unknown" }
-        Write-Host "[InkEngine] Status: RUNNING | PID=$($proc.Id) | Endpoint=$BaseUrl/v1 | Effort=$effShow" -ForegroundColor Green
+        $visShow = if ($h.vision -eq $true) { "ON (0 MiB idle)" } else { "OFF" }
+        Write-Host "[InkEngine] Status: RUNNING | PID=$($proc.Id) | Endpoint=$BaseUrl/v1 | Effort=$effShow | Vision=$visShow" -ForegroundColor Green
         Write-Host ("  Context : {0} / {1} tokens" -f $st.kv_cur_pos, $st.kv_max_ctx)
         Write-Host ("  VRAM    : Experts={0:N1} MiB | KV={1:N1} MiB (SWA {2:N1} + Global {3:N1} + Quest {4:N1})" -f `
             $st.expert_vram_mb, ($st.kv_swa_vram_mb + $st.kv_global_vram_mb + $st.kv_quest_vram_mb), `

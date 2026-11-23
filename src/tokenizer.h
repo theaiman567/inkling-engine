@@ -11,9 +11,16 @@ struct ToolCallSpec {
     std::string arguments_json; // JSON object string, e.g. {"path":"main.cpp"}
 };
 
+struct ChatContentPart {
+    bool is_image = false;
+    std::string text;
+    std::string image_url; // data:image/...;base64,... or local file path
+};
+
 struct ChatMessage {
     std::string role;              // "system", "user", "assistant", "tool"
     std::string content;
+    std::vector<ChatContentPart> parts; // optional ordered text + image parts (for multimodal user/tool msgs)
     std::string name;              // optional tool or assistant name
     std::string tool_call_id;      // for role=="tool"
     std::string reasoning_content; // optional assistant thinking
@@ -51,6 +58,7 @@ public:
     int32_t text_id() const { return text_id_; }
     int32_t invoke_tool_json_id() const { return invoke_tool_json_id_; }
     int32_t invoke_tool_text_id() const { return invoke_tool_text_id_; }
+    int32_t image_placeholder_id() const { return 200054; } // <|unused_200054|>
     int32_t vocab_size() const { return (int32_t)id_to_token_.size(); }
 
 private:

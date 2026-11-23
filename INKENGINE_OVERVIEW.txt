@@ -1,0 +1,479 @@
+================================================================================
+  INKENGINE — COMPLETE OVERVIEW, VERSION HISTORY (v1.0 -> v3.2) & BENCHMARKS
+================================================================================
+
+Last Updated : 2026-11-23
+Project Home : C:\Users\User\Desktop\inkling-engine
+Repository   : https://github.com/theaiman567/inkling-engine
+Target Model : Inkling-2-Mini (26.4B total / ~5.4B active Looped-MoE + 318M Vision)
+               Tested on Inkling-2-Mini-UD-IQ3_XXS.gguf (10.86 GiB) + mmproj-F16.gguf (610 MB)
+Test Rig     : NVIDIA RTX 4060 8 GB (272 GB/s GDDR6, sm_89)
+               AMD Ryzen 5 5500 (6C/12T, AVX2)
+               16 GB DDR4 RAM
+               SATA SSD (model file) + NVMe SSD (OS, KV swap & prefix cache)
+
+
+================================================================================
+1. WHAT IS INKENGINE SUPPOSED TO DO? (THE PROBLEM IT SOLVES)
+================================================================================
+
+Inkling-2-Mini is a 26.4B-parameter Mixture-of-Experts (MoE) model with a
+1-million-token context window. Even quantized to ~3-bit (UD-IQ3_XXS), the
+model file is 10.86 GiB — which CANNOT fit inside an 8 GB VRAM GPU, let alone
+with 64K–512K tokens of KV cache.
+
+When you run Inkling-2-Mini on standard engines like llama.cpp / Unsloth Studio
+on an 8 GB GPU + 16 GB RAM:
+  - Static layer offloading treats all layers equally and spills weights across
+    CPU/PCIe inefficiently.
+  - Default compute/scratch buffers waste ~3.48 GiB of precious VRAM.
+  - Result: ~10.6 tok/s decode and Out-Of-Memory (OOM) past ~32K–48K context.
+
+InkEngine was built from scratch in standalone C++17 / CUDA / AVX2 — with ZERO
+llama.cpp or ggml dependencies — to solve three goals:
+  1. 100% custom serving engine tailored specifically to Inkling-2's unique
+     Looped-MoE architecture.
+  2. 3x+ faster generation and 2x+ faster prompt processing on consumer 8 GB
+     GPUs without sacrificing output quality.
+  3. Massive context windows (128K, 256K, 512K, up to 1M tokens) by seamlessly
+     tiering BOTH model weights AND KV cache across VRAM -> RAM -> NVMe SSD.
+
+
+================================================================================
+2. WHAT IT ACTUALLY DOES UNDER THE HOOD (HOW IT WORKS)
+================================================================================
+
+InkEngine exploits two unique structural facts about Inkling-2-Mini:
+
+  A) 3x Looped-MoE Architecture:
+     - Inkling-2 has 24 physical layers, expanded into 48 logical layers per
+       token:
+         * Layers 0..5   (Prelude) : executed 1x per token (Outer)
+         * Layers 6..17  (Core)    : executed 3x per token = 36 logical passes!
+         * Layers 18..23 (Coda)    : executed 1x per token (Outer)
+     - Every layer has 128 MoE experts, and only 8 experts activate per token.
+     - Because the 12 Core layers account for 75% of all MoE work (36 of 48
+       passes), keeping hot Core experts in VRAM (guided by a learned neural
+       expert predictor) yields a 93–94% VRAM hit rate using less than half the
+       model's size in VRAM!
+
+  B) Hybrid Sliding-Window + Global Attention:
+     - 40 of the 48 logical layers are Sliding-Window Attention (SWA = 1,024
+       tokens). Their KV cache NEVER grows beyond 45 MiB total in VRAM — even
+       at 1,000,000 tokens!
+     - Only 8 logical layers are Global Attention. InkEngine pages those 8
+       layers in 64-token blocks across VRAM -> RAM -> NVMe SSD, using INT8
+       Quest summaries + GPU Radix-Select Top-K to fetch only the most relevant
+       historical pages on ultra-long contexts (256K–1M).
+
+Exact 3-Tier Memory Split at 128K Context (RTX 4060 8 GB + 16 GB RAM, Q4_0 KV):
+  - GPU VRAM (~7,590 / 8,188 MiB used, ~250–370 MiB Windows safety headroom):
+      * Dense weights (attention, loop controllers, routers, LM head): 988 MiB
+      * KV Cache (40 SWA = 45 MiB + 8 Global = 640 MiB + Quest = 32.6 MiB): 718 MiB
+      * Dynamic Expert VRAM Pool (1,494 / 3,072 experts = 48.6%): 4,842 MiB
+      * CUDA context, 97 Graphs, batch/PCIe staging buffers: ~1,042 MiB
+  - System RAM (~5.6–6.2 GiB total process working set):
+      * Tier-1 Expert RAM Pool (all 1,578 remaining cold experts): 5,363 MiB
+      * Tier-1 Global KV RAM Pool: 512 MiB (up to 1,024 MiB cap)
+      * Live prefix & turn-rewind snapshots: ~250–400 MiB
+  - SSD Storage:
+      * Model GGUF (read-only on SATA S:): 10.86 GiB (0 steady-state reads @ 128K!)
+      * Persistent NVMe OpenCode KV Prefix Cache (%LOCALAPPDATA%\InkEngine\kv_cache): ~369–383 MiB
+      * NVMe KV Page Swap (%TEMP%\inkengine_kv_swap.bin): 0 MiB @ 128K;
+        grows automatically past 128K (~3.05 GiB @ 512K).
+
+Everyday Serving Integration:
+  - Runs as a lightweight headless OpenAI-compatible HTTP server on
+    http://127.0.0.1:8787/v1 (zero browser/GUI overhead).
+  - Global `inkcode` command auto-starts InkEngine in the background and
+    launches the OpenCode CLI pre-connected to Inkling-2-Mini with full tool
+    calling, thinking/reasoning streaming, and KV prefix caching.
+
+
+================================================================================
+3. VERSION-BY-VERSION EVOLUTION (WHAT CHANGED AT EACH STEP)
+================================================================================
+
+--------------------------------------------------------------------------------
+BASELINE: llama.cpp / Unsloth Studio
+--------------------------------------------------------------------------------
+  - 64K decode        : 10.64 tok/s (capped at ~48K max before OOM on 8 GB VRAM)
+  - 128K / 256K / 512K: OOM
+  - Prompt prefill    : ~55 tok/s
+  - Cold startup      : ~40s
+  - OpenCode Turn 1   : ~200s (10.5K system + tools prompt)
+  - Limitations       : ~3.48 GiB scratch VRAM waste, static CPU/GPU layer
+                        splitting, no Inkling-2 loop-aware expert caching, no
+                        SSD KV paging, no persistent disk prefix cache.
+
+--------------------------------------------------------------------------------
+VERSION 1.0: Standalone Custom 3-Tier Engine + OpenCode CLI Integration
+--------------------------------------------------------------------------------
+What was built:
+  1. Pure C++17 / CUDA / AVX2 standalone runtime (zero llama.cpp / ggml code)
+     with native GGUF reader, tokenizer, and full Inkling-2 architecture
+     (AttnRes, 3x LoopControl, ShortConv, SiTU, relative bias, logit softcap).
+  2. Eliminated ~3.48 GiB scratch bloat -> ~24 MiB GPU activation buffers,
+     freeing >5 GiB of VRAM for dynamic MoE experts on an 8 GB card.
+  3. Custom __dp4a GPU kernels + AVX2 CPU fallback across all 10 GGUF formats
+     used by UD-IQ3_XXS (IQ2_XXS/XS/S, IQ3_XXS, IQ4_NL, NVFP4, Q4_K/5_K/6_K/8_0).
+  4. 3-Tier Loop-Aware Dynamic ExpertCache (VRAM -> RAM -> SSD) with Core-
+     weighted LFU policy (~83–88% VRAM hit rate: 97–98% Core, 42–56% Outer).
+  5. 3-Tier Hybrid Paged KV Cache (40 SWA pinned in VRAM + 8 Global paged
+     across VRAM -> RAM -> NVMe SSD) with Quest sparse-page retrieval.
+  6. OpenAI-compatible HTTP server (/v1/chat/completions, SSE streaming,
+     native Inkling-2 tool calls & reasoning_content, 3-tier RAM KV prefix
+     checkpoints) + one-command headless `inkcode` launcher for OpenCode CLI.
+
+Key Gains (Baseline -> v1.0):
+  - 64K decode   : 10.64 -> 26.03 tok/s (2.45x faster than llama.cpp!)
+  - 128K decode  : OOM   -> 20.15 tok/s (2.7x more context!)
+  - 256K SSD     : OOM   -> 18.82 tok/s (5.3x more context!)
+  - 512K SSD     : OOM   ->  5.73 tok/s (10.8x more context!)
+  - Prefill      : ~24 tok/s (1-token sequential prefill; improved in v2/v3)
+  - Exactness    : 100% exact token parity vs llama.cpp reference (--verify).
+
+--------------------------------------------------------------------------------
+VERSION 2.0: Learned MoE Expert Predictor + CUDA Graphs + Batched Prefill + Spec v1
+--------------------------------------------------------------------------------
+What was added on top of v1.0:
+  1. Native Learned MoE Expert Predictor Runtime (pure C++17/AVX2):
+     - Implemented Lanilen/Inkling-2-Mini-Expert-Predictor (pred-v3 + start-v3
+       .moepred GGUF v1 models), verified to 1.639e-07 / 2.980e-07 max abs diff
+       against PyTorch golden .vec vectors.
+     - Predicts which experts will be needed 128–512 tokens ahead and proactively
+       promotes them into VRAM.
+     - Lifted VRAM expert hit rate from 83–88% -> 92.0–93.5% (Core 98%+, Outer
+       jumped from ~45% -> ~75–80%) with 0 SSD expert reads!
+  2. 97 Captured CUDA Graphs (48x prelude + 48x postlude + LM Head):
+     - Captured in ~30–50 ms at boot; cut ~82% of Windows WDDM kernel launch
+       overhead during single-token decode.
+  3. Batched GEMM + Grouped Hybrid MoE Prefill (B <= 64):
+     - Replaced 1-token sequential prefill with batched dense GEMMs + grouped
+       expert execution.
+  4. Zero-VRAM Lossless Speculative Decoding v1:
+     - Prompt-lookup / N-gram drafter (K <= 4) with exact GPU SWA + ShortConv
+       rollback, giving free speedups on code editing & JSON without using
+       extra VRAM for a draft model.
+
+Key Gains (v1.0 -> v2.0):
+  - 64K decode      : 26.03 -> 32.34 tok/s (+24.2% vs v1.0 | 3.04x vs llama.cpp)
+  - 128K decode     : 20.15 -> 27.57 tok/s (+36.8% vs v1.0!)
+  - Code refactor   : 26.28 -> 33.81 tok/s (+28.7% vs v1.0)
+  - Batched prefill : ~24   -> 71.80 tok/s (3.0x faster than v1.0!)
+  - OpenCode Turn 1 : ~440s -> 163.3s (2.7x faster!)
+
+--------------------------------------------------------------------------------
+VERSION 3.0: 8 Lossless Deep-Systems Upgrades (First Public GitHub Release)
+--------------------------------------------------------------------------------
+(Note: 2-bit KV cache was intentionally SKIPPED to preserve 100% quality; KV
+remained Q4_0 for clean apples-to-apples comparisons.)
+
+What was added on top of v2.0:
+  1. Persistent NVMe OpenCode KV Prefix Cache:
+     - Atomically saves/restores 3-tier prefix checkpoints (tools-prefix,
+       pre-<env> static-prefix, full-system) to %LOCALAPPDATA%\InkEngine\kv_cache\.
+     - Restores 8,064+ tokens in 184.9 ms even after a full server restart or
+       PC reboot — slashing post-restart OpenCode Turn 1 from 163.3s -> 29.1s!
+  2. Loop-Phased Continuous Background Expert DMA:
+     - Runs zero-race outer-layer DMA swaps during the 36 Core passes (il=6..41)
+       so promoted Coda experts are live before layer 42 of the SAME token.
+  3. 2-Bucket Variable-Size VRAM & RAM Expert Pools:
+     - Split pools into compact 3.05 MiB slots (IQ2_* layers) + universal
+       3.36 MiB slots (IQ3_XXS layers) -> fits +49 to +60 MORE hot experts in
+       the exact same 8 GB VRAM while using 86 MiB LESS system RAM!
+  4. Super-Fused CUDA Kernels (Exact FP32 Routers Preserved):
+     - Single-launch multi-projection Attention GEMV (Q+Gate+K+V+Rel+Sink+DynKV),
+       3-way LoopControl+RMSNorm, gated Wo+post_conv fusion, and exact FP32
+       fused FFN RMSNorm+Router+Top-K (~624 fewer kernel launches per token).
+  5. Async Background RAM Preload at Boot:
+     - Opens HTTP port 8787 as soon as dense weights + VRAM experts finish
+       (~18.6s vs 34.4s in v2.0), streaming cold experts into RAM in parallel
+       on a background thread.
+  6. Layer-Wise PCIe-Streamed WMMA FP16->FP32 Tensor Core Prefill (B = 128):
+     - Cooperative 8-element dequantizer across all 10 GGUF formats feeding
+       Ada Lovelace WMMA Tensor Cores + a double-buffered 28 MiB PCIe Gen4
+       staging ring that streams cold outer experts straight to GPU Tensor
+       Cores instead of stalling on CPU.
+     - Boosted prefill from 71.8 -> 120.69 tok/s (+68.1% vs v2.0 | 2.2x vs llama.cpp!).
+  7. Zero-VRAM Lossless Speculative Decoding v2:
+     - Always-on default: O(1) Rolling 3-Gram Suffix Hash Index covering full
+       128K+ context in <1 us, drafting up to K = 6 tokens (35.18 tok/s on
+       code refactoring, 0% slowdown on prose).
+     - Opt-in code turbo (--self-draft-k 2|3): 1-Loop (24L) GPU-only self-
+       speculative fallback (79.2% Top-1 / 93.8% Top-5 agreement empirically
+       measured; pushes code refactoring up to 37.87 tok/s at 73.1% accept).
+  8. INT8 Quest Summaries + GPU Radix-Select Top-K + Async QD-16 NVMe Paging:
+     - 4x smaller Quest metadata VRAM (32.6 MiB @ 128K, 130.1 MiB @ 512K),
+       O(N) 4-pass GPU Radix-Select Top-K (512 B D2H instead of 32 KB + CPU
+       sort), and Queue-Depth-16 overlapped NVMe reads.
+     - Boosted 512K SSD decode 4.26x (5.73 -> 24.43 tok/s) and 256K +42.1%
+       (18.82 -> 26.75 tok/s)!
+  9. Usability & Open-Source Polish:
+     - Default reasoning effort set to `max` (0.99).
+     - Portable `inkcode.ps1` ($PSScriptRoot + --gguf / INKENGINE_MODEL),
+       multi-GPU `build.bat` (sm_75 / sm_86 / sm_89 / sm_120 + VS 2019/2022
+       auto-detection), .gitignore, and full GitHub README.
+
+Key Gains (v2.0 -> v3.0):
+  - 64K decode          : 32.34 -> 32.65 tok/s (93.9% VRAM hit | 3.07x vs llama.cpp)
+  - 128K decode         : 27.57 -> 27.58 tok/s (93.1% VRAM hit, 0 SSD reads)
+  - 256K NVMe SSD       : 18.82 -> 26.75 tok/s (+42.1%!)
+  - 512K NVMe SSD       :  5.73 -> 24.43 tok/s (4.26x faster!!)
+  - Code refactoring    : 33.81 -> 35.18 tok/s (37.87 w/ --self-draft-k 3 | 3.56x vs llama.cpp)
+  - Batched prefill (2K): 71.80 -> 120.69 tok/s (+68.1% | 5.0x vs v1.0 | 2.2x vs llama.cpp)
+  - Cold server boot    : 34.4s -> 18.6s (1.85x faster!)
+  - OpenCode Turn 1 cold: 163.3s -> 99.6s (1.64x faster)
+  - OpenCode Turn 1 warm: 163.3s -> 29.1s after full restart! (5.6x faster!)
+
+--------------------------------------------------------------------------------
+VERSION 3.1: Quality, Anti-Looping, Streaming Stability & Instant Retry Rewind
+--------------------------------------------------------------------------------
+Discovered and fixed during extended multi-turn OpenCode agent sessions after
+the v3.0 GitHub release:
+
+  1. Fixed Q4_0 KV Cache +0.5*d Systematic Rounding Bias (MAJOR QUALITY FIX):
+     - `quant_block32_q4_0` in src/cuda_kernels.cu previously used
+       `__float2int_rn(v * id + 8.5f)`. Adding +8.5f is only for truncating
+       (int) casts; pairing it with round-to-nearest shifted EVERY K/V value
+       by +0.5*d across all 48 layers and doubled worst-case Q4_0 KV error,
+       triggering code corruption and repetition loops under `effort=max`.
+     - Fixed to `__float2int_rn(v * id + 8.0f)` (exact unbiased rounding,
+       cutting max Q4_0 KV error in half) and bumped NVMe checkpoint format
+       from v1 -> v2 so stale biased checkpoints auto-rebuild cleanly.
+  2. Fixed Speculative Rejection Greedy-Argmax Trap:
+     - In `sample_from_logits` (src/model.cpp), rejected N-gram drafts with
+       `d_idx < 0` previously fell back to `cand[0]` (pure greedy argmax),
+       trapping repeating phrases in a greedy loop whenever N-gram fired.
+     - Fixed to fall through to exact unbiased Leviathan residual sampling +
+       fast unsorted double-precision sampling when top_k=0 & top_p=1.0.
+  3. Official Inkling-2-Mini Sampling Defaults:
+     - Changed HTTP server defaults from (T=0.6, top_p=0.95, top_k=40,
+       min_p=0.05) to Thinking Machines / Unsloth's official recommended
+       (T=1.0, top_p=1.0, top_k=0, min_p=0.0) with a time-mixed seed and
+       live sampling telemetry in logs\server.log.
+  4. Real OpenAI SSE `data:` Heartbeats During Large File Writes & Prefills:
+     - Previously, buffering large tool calls (`write` / `edit` in ST_TOOL_JSON)
+       sent zero TCP bytes for minutes, causing OpenCode `SSE read timed out`.
+     - Now emits valid OpenAI empty-delta SSE events (`"delta":{}`) on every
+       prefill batch (~1.5s) and every 16 tokens (~0.7s) while buffering tool
+       JSON/headers + accurate `"length"` finish_reason when hitting max_tokens.
+  5. Instant <1s TCP Disconnect Detection (`is_client_alive`):
+     - Non-blocking <1 us Winsock `select + MSG_PEEK` check detects TCP FIN/RST
+       immediately during both prefill and decode.
+     - Eliminates zombie requests that previously blocked the server for 5–12+
+       minutes and caused `ProviderHeaderTimeoutError: 300000ms` on retries.
+  6. Lightweight ~49 MiB Zero-Global-Copy In-Place Turn-Rewind KV Snapshot:
+     - Saves only ShortConv + SWA state (~49 MiB, ~4 ms) at the prompt's 64-
+       token page boundary (and every 4,096 tokens during huge prefills).
+     - On retries/cancels after partial generation (even at 36K–512K context),
+       rewinds in-place in ~4 ms while keeping all Global KV pages intact —
+       turning 5-minute retry re-prefills into ~1-second resumes!
+  7. OpenCode Timeout Configuration:
+     - Disabled OpenCode's default 5-minute (300,000 ms) local limits in
+       opencode.jsonc (`timeout`, `headerTimeout`, `chunkTimeout`: `false`).
+
+Key Verified Results (v3.0 -> v3.1):
+  - Reasoning / Loop Quality (same Python LRUCache prompt, Q4_0 KV, effort=max):
+      * v3.0 (biased Q4_0 + spec trap): corrupted duplicate code lines inside
+        reasoning, still looping at 2,500 tokens, never emitted final answer.
+      * v3.1 (fixed): crisp reasoning, clean bug-free Python LRUCache class,
+        zero looping, 25.13 tok/s (spec=989/2879).
+  - Abrupt Client Disconnect Recovery:
+      * v3.0: blocked for 5–12+ min on dead socket -> ProviderHeaderTimeoutError.
+      * v3.1: aborted immediately (`ABORTED(client_closed)`), /health responded
+        in 842.1 ms!
+  - Retry KV Cache Recovery & File-Write Tool Streaming:
+      * v3.0: threw away 25,805 tokens -> ~5.3 min re-prefill + SSE timeout.
+      * v3.1: reused 2,112 / 2,127 tokens (99.3% cached), emitted 18 SSE
+        heartbeats during `write_file` buffering, streamed complete tool call
+        at 24.39 tok/s with zero timeouts!
+
+--------------------------------------------------------------------------------
+VERSION 3.2: Native Zero-Overhead Multimodal Vision (GPU-Streamed `inkling2v`)
+--------------------------------------------------------------------------------
+Added full multimodal vision so Inkling-2-Mini can directly see screenshots,
+Three.js 3D renders, UI layouts, diagrams, and photos inside OpenCode and the
+OpenAI HTTP API — WITHOUT touching text decode speed or stealing VRAM/RAM from
+MoE experts!
+
+Architecture Decision (Why GPU-Streamed On-Demand Won Over Permanent CPU RAM):
+  - Pinning the 610 MB `mmproj-F16.gguf` in VRAM would evict ~185 hot MoE
+    expert slots and slow down every text token.
+  - Pinning it in CPU RAM (AVX2) would steal 610 MiB from 16 GB RAM (pushing
+    cold MoE experts to SSD) AND take ~5–15 seconds per image on CPU.
+  - Instead, InkEngine v3.2 streams `mmproj-F16.gguf` layer-by-layer in tiny
+    8–9 MiB slices through the engine's ALREADY-ALLOCATED 14 MiB PCIe prefill
+    staging ring directly onto RTX 4060 WMMA Tensor Cores, reuses the idle
+    Q/K/V activation slab for single-pass FFN, and calls `cudaFree` on all
+    temporary activation buffers the instant each image finishes!
+  - Result: 0 MiB permanent VRAM, 0 MiB permanent RAM (<100 KB GGUF header
+    only), identical 1,494 VRAM expert slots, and 0.0% text-only slowdown!
+
+What was added on top of v3.1:
+  1. 6 Custom Vision CUDA Kernels (src/cuda_kernels.cu/.cuh):
+     - Exact mean+var LayerNorm (`eps=1e-5`), WMMA FP16->FP32 GEMM (F16/BF16/
+       F32 weights reusing existing `g_batch_f16_buf`), exact 2D Vision RoPE
+       (`pos_w` on dims 0..31, `pos_h` on dims 32..63, `theta=10000`), tiled
+       bidirectional FlashAttention (`d_head=64`), GELU_ERF, and LayerScale.
+  2. Standalone `VisionEncoder` (src/vision.cpp/.h):
+     - Pure Windows WIC decoder (`windowscodecs.lib` + `ole32.lib`) decoding
+       PNG, JPEG, BMP, GIF, and WebP from base64 data URIs or local files with
+       zero third-party image libraries.
+     - Exact `inkling2v` 23-layer Perception-Encoder ViT + 2x2 spatial merge +
+       2-layer MLP projector (`4096 -> 4096 -> 2304`), capping 8 GB GPUs at 640
+       vision tokens (`1320x720` crisp HD) for single-pass FFN and fast prefill.
+     - On-demand content-hash LRU cache (0 MiB idle; up to 16 images / 64 MiB
+       cap only after images are sent) -> 0.0 ms instant multi-turn hits!
+  3. Seamless Multimodal KV Prefix Caching & `tok_norm_` Bypass (src/model.cpp):
+     - Auto-detects `mmproj-F16.gguf` beside the model GGUF (`--mmproj` /
+       `--no-vision` / CLI `--image`).
+     - Formats official `<|content_image|><|unused_200054|><|end_message|>`
+       blocks for `user` and `tool` messages, bypasses `tok_norm_` on raw image
+       embeddings in `forward_batch()`, and assigns deterministic negative
+       hash-derived token IDs so both incremental KV prefix caching AND turn-
+       rewind snapshots automatically reuse prior images across turns!
+  4. OpenAI `image_url` API & OpenCode Multimodal Config (src/server.cpp,
+     inkcode.ps1, opencode.jsonc):
+     - Parses OpenAI `image_url`, `input_image`, and base64 `image` blocks,
+       exposes `"vision": true|false` in `/health` and `inkcode status`, and
+       enables `"modalities": {"input": ["text", "image"], "output": ["text"]}`
+       in OpenCode so screenshots can be attached directly to Inkling-2-Mini.
+
+Key Verified Results (v3.1 -> v3.2):
+  - Idle Resource Overhead (128K server, `Vision=ON (0 MiB idle)`):
+      * 0 MiB permanent VRAM added (identical 1,494 VRAM expert slots / 4,841.6
+        MiB as v3.1), 0 MiB permanent RAM added, 0 MiB VRAM leak after images.
+  - Real Image Recognition (640x480 & Full HD 1920x1080 Base64 PNG Streaming):
+      * 100% accurate reading of `"INKENGINE 3.2"` text + red circle (left),
+        blue square (right), green triangle (bottom center, pointing up).
+      * Full HD `1920x1080 -> 1320x720` (594 LLM tokens) encoded in 2.99s
+        streamed straight off SATA SSD `S:\` (prefill 74.1 tok/s).
+      * Multi-turn follow-up on same image hit 0.0 ms vision LRU cache + 192
+        cached KV tokens restored in 10.0 ms (TTFT dropped 19.9s -> 2.0s!).
+  - Text-Only Exact Parity (`--verify`): 100% EXACT MATCH (29/29 + "17 * 23 is 391.").
+
+
+================================================================================
+4. COMPLETE BENCHMARK & SPEED PROGRESSION SUMMARY
+================================================================================
+
+All speeds measured on RTX 4060 8 GB + Ryzen 5 5500 + 16 GB DDR4, Q4_0 KV,
+Inkling-2-Mini-UD-IQ3_XXS.gguf (10.86 GiB):
+
+Benchmark                     | llama.cpp  |   v1.0   |   v2.0   |   v3.0   | v3.2 (Latest)       | Total Gain vs llama.cpp
+------------------------------+------------+----------+----------+----------+---------------------+------------------------
+64K steady decode             | 10.64 t/s* | 26.03    | 32.34    | 32.65    | ~32.65 t/s          | 3.07x faster
+128K full context (pos=130K)  | OOM        | 20.15    | 27.57    | 27.58    | ~27.58 t/s          | 2.59x (2.7x context)
+256K NVMe SSD (pos=260K)      | OOM        | 18.82    | 18.82    | 26.75    | ~26.75 t/s          | 2.51x (5.3x context)
+512K NVMe SSD (pos=520K)      | OOM        |  5.73    |  5.73    | 24.43    | ~24.43 t/s          | 2.30x (10.8x context)
+Code refactor (MetricsCalc)   | 10.64 t/s  | 26.28    | 33.81    | 35.18**  | ~35.18** t/s        | 3.31x - 3.56x faster
+Batched prefill (2K prompt)   | ~55 t/s    | ~24      | 71.80    | 120.69   | ~120.69 t/s         | ~2.19x faster (5x v1)
+Cold server boot (128K)       | ~40s       | ~34s     | 34.4s    | 18.6s    | 16.0s - 18.6s       | ~2.2x faster boot
+OpenCode Turn 1 (10.5K, cold) | ~200s      | ~440s    | 163.3s   | 99.6s    | ~99.6s              | ~2.0x faster
+OpenCode Turn 1 (post-reboot) | ~200s      | ~440s    | 163.3s   | 29.1s    | ~29.1s (185ms load) | ~6.9x faster!
+Retry recovery (same turn)    | Re-prefill | Re-pref  | Re-pref  | Re-pref  | ~4 ms rewind (99%+) | ~300s -> ~1s!
+Client disconnect abort       | N/A        | Blocks   | Blocks   | Blocks   | 842 ms (<1s!)       | Zero zombie hangs
+Q4_0 KV rounding accuracy     | Unbiased   | +0.5d    | +0.5d    | +0.5d    | Unbiased (0 bias)   | 2x lower max KV error
+Multimodal Vision (idle cost) | ~610M VRAM | N/A      | N/A      | N/A      | 0 MiB VRAM / 0 RAM  | Zero text regression!
+HD 1080p Vision + Cache Hit   | Pinned GPU | N/A      | N/A      | N/A      | 2.99s / 0ms+10ms KV | Full OpenCode vision!
+Exact token parity (--verify) | Reference  | 100%     | 100%     | 100%     | 100% (29/29 + 391)  | Lossless exact match
+
+  * llama.cpp maxed out at ~48K context before OOM on 8 GB VRAM.
+ ** Up to 37.87 tok/s with opt-in `--self-draft-k 3` (1-Loop 24L self-drafting).
+
+Physics Perspective (RTX 4060 8 GB, 272 GB/s GDDR6):
+  - Every generated token reads ~2.41 GiB of weights (~1.12 GiB dense across
+    48 passes + ~1.29 GiB for 384 active MoE experts).
+  - Even if the entire 10.86 GiB model fit 100% in VRAM with zero misses, an
+    RTX 4060's 272 GB/s memory bus physically caps 1-token decode at ~60–65
+    tok/s; with only 48.6% of experts fitting in 8 GB VRAM, the practical
+    single-token hardware ceiling is ~35–38 tok/s.
+  - Reaching 32.65 tok/s steady (and 35–38 tok/s with zero-VRAM speculation)
+    means InkEngine v3.x is operating near the physical hardware ceiling of an
+    8 GB RTX 4060!
+
+System Resource Footprint (v2.0 vs v3.0/v3.1/v3.2 @ 128K Context):
+  - GPU VRAM Used           : ~7,680 MiB (v2.0) -> ~7,585 MiB (v3.x)
+  - VRAM Expert Slots       : 1,445 slots       -> 1,494 slots (+49 hot experts!)
+  - Vision Idle Footprint   : N/A               -> 0 MiB VRAM / 0 MiB RAM (v3.2)
+  - Expert VRAM Hit Rate    : 92.0% (128K)      -> 93.1% (128K) / 93.9% (64K)
+  - Tier-1 RAM Expert Pool  : 5,450 MiB         -> 5,363 MiB (-86 MiB RAM)
+  - Process Working Set RAM : ~5,950 MiB        -> 5,610 MiB idle / 6,210 MiB active
+  - Expert SSD Reads @ 128K : 0                 -> 0 (100% in VRAM + RAM)
+  - NVMe KV Swap @ 128K     : 0 MiB             -> 0 MiB (activates >128K)
+  - NVMe Prefix Cache       : 0 MiB             -> ~369–383 MiB (3 v2 .ckpt files)
+
+
+================================================================================
+5. WHEN INKENGINE IS BENEFICIAL VS. WHEN IT IS NOT
+================================================================================
+
+  [HUGE WIN] 6 GB - 12 GB VRAM GPUs (RTX 3060/3070/3080/4060/4070 & laptops):
+    - Primary target hardware. 2.5x–3.5x faster than llama.cpp, 2.2x faster
+      prefill, zero OOM from 64K up to 512K+ context.
+
+  [GOOD WIN] 16 GB VRAM GPUs (RTX 4060 Ti 16G / 4070 Ti Super / 4080 / 5080):
+    - Worth using for higher-bit quants that exceed 16 GB, ultra-long 256K–1M
+      context via NVMe KV paging, 97 captured CUDA Graphs, zero-VRAM coding
+      speculative decoding, and <0.2s persistent NVMe OpenCode prefix caching.
+
+  [USUALLY NOT NEEDED] 24 GB - 32 GB+ VRAM GPUs (RTX 3090 / 4090 / 5090):
+    - If your quant + context fits 100% in VRAM, llama.cpp / ik_llama.cpp with
+      -ngl 99 is simpler and has mature full-GPU prefill kernels (unless you
+      specifically want 512K–1M SSD KV, speculative coding boost, or persistent
+      disk KV prefix caching).
+
+  [NOT SUPPORTED YET]:
+    - Multi-user concurrent serving (single-user engine; use vLLM / SGLang).
+    - Non-Inkling-2 models (exclusively general.architecture = inkling2).
+    - Linux / macOS / AMD / Apple Silicon (currently Windows x64 + NVIDIA
+      sm_75+ + AVX2 CPU).
+    - Moving to 4-bit UD-Q4_K_M (~16.6 GB) on 8 GB VRAM + 16 GB RAM: would
+      require adding Q4_K/Q5_K/Q6_K CPU AVX2 dot-product kernels and would
+      spill ~3.5–4.5 GiB of experts onto SSD (estimated ~16–22 tok/s on NVMe
+      or ~11–17 tok/s on SATA vs 27–33 tok/s today on UD-IQ3_XXS).
+
+
+================================================================================
+6. QUICK COMMAND REFERENCE & PROJECT FILE MAP
+================================================================================
+
+Daily Commands (Global `inkcode` CLI):
+  inkcode                      Start InkEngine (128K, effort=max, vision=ON) & OpenCode CLI
+  inkcode --effort high        Use high (0.9) effort for tighter thinking chains
+  inkcode --ctx 65536          64K 100%-VRAM exact context (~32.7 tok/s)
+  inkcode --ctx 262144         256K 3-tier VRAM + RAM + NVMe SSD (~26.8 tok/s)
+  inkcode --ctx 524288         512K 3-tier VRAM + RAM + NVMe SSD (~24.4 tok/s)
+  inkcode --no-vision          Disable mmproj-F16.gguf vision auto-detection
+  inkcode start / status       Preload background server / view live telemetry
+  inkcode restart / stop       Restart with new flags / free all VRAM & RAM
+
+Key Files in C:\Users\User\Desktop\inkling-engine:
+  build.bat                    Multi-GPU (sm_75..sm_120) & VS 2019/2022 builder
+  build\inkengine.exe          Compiled standalone engine binary
+  inkcode.ps1                  Portable background server + OpenCode launcher
+  README.md                    GitHub landing page, install & tuning guide
+  CHANGELOG.md                 Detailed v3.2 + v3.1 PR notes & commit summary
+  INKENGINE_OVERVIEW.txt       This complete overview & version history
+  models\                      Learned MoE expert predictors (pred-v3, start-v3)
+  logs\server.log              Live HTTP, vision, prefill, decode & cache telemetry
+  src\cuda_kernels.cu/.cuh     Fused CUDA kernels, WMMA prefill, KV, 6 vision kernels
+  src\vision.cpp/.h            Standalone WIC + GPU-streamed inkling2v vision encoder
+  src\cpu_kernels.cpp/.h       AVX2 multi-threaded fallback for missed experts
+  src\expert_cache.cpp/.h      2-bucket 3-tier VRAM/RAM/SSD expert cache + DMA
+  src\moe_predictor.cpp/.h     Native C++17/AVX2 .moepred predictor runtime
+  src\paged_kv.cpp/.h          3-tier HybridPagedKV, Quest Top-K, NVMe + Rewind
+  src\model.cpp/.h             Inkling-2 forward, multimodal prefill, speculative
+  src\server.cpp/.h            OpenAI HTTP/SSE server, vision image_url, tools
+  src\tokenizer.cpp/.h         Inkling-2 BPE tokenizer & multimodal chat formatter
+  src\gguf.cpp/.h              Standalone GGUF v3 parser + Win32 overlapped I/O
+  src\main.cpp                 CLI entry point (--image/--mmproj), bench & verify
+
+Potential Future Upgrades:
+  - Q8_0 vs Q4_0 KV cache A/B quality/speed comparison (--kv-quant q8 already
+    built in and ready to test!).
+  - Q4_K / Q5_K / Q6_K / IQ4_XS CPU AVX2 MoE kernels for running 15–17 GB
+    4-bit quants (UD-IQ4_XS / UD-Q4_K_M).
+  - Linux POSIX / io_uring port for cross-platform open-source contributors.
+================================================================================

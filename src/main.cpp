@@ -15,6 +15,9 @@ void print_usage() {
         "InkEngine - Custom Looped-MoE 3-Tier (VRAM/RAM/SSD) Serving Engine for Inkling-2-Mini\n\n"
         "Usage: inkengine.exe [options]\n"
         "  --model <path>         Path to Inkling-2-Mini GGUF file\n"
+        "  --mmproj <path>        Path to mmproj-F16.gguf vision projector (auto-detected beside model GGUF)\n"
+        "  --no-vision            Disable multimodal vision encoder\n"
+        "  --image <path>         Attach an image file (PNG/JPG/BMP/WebP) to --prompt (repeatable)\n"
         "  --ctx <N>              Max context length (default: 65536; supports up to 1048576 via SSD!)\n"
         "  --kv-quant <q4|q8|f16> KV cache quantization (default: q4)\n"
         "  --kv-mode <auto|quest|exact> Global KV mode past VRAM (default: auto)\n"
@@ -96,6 +99,7 @@ int main(int argc, char** argv) {
     int  bench_pos = 0;
     int  bench_prefill_n = 0;
     std::string prompt_str;
+    std::vector<std::string> image_paths;
     std::string effort = "";
     std::string host = "127.0.0.1";
     int port = 8080;
@@ -105,6 +109,9 @@ int main(int argc, char** argv) {
         auto next = [&]() -> std::string { return (i + 1 < argc) ? argv[++i] : ""; };
         if (a == "--help" || a == "-h") { print_usage(); return 0; }
         else if (a == "--model") cfg.model_path = next();
+        else if (a == "--mmproj") cfg.mmproj_path = next();
+        else if (a == "--no-vision") cfg.use_vision = false;
+        else if (a == "--image") image_paths.push_back(next());
         else if (a == "--ctx") cfg.max_ctx = std::stoi(next());
         else if (a == "--kv-quant") {
             std::string q = next();
@@ -317,11 +324,56 @@ int main(int argc, char** argv) {
         print_profile(engine);
     }
 
+    if (!image_paths.empty() && prompt_str.empty()) {
+        prompt_str = "Describe this image in detail.";
+    }
     if (!prompt_str.empty()) {
         std::string p_eff = effort.empty() ? "none" : effort;
-        std::string fmt = engine.tokenizer().format_chat({{"user", prompt_str}}, p_eff, true);
-        auto ids = engine.tokenizer().encode(fmt, true);
-        std::printf("\n[Prompt] (%zu tokens) > ", ids.size());
+        ChatMessage user_msg;
+        user_msg.role = "user";
+        std::vector<EncodedImage> encoded_imgs;
+        MultimodalEmbeddings mm_embd;
+
+        if (!image_paths.empty()) {
+            if (!engine.has_vision()) {
+                std::fprintf(stderr, "[ERROR] --image specified, but vision encoder is not loaded (mmproj-F16.gguf missing or --no-vision set).\n");
+                return 1;
+            }
+            encoded_imgs.reserve(image_paths.size());
+            for (const auto& ipath : image_paths) {
+                EncodedImage enc;
+                if (!engine.encode_image_input(ipath, enc)) {
+                    std::fprintf(stderr, "[ERROR] Failed to encode image: %s\n", ipath.c_str());
+                    return 1;
+                }
+                encoded_imgs.push_back(std::move(enc));
+                ChatContentPart ipart;
+                ipart.is_image = true;
+                ipart.image_url = ipath;
+                user_msg.parts.push_back(std::move(ipart));
+            }
+            ChatContentPart tpart;
+            tpart.is_image = false;
+            tpart.text = prompt_str;
+            user_msg.parts.push_back(std::move(tpart));
+        } else {
+            user_msg.content = prompt_str;
+        }
+
+        std::string fmt = engine.tokenizer().format_chat({user_msg}, p_eff, true);
+        auto raw_ids = engine.tokenizer().encode(fmt, true);
+        std::vector<int32_t> ids;
+        const MultimodalEmbeddings* mm_ptr = nullptr;
+        if (!encoded_imgs.empty()) {
+            InklingEngine::expand_multimodal_tokens(
+                raw_ids, engine.tokenizer().image_placeholder_id(), encoded_imgs, ids, mm_embd);
+            mm_ptr = &mm_embd;
+        } else {
+            ids = std::move(raw_ids);
+        }
+
+        std::printf("\n[Prompt] (%zu tokens%s) > ", ids.size(),
+                    encoded_imgs.empty() ? "" : ", multimodal");
         std::fflush(stdout);
         engine.reset_profile();
         auto res = engine.generate(ids, sp, [&](int32_t id, const std::string& piece) {
@@ -330,7 +382,7 @@ int main(int argc, char** argv) {
             else std::printf("%s", piece.c_str());
             std::fflush(stdout);
             return true;
-        }, do_profile);
+        }, do_profile, false, 0, nullptr, 0, 0, mm_ptr);
         std::printf("\n\n[Stats] prefill=%d tok (%.2f tok/s) | decode=%d tok (%.2f tok/s)",
                     res.prompt_tokens, res.prompt_tokens * 1000.0 / std::max(res.prefill_ms, 0.001),
                     res.gen_tokens, res.gen_tokens * 1000.0 / std::max(res.decode_ms, 0.001));
