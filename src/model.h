@@ -181,7 +181,7 @@ public:
 
     // Multimodal Vision helpers (zero permanent VRAM/RAM — streams mmproj through prefill staging!)
     bool has_vision() const { return vision_.loaded(); }
-    bool encode_image_input(const std::string& url_or_path, EncodedImage& out);
+    bool encode_image_input(const std::string& url_or_path, EncodedImage& out, bool allow_local_files = false);
     static void expand_multimodal_tokens(
         const std::vector<int32_t>& raw_tokens,
         int32_t image_placeholder_id,
@@ -214,6 +214,7 @@ public:
         int spec_steps = 0;
         double prefill_ms = 0.0;
         double decode_ms = 0.0;
+        bool hit_max_ctx = false;
     };
     GenResult generate(
         const std::vector<int32_t>& prompt_tokens,
@@ -229,9 +230,14 @@ public:
 
     // Copy current logits to host (for verification / top-K inspection)
     void copy_logits_to_host(std::vector<float>& dst) const;
+    void copy_batch_logits_to_host(int b, std::vector<float>& dst) const;
 
-    // Empirical probe: measures exact 1-Loop Early-Exit (24L) vs Full 3-Loop (48L) token agreement rate!
+    // Empirical probe & R0 parity suite helpers
     void probe_early_exit(const std::string& prompt_text, int n_tokens = 48);
+    bool run_parity_suite();
+    int max_ctx() const { return cfg_.max_ctx; }
+    void set_batched_prefill(bool on) { cfg_.use_batched_prefill = on; }
+    void set_speculative(bool on) { cfg_.use_speculative = on; }
 
     const InkHParams& hparams() const { return hp_; }
     const InkTokenizer& tokenizer() const { return tok_; }

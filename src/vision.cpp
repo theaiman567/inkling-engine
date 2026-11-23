@@ -275,22 +275,35 @@ bool VisionEncoder::base64_decode(const std::string& b64, std::vector<uint8_t>& 
     return !out.empty();
 }
 
-bool VisionEncoder::resolve_image_input(const std::string& url_or_path, std::vector<uint8_t>& out_bytes) {
+bool VisionEncoder::resolve_image_input(const std::string& url_or_path, std::vector<uint8_t>& out_bytes, bool allow_local_files) {
     out_bytes.clear();
     if (url_or_path.empty()) return false;
 
-    // 1. data:image/...;base64,<payload>
+    // 1. data:image/...;base64,<payload> (ALWAYS safe for HTTP & CLI)
     if (url_or_path.rfind("data:", 0) == 0) {
         size_t comma = url_or_path.find(',');
         if (comma == std::string::npos) return false;
         return base64_decode(url_or_path.substr(comma + 1), out_bytes);
     }
 
-    // 2. file:///C:/... or raw local file path
+    // Security (R2 / SR1-09): Over HTTP (allow_local_files == false), NEVER touch the filesystem or network shares!
+    if (!allow_local_files) {
+        // Optional safe fallback: bare base64 payload without whitespace/path separators (some SDKs send bare base64)
+        bool looks_b64 = (url_or_path.size() > 64 &&
+                          url_or_path.find("://") == std::string::npos &&
+                          url_or_path.find('\\') == std::string::npos &&
+                          url_or_path.find(':') == std::string::npos);
+        if (looks_b64) {
+            return base64_decode(url_or_path, out_bytes);
+        }
+        std::fprintf(stderr, "[Vision] Blocked non-data image_url over HTTP (local/UNC file paths disabled for security)\n");
+        return false;
+    }
+
+    // 2. CLI-only local file path (still strictly refuses UNC / Windows device paths to block SMB/NTLM leaks!)
     std::string path = url_or_path;
     if (path.rfind("file:///", 0) == 0) {
         path = path.substr(8);
-        // Basic %20 URL unescape
         std::string unesc;
         unesc.reserve(path.size());
         for (size_t i = 0; i < path.size(); ++i) {
@@ -303,6 +316,16 @@ bool VisionEncoder::resolve_image_input(const std::string& url_or_path, std::vec
             }
         }
         path = std::move(unesc);
+    } else if (path.rfind("file://", 0) == 0) {
+        // file://host/share -> UNC! Always block!
+        std::fprintf(stderr, "[Vision] Blocked UNC file:// URI\n");
+        return false;
+    }
+
+    // Strictly refuse UNC paths (\\host\share, //host/share) and Windows extended/device paths (\\?\, \\.\)
+    if (path.size() >= 2 && ((path[0] == '\\' && path[1] == '\\') || (path[0] == '/' && path[1] == '/'))) {
+        std::fprintf(stderr, "[Vision] Blocked UNC/device path: %s\n", path.c_str());
+        return false;
     }
 
     std::ifstream ifs(path, std::ios::binary | std::ios::ate);
@@ -313,11 +336,6 @@ bool VisionEncoder::resolve_image_input(const std::string& url_or_path, std::vec
             ifs.seekg(0, std::ios::beg);
             if (ifs.read((char*)out_bytes.data(), sz)) return true;
         }
-    }
-
-    // 3. Fallback: raw base64 without data: prefix (some SDKs send bare base64)
-    if (url_or_path.size() > 64 && url_or_path.find("://") == std::string::npos) {
-        return base64_decode(url_or_path, out_bytes);
     }
     return false;
 }
@@ -369,7 +387,7 @@ bool VisionEncoder::decode_image_wic(const uint8_t* bytes, size_t len, int& out_
 bool VisionEncoder::encode_file(const std::string& file_path, EncodedImage& out,
                                 void* d_stage_buf, void* h_stage_buf, size_t stage_bytes, cudaStream_t stream) {
     std::vector<uint8_t> bytes;
-    if (!resolve_image_input(file_path, bytes)) {
+    if (!resolve_image_input(file_path, bytes, /*allow_local_files=*/true)) {
         std::fprintf(stderr, "[Vision] Failed to read image file: %s\n", file_path.c_str());
         return false;
     }
@@ -481,7 +499,7 @@ bool VisionEncoder::encode_bytes(const uint8_t* file_bytes, size_t file_len, Enc
     if (own_stage) {
         stage_cap = 12ull * 1024 * 1024;
         INK_CUDA_CHECK(cudaMalloc(&d_stage, stage_cap));
-        INK_CUDA_CHECK(cudaHostAlloc(&h_stage, stage_cap, cudaHostAllocWriteCombined));
+        INK_CUDA_CHECK(cudaHostAlloc(&h_stage, stage_cap, cudaHostAllocDefault));
     }
 
     float* d_X = nullptr;       // [n_pos, 1024]

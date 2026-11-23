@@ -690,10 +690,12 @@ void CPUThreadPool::run_moe_experts(
         quantize_f32_to_q8_32(h_buf_.data() + (size_t)t * n_ff, qh[t], n_ff);
     }
 
-    // Pass 2: Expert-outer sequential streaming (eliminates 8-stream TLB thrashing!)
+    // Pass 2: Expert-outer sequential streaming with 64-byte (16-float) cache-line aligned slices (zero false sharing!)
     parallel_for_threads([&](int tid, int nth) {
-        int r0 = (n_embd * tid) / nth;
-        int r1 = (n_embd * (tid + 1)) / nth;
+        int n_lines = (n_embd + 15) / 16;
+        int r0 = std::min(n_embd, ((n_lines * tid) / nth) * 16);
+        int r1 = std::min(n_embd, ((n_lines * (tid + 1)) / nth) * 16);
+        if (r0 >= r1) return;
         std::memset(out + r0, 0, (size_t)(r1 - r0) * sizeof(float));
         for (int t = 0; t < n_tasks; ++t) {
             const CPUExpertTask& tk = tasks[t];
@@ -776,10 +778,12 @@ void CPUThreadPool::run_moe_experts_grouped(
         }
     });
 
-    // Pass 2: Weight-outer Down + Weighted Scatter-Add with UNPACK-ONCE-DOT-N AVX2 (ZERO atomics!)
+    // Pass 2: Weight-outer Down + Weighted Scatter-Add with UNPACK-ONCE-DOT-N AVX2 (ZERO atomics, 64B-aligned slices!)
     parallel_for_threads([&](int tid, int nth) {
-        int r0 = (n_embd * tid) / nth;
-        int r1 = (n_embd * (tid + 1)) / nth;
+        int n_lines = (n_embd + 15) / 16;
+        int r0 = std::min(n_embd, ((n_lines * tid) / nth) * 16);
+        int r1 = std::min(n_embd, ((n_lines * (tid + 1)) / nth) * 16);
+        if (r0 >= r1) return;
         for (int b = 0; b < B; ++b) {
             std::memset(out_batch + (size_t)b * n_embd + r0, 0, (size_t)(r1 - r0) * sizeof(float));
         }

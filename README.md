@@ -1,8 +1,8 @@
-# InkEngine v3.2
+# InkEngine v3.3
 
 **A standalone C++17 / CUDA / AVX2 3-tier (VRAM → RAM → SSD) multimodal serving engine built from scratch for [Inkling-2-Mini](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) (`general.architecture = inkling2` + `inkling2v` vision), with zero `llama.cpp` or `ggml` dependencies.**
 
-InkEngine is engineered specifically for consumer GPUs that **cannot fit the full model + long context in VRAM** (e.g., 6–12 GB NVIDIA GPUs + 16 GB RAM + NVMe/SATA SSDs). By exploiting Inkling-2's **3× Looped-MoE architecture** (where 12 physical Core layers execute 3× per token while 12 Outer layers execute 1×), pairing a native **learned MoE expert predictor**, paging global KV cache across VRAM → RAM → NVMe SSD with GPU Radix-Select Quest attention, and streaming **multimodal vision (`mmproj-F16.gguf`)** on-demand through GPU Tensor Cores with **0 MiB permanent VRAM/RAM overhead**, InkEngine delivers **3× faster decode**, **2.2× faster prefill**, **native image understanding**, and **up to 512K–1M token context** on an 8 GB GPU — with **100% lossless token parity**.
+InkEngine is engineered specifically for consumer GPUs that **cannot fit the full model + long context in VRAM** (e.g., 6–12 GB NVIDIA GPUs + 16 GB RAM + NVMe/SATA SSDs). By exploiting Inkling-2's **3× Looped-MoE architecture** (where 12 physical Core layers execute 3× per token while 12 Outer layers execute 1×), pairing a native **learned MoE expert predictor**, paging global KV cache across VRAM → RAM → NVMe SSD with GPU Radix-Select Quest attention, and streaming **multimodal vision (`mmproj-F16.gguf`)** on-demand through GPU Tensor Cores with **0 MiB permanent VRAM/RAM overhead**, InkEngine delivers **3× faster decode**, **2.2× faster prefill**, **native image understanding**, and **up to 512K–1M token context** on an 8 GB GPU — backed by an automated **long-context (`>1,024`) parity verification suite** and **hardened local HTTP Bearer authentication**.
 
 ---
 
@@ -94,13 +94,13 @@ Works with **OpenCode**, **Cline**, **Continue**, **Open WebUI**, Python `openai
 build\inkengine.exe --model "C:\path\to\Inkling-2-Mini-UD-IQ3_XXS.gguf" --serve --host 127.0.0.1 --port 8787 --ctx 131072 --effort max
 ```
 
-Endpoints exposed:
-- `POST /v1/chat/completions` (SSE streaming, **multimodal `image_url` PNG/JPEG/BMP/WebP**, tool calls, `reasoning_content`, automatic KV prefix caching — including multi-turn image KV reuse!)
+Endpoints exposed *(protected by default with `Authorization: Bearer <token>`, Host allowlist, and non-wildcard CORS; pass `--api-key <token>` or `--no-auth` to override)*:
+- `POST /v1/chat/completions` (SSE streaming with UTF-8 boundary buffering, **multimodal `image_url` base64 PNG/JPEG/BMP/WebP**, tool calls, `reasoning_content`, strict HTTP 400 `context_length_exceeded` guard, automatic KV prefix caching — including multi-turn image KV reuse!)
 - `POST /v1/completions`
 - `GET /v1/models`
-- `GET /health` (readiness, `max_ctx`, active `effort`, `vision` status)
+- `GET /health` (readiness, `max_ctx`, active `effort`, `vision` status; responds in `<1 ms` even under stalled sockets)
 - `GET /stats` (live VRAM / RAM / SSD telemetry & expert cache hit rates)
-- `POST /shutdown` (clean shutdown)
+- `POST /shutdown` (authenticated clean shutdown)
 
 ### Option B: Standalone CLI Prompt *(Text or Image)*
 ```cmd
@@ -117,7 +117,7 @@ build\inkengine.exe --model "C:\path\to\Inkling-2-Mini-UD-IQ3_XXS.gguf" --ctx 16
    ```
    *(Or pass `--gguf "C:\path\to\model.gguf"` per command.)*
 
-2. **Add InkEngine to `%USERPROFILE%\.config\opencode\opencode.jsonc`**:
+2. **Add InkEngine to `%USERPROFILE%\.config\opencode\opencode.jsonc`** *(on startup, `inkcode.ps1` automatically generates a per-user CSPRNG token in `%LOCALAPPDATA%\InkEngine\api_token` and syncs only `provider.inkengine.options.apiKey`)*:
    ```jsonc
    {
      "provider": {
@@ -176,8 +176,12 @@ InkEngine automatically queries your free VRAM and system RAM at startup, so mos
 | `--self-draft-k <0\|2\|3>` | `0` (off) | Opt-in 1-Loop (24L) GPU-only lossless self-speculative drafting. Boosts code/refactoring speed (+7–10%), though cold prose may see lower acceptance. |
 | `--no-disk-kv-cache` | *(enabled)* | Disable persistent NVMe OpenCode KV prefix checkpoints in `%LOCALAPPDATA%\InkEngine\kv_cache\`. |
 | `--mmproj <path>` | *(auto-detected)* | Explicit path to `mmproj-F16.gguf` if stored outside your model GGUF directory (or set `INKENGINE_MMPROJ` for `inkcode`). |
-| `--image <path>` | *(none)* | Attach one or more local PNG/JPEG/BMP/WebP images to standalone `--prompt` CLI calls. |
+| `--image <path>` | *(none)* | Attach one or more local PNG/JPEG/BMP/WebP images to standalone `--prompt` CLI calls *(local paths are intentionally disabled over HTTP `image_url` for security)*. |
 | `--no-vision` | *(vision ON)* | Disable multimodal vision auto-detection even if `mmproj-F16.gguf` is present. |
+| `--api-key <token>` | *(random CSPRNG)* | Set an explicit Bearer token for `--serve` (`inkcode.ps1` auto-manages `%LOCALAPPDATA%\InkEngine\api_token` and syncs OpenCode). |
+| `--no-auth` | *(auth ON)* | Disable Bearer token enforcement on `--serve` (only for trusted isolated environments). |
+| `--cors-origin <url>` | *(CORS blocked)* | Allow a single browser origin (e.g., `http://localhost:3000`); default blocks cross-origin requests (`403`) and DNS rebinding. |
+| `--verify-suite` | *(off)* | Run the automated R0 long-context (`>1,024`) SWA wrap, batched prefill, speculative, and bit-exact Turn-Rewind + Disk v3 checkpoint parity suite. |
 | `--sync-preload` | *(async)* | Wait for full Tier-1 RAM expert preload to finish before opening the HTTP port. |
 
 ---
@@ -186,7 +190,7 @@ InkEngine automatically queries your free VRAM and system RAM at startup, so mos
 
 Measured on **RTX 4060 8 GB + Ryzen 5 5500 (6C/12T) + 16 GB DDR4 + SATA model SSD + NVMe OS SSD**, running `Inkling-2-Mini-UD-IQ3_XXS.gguf` (10.86 GiB) with `Q4_0` KV cache:
 
-| Benchmark | `llama.cpp` (Unsloth Studio) | InkEngine v1.0 | InkEngine v2.0 | **InkEngine v3.2** | v3.2 vs. `llama.cpp` |
+| Benchmark | `llama.cpp` (Unsloth Studio) | InkEngine v1.0 | InkEngine v2.0 | **InkEngine v3.3** | v3.3 vs. `llama.cpp` |
 |---|---:|---:|---:|---:|---:|
 | **64K steady decode** | 10.64 tok/s *(48K max)* | 26.03 tok/s | 32.34 tok/s | **32.65 tok/s** | **3.07×** |
 | **128K full context (`pos=130K`)** | OOM | 20.15 tok/s | 27.57 tok/s | **27.58 tok/s** | **2.59×** *(2.7× ctx)* |
@@ -197,17 +201,19 @@ Measured on **RTX 4060 8 GB + Ryzen 5 5500 (6C/12T) + 16 GB DDR4 + SATA model SS
 | **Cold server boot (`128K`)** | ~40s | ~34s | 34.4s | **18.6s** *(async RAM warm)* | **~2.1× faster** |
 | **OpenCode Turn 1 (10.5K prompt)** | ~200s | ~440s | 163.3s | **99.6s** *(cold)* / **29.1s** *(NVMe KV hit)* | **~6.9× faster** |
 | **Multimodal Vision (`mmproj-F16`, idle)** | ~610+ MiB VRAM/RAM | N/A | N/A | **0 MiB permanent VRAM / 0 MiB RAM** | **Zero text slowdown** |
-| **Full HD 1080p encode + multi-turn cache** | Re-encodes or pins VRAM | N/A | N/A | **~3.0s** *(SATA stream)* / **0.0 ms + 10 ms KV hit** | **1,494 VRAM slots kept** |
+| **Full HD 1080p encode + multi-turn cache** | Re-encodes or pins VRAM | N/A | N/A | **~3.0s** *(SATA stream)* / **0.0 ms + 10 ms KV hit** | **1,493 VRAM slots kept** |
 
 ### Exactness & Verification Commands
-You can verify token-for-token exactness and predictor math on your own machine:
+You can verify token-for-token exactness, long-context (`>1,024`) SWA/speculative/checkpoint parity, and predictor math on your own machine:
 ```cmd
-build\inkengine.exe --model "C:\path\to\model.gguf" --ctx 4096 --kv-quant f16 --no-fp16-loop --verify
+build\inkengine.exe --model "C:\path\to\model.gguf" --ctx 4096 --kv-quant f16 --no-fp16-loop --verify --verify-suite
+build\inkengine.exe --model "C:\path\to\model.gguf" --ctx 4096 --kv-quant q4 --verify-suite
 build\inkengine.exe --model "C:\path\to\model.gguf" --verify-predictor
 build\inkengine.exe --model "C:\path\to\model.gguf" --ctx 65536 --bench-prefill 2048
 build\inkengine.exe --model "C:\path\to\model.gguf" --ctx 65536 --bench 128
 ```
 - **Model Token Parity**: 100% exact match (`29/29` tokenizer match, `"17 * 23 is 391."`).
+- **Long-Context Parity (`--verify-suite`, `F16` & `Q4_0`)**: SWA ring-wrap `L0_SWA_err=0.000001`, post-wrap `B=128/32/7` Top-1 exact match, Speculative ON vs. OFF `96/96` exact (`77/77 = 100%` accepted past `pos=1024`), and **bit-exact (`0.000000`)** Turn-Rewind + Disk v3 Checkpoint restore.
 - **Predictor Parity**: `pred-v3.vec` = `1.639e-07`, `start-v3.vec` = `2.980e-07` max abs diff vs. PyTorch golden vectors.
 
 ---
@@ -218,10 +224,11 @@ build\inkengine.exe --model "C:\path\to\model.gguf" --ctx 65536 --bench 128
 2. **Async Background RAM Preload**: Opens the HTTP server in ~18.6s while streaming cold experts from SSD into Tier-1 RAM in the background.
 3. **Super-Fused CUDA Kernels + 97 Captured CUDA Graphs**: Single-launch multi-projection Attention GEMV, 3-way LoopControl + RMSNorm, gated `Wo` + `attn_post_conv` residual fusion, and exact FP32 Router+Top-K.
 4. **Layer-Wise PCIe-Streamed WMMA Tensor Core Prefill (`B = 128`)**: Cooperative 8-element dequantizer across 10 quant formats feeding `nvcuda::wmma` FP16→FP32 Tensor Cores, with a double-buffered 28 MiB PCIe staging ring for cold outer experts.
-5. **3-Tier Hybrid Paged KV (VRAM → RAM → NVMe SSD) + GPU Radix-Select Quest**: Keeps all 40 SWA layers (~45 MiB) pinned in VRAM and pages the 8 Global layers across VRAM, RAM, and Queue-Depth-16 `FILE_FLAG_OVERLAPPED` NVMe SSD using INT8 Quest summaries and O(N) GPU Radix-Select Top-K.
+5. **3-Tier Hybrid Paged KV (VRAM → RAM → NVMe SSD) + GPU Radix-Select Quest**: Keeps all 40 SWA layers (`1,152`-slot wrap-safe ring, `50.6 MiB` at `Q4_0`) pinned in VRAM with disjoint per-global-layer page tables, and pages the 8 Global layers across VRAM, RAM, and Queue-Depth-16 `FILE_FLAG_OVERLAPPED` NVMe SSD using INT8 Quest summaries and O(N) GPU Radix-Select Top-K.
 6. **Zero-VRAM Lossless Speculative Decoding**: O(1) rolling 3-gram suffix hash index across the full context (`K ≤ 6`) plus opt-in 1-Loop (24L) GPU-only self-drafting (`--self-draft-k`).
-7. **Persistent NVMe OpenCode KV Checkpoints**: Atomic 3-tier prefix checkpoints (`tools-prefix`, pre-`<env>` `static-prefix`, `full-system`) restored in `<200 ms` across restarts, plus `~49 MiB` zero-Global-copy `~4–10 ms` in-place turn-rewind snapshots.
-8. **Zero-Overhead GPU-Streamed Multimodal Vision (`inkling2v`)**: Pure Windows WIC decoder + 6 custom CUDA ViT/projector kernels (23-layer Perception-Encoder ViT, exact 2D RoPE, tiled FlashAttention, 2×2 spatial merge, `tok_norm` bypass) streamed in 8–9 MiB slices through the existing prefill PCIe staging ring — leaving all 1,494 VRAM expert slots, RAM budget, and text decode speed 100% untouched. Deterministic hash-derived synthetic token IDs let OpenCode multi-turn conversations reuse both cached image embeddings (`0.0 ms`) and KV prefix caches (`~10 ms`) automatically.
+7. **Persistent NVMe OpenCode KV Checkpoints (v3)**: Atomic 3-tier prefix checkpoints (`tools-prefix`, pre-`<env>` `static-prefix`, `full-system`) restored in `<200 ms` across restarts, plus `~55 MiB` zero-Global-copy `~4–10 ms` bit-exact in-place turn-rewind snapshots.
+8. **Zero-Overhead GPU-Streamed Multimodal Vision (`inkling2v`)**: Pure Windows WIC decoder + 6 custom CUDA ViT/projector kernels (23-layer Perception-Encoder ViT, exact 2D RoPE, tiled FlashAttention, 2×2 spatial merge, `tok_norm` bypass) streamed in 8–9 MiB slices through the existing prefill PCIe staging ring — leaving VRAM expert slots, RAM budget, and text decode speed 100% untouched. Deterministic hash-derived synthetic token IDs let OpenCode multi-turn conversations reuse both cached image embeddings (`0.0 ms`) and KV prefix caches (`~10 ms`) automatically.
+9. **Hardened Local HTTP/SSE Runtime**: Default CSPRNG Bearer auth across all routes, `Host` allowlist & non-wildcard CORS (blocking DNS rebinding), HTTP `image_url` local/UNC file exfiltration guard, strict anti-smuggling header parser, `10s/30s` socket timeouts, bounded 16-worker concurrency so `/health` stays `<1 ms`, UTF-8 multi-byte SSE boundary buffering, and strict `context_length_exceeded` handling.
 
 ---
 

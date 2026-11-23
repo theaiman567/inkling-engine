@@ -1,3 +1,4 @@
+#define _CRT_RAND_S
 #include "server.h"
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -5,6 +6,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cctype>
 #include <sstream>
@@ -13,6 +15,8 @@
 #include <chrono>
 #include <algorithm>
 #include <atomic>
+#include <mutex>
+#include <thread>
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -288,13 +292,104 @@ private:
     size_t i_, n_;
 };
 
+enum OutState { ST_HEADER, ST_THINKING, ST_TEXT, ST_TOOL_JSON, ST_TOOL_TEXT };
+
 // =========================================================================
-// HTTP Helpers (supports Content-Length, Chunked Transfer, Expect: 100-continue)
+// HTTP Helpers, Security (R2), UTF-8 Stream Splitter (R7) & Timeouts (R9)
 // =========================================================================
 std::string to_lower_ascii(std::string s) {
     for (char& c : s) c = (char)std::tolower((unsigned char)c);
     return s;
 }
+
+std::string trim_ascii(const std::string& s) {
+    size_t a = 0, b = s.size();
+    while (a < b && (s[a] == ' ' || s[a] == '\t' || s[a] == '\r' || s[a] == '\n')) ++a;
+    while (b > a && (s[b - 1] == ' ' || s[b - 1] == '\t' || s[b - 1] == '\r' || s[b - 1] == '\n')) --b;
+    return s.substr(a, b - a);
+}
+
+std::string generate_csprng_hex_token(int n_bytes = 16) {
+    static const char* kHex = "0123456789abcdef";
+    std::string out;
+    out.reserve((size_t)n_bytes * 2);
+    for (int i = 0; i < n_bytes; i += 4) {
+        unsigned int r = 0;
+        if (rand_s(&r) != 0) {
+            r = (unsigned int)std::chrono::high_resolution_clock::now().time_since_epoch().count() ^ (0x9E3779B9u * (unsigned int)(i + 1));
+        }
+        for (int b = 0; b < 4 && (i + b) < n_bytes; ++b) {
+            unsigned char v = (unsigned char)((r >> (b * 8)) & 0xFFu);
+            out.push_back(kHex[v >> 4]);
+            out.push_back(kHex[v & 0x0Fu]);
+        }
+    }
+    return out;
+}
+
+bool const_time_eq(const std::string& a, const std::string& b) {
+    if (a.size() != b.size()) return false;
+    unsigned char diff = 0;
+    for (size_t i = 0; i < a.size(); ++i) diff |= (unsigned char)(a[i] ^ b[i]);
+    return diff == 0;
+}
+
+// DNS-rebinding protection (R2 / SR1-09): only accept localhost / loopback / explicit bind host!
+bool is_allowed_host_header(const std::string& host_hdr, const std::string& bind_host) {
+    std::string h = to_lower_ascii(trim_ascii(host_hdr));
+    if (h.empty()) return true; // HTTP/1.0 or local minimal probes without Host header
+    if (!h.empty() && h[0] == '[') {
+        size_t rb = h.find(']');
+        if (rb == std::string::npos) return false;
+        h = h.substr(1, rb - 1);
+    } else {
+        size_t colon = h.find(':');
+        if (colon != std::string::npos) h.resize(colon);
+    }
+    std::string bh = to_lower_ascii(bind_host);
+    return (h == "127.0.0.1" || h == "localhost" || h == "::1" || h == bh);
+}
+
+// Holds incomplete trailing 1-3 UTF-8 bytes so every SSE delta is valid UTF-8 (R7 / SR1-12)!
+struct Utf8StreamBuffer {
+    std::string pending;
+
+    std::string push(const std::string& chunk) {
+        if (chunk.empty()) return "";
+        pending += chunk;
+        size_t n = pending.size();
+        size_t scan_lo = (n > 4) ? (n - 4) : 0;
+        size_t cut = n;
+        for (size_t i = n; i > scan_lo; --i) {
+            unsigned char b = (unsigned char)pending[i - 1];
+            if ((b & 0xC0u) == 0x80u) continue; // continuation byte
+            size_t need = 1;
+            if      (b < 0x80u)            need = 1;
+            else if ((b & 0xE0u) == 0xC0u) need = 2;
+            else if ((b & 0xF0u) == 0xE0u) need = 3;
+            else if ((b & 0xF8u) == 0xF0u) need = 4;
+            else                           need = 1; // invalid lead byte: emit immediately
+            size_t have = n - (i - 1);
+            if (have < need) cut = i - 1;
+            break;
+        }
+        if (cut == 0) return "";
+        if (cut == n) {
+            std::string out = std::move(pending);
+            pending.clear();
+            return out;
+        }
+        std::string out = pending.substr(0, cut);
+        pending.erase(0, cut);
+        return out;
+    }
+
+    std::string flush() {
+        std::string out = std::move(pending);
+        pending.clear();
+        return out;
+    }
+};
 
 bool send_all(SOCKET sock, const std::string& data) {
     const char* p = data.data();
@@ -330,14 +425,29 @@ bool is_client_alive(SOCKET sock) {
     return true;
 }
 
-void send_json(SOCKET sock, int code, const std::string& json_body) {
+const char* http_status_text(int code) {
+    switch (code) {
+        case 200: return "OK";
+        case 400: return "Bad Request";
+        case 401: return "Unauthorized";
+        case 403: return "Forbidden";
+        case 404: return "Not Found";
+        case 503: return "Service Unavailable";
+        default:  return "Error";
+    }
+}
+
+void send_json(SOCKET sock, int code, const std::string& json_body, const std::string& cors_origin = "") {
     std::ostringstream oss;
-    oss << "HTTP/1.1 " << code << (code == 200 ? " OK" : (code == 400 ? " Bad Request" : " Error")) << "\r\n"
-        << "Content-Type: application/json\r\n"
-        << "Access-Control-Allow-Origin: *\r\n"
-        << "Access-Control-Allow-Headers: *\r\n"
-        << "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-        << "Content-Length: " << json_body.size() << "\r\n"
+    oss << "HTTP/1.1 " << code << " " << http_status_text(code) << "\r\n"
+        << "Content-Type: application/json\r\n";
+    if (!cors_origin.empty()) {
+        oss << "Access-Control-Allow-Origin: " << cors_origin << "\r\n"
+            << "Access-Control-Allow-Headers: Authorization, Content-Type\r\n"
+            << "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+            << "Vary: Origin\r\n";
+    }
+    oss << "Content-Length: " << json_body.size() << "\r\n"
         << "Connection: close\r\n\r\n"
         << json_body;
     send_all(sock, oss.str());
@@ -363,12 +473,30 @@ bool decode_chunked(const std::string& raw, std::string& out) {
     return false;
 }
 
-bool read_http_request(SOCKET cli, std::string& method, std::string& path, std::string& body) {
+struct HttpRequest {
+    std::string method;
+    std::string path;
+    std::string body;
+    std::string host_hdr;
+    std::string auth_hdr;
+    int error_code = 0;
+};
+
+bool read_http_request(SOCKET cli, HttpRequest& out) {
+    out = HttpRequest{};
+    // Socket recv/send timeouts (R9 / SR1-10): prevent stalled clients from ever hanging the server!
+    DWORD rcv_to = 10000; // 10 seconds
+    DWORD snd_to = 30000; // 30 seconds
+    setsockopt(cli, SOL_SOCKET, SO_RCVTIMEO, (const char*)&rcv_to, sizeof(rcv_to));
+    setsockopt(cli, SOL_SOCKET, SO_SNDTIMEO, (const char*)&snd_to, sizeof(snd_to));
+
+    const auto t_start = std::chrono::steady_clock::now();
     std::string req;
     req.reserve(16384);
     char buf[16384];
     size_t header_end = std::string::npos;
     size_t content_len = 0;
+    bool has_cl = false;
     bool is_chunked = false;
     bool sent_100 = false;
 
@@ -378,30 +506,73 @@ bool read_http_request(SOCKET cli, std::string& method, std::string& path, std::
             if (is_chunked) {
                 std::string decoded;
                 if (decode_chunked(req.substr(header_end + 4), decoded)) {
-                    body = std::move(decoded);
+                    out.body = std::move(decoded);
                     break;
                 }
             }
+        } else {
+            double elapsed_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
+            if (elapsed_s > 10.0) return false; // 10s header deadline (defeats slow-loris!)
         }
+
         int n = recv(cli, buf, sizeof(buf), 0);
         if (n <= 0) break;
         req.append(buf, n);
-        if (req.size() > 64ull * 1024 * 1024) return false; // 64 MB safety cap
+        if (req.size() > 64ull * 1024 * 1024) { out.error_code = 400; return false; }
 
         if (header_end == std::string::npos) {
             header_end = req.find("\r\n\r\n");
+            if (header_end == std::string::npos && req.size() > 65536) {
+                out.error_code = 400;
+                return false;
+            }
             if (header_end != std::string::npos) {
-                std::string hdr_l = to_lower_ascii(req.substr(0, header_end));
-                if (hdr_l.find("transfer-encoding: chunked") != std::string::npos) {
-                    is_chunked = true;
+                // Strict line-by-line header parser (R2 + SR1-11: rejects conflicting CL / Transfer-Encoding!)
+                size_t line_start = req.find("\r\n");
+                if (line_start == std::string::npos || line_start > header_end) {
+                    out.error_code = 400;
+                    return false;
                 }
-                size_t cl = hdr_l.find("content-length:");
-                if (cl != std::string::npos) {
-                    content_len = (size_t)std::strtoull(hdr_l.c_str() + cl + 15, nullptr, 10);
+                size_t pos = line_start + 2;
+                while (pos < header_end) {
+                    size_t next_crlf = req.find("\r\n", pos);
+                    if (next_crlf == std::string::npos || next_crlf > header_end) next_crlf = header_end;
+                    std::string line = req.substr(pos, next_crlf - pos);
+                    pos = next_crlf + 2;
+                    size_t colon = line.find(':');
+                    if (colon == std::string::npos) continue;
+                    std::string k = to_lower_ascii(trim_ascii(line.substr(0, colon)));
+                    std::string v = trim_ascii(line.substr(colon + 1));
+                    if (k == "host") {
+                        out.host_hdr = v;
+                    } else if (k == "authorization") {
+                        out.auth_hdr = v;
+                    } else if (k == "transfer-encoding") {
+                        if (to_lower_ascii(v).find("chunked") != std::string::npos) is_chunked = true;
+                    } else if (k == "content-length") {
+                        if (v.empty()) { out.error_code = 400; return false; }
+                        for (char ch : v) {
+                            if (ch < '0' || ch > '9') { out.error_code = 400; return false; }
+                        }
+                        size_t parsed_cl = 0;
+                        try { parsed_cl = std::stoull(v); } catch (...) { out.error_code = 400; return false; }
+                        if (has_cl && parsed_cl != content_len) { out.error_code = 400; return false; }
+                        content_len = parsed_cl;
+                        has_cl = true;
+                    } else if (k == "expect") {
+                        if (!sent_100 && to_lower_ascii(v).find("100-continue") != std::string::npos) {
+                            send_all(cli, "HTTP/1.1 100 Continue\r\n\r\n");
+                            sent_100 = true;
+                        }
+                    }
                 }
-                if (!sent_100 && hdr_l.find("expect: 100-continue") != std::string::npos) {
-                    send_all(cli, "HTTP/1.1 100 Continue\r\n\r\n");
-                    sent_100 = true;
+                if (is_chunked && has_cl) {
+                    out.error_code = 400; // RFC 7230: reject Transfer-Encoding + Content-Length smuggling!
+                    return false;
+                }
+                if (has_cl && content_len > 64ull * 1024 * 1024) {
+                    out.error_code = 400;
+                    return false;
                 }
             }
         }
@@ -411,18 +582,20 @@ bool read_http_request(SOCKET cli, std::string& method, std::string& path, std::
     std::string first_line = req.substr(0, req.find("\r\n"));
     {
         std::istringstream iss(first_line);
-        iss >> method >> path;
+        iss >> out.method >> out.path;
     }
-    // Strip query string from path
-    size_t q = path.find('?');
-    if (q != std::string::npos) path.resize(q);
+    if (out.method.empty() || out.path.empty()) { out.error_code = 400; return false; }
+    size_t q = out.path.find('?');
+    if (q != std::string::npos) out.path.resize(q);
 
     if (!is_chunked) {
         if (req.size() >= header_end + 4) {
             size_t avail = req.size() - (header_end + 4);
-            body = req.substr(header_end + 4, std::min(avail, content_len));
+            if (avail < content_len) return false; // truncated/timed-out request body
+            out.body = req.substr(header_end + 4, content_len);
         } else {
-            body.clear();
+            if (content_len > 0) return false;
+            out.body.clear();
         }
     }
     return true;
@@ -616,10 +789,22 @@ bool parse_inkling_tool_invocation(const std::string& raw_json, const std::strin
 
 } // namespace
 
+OpenAIServer::OpenAIServer(InklingEngine& engine, const ServerConfig& cfg)
+    : engine_(engine), cfg_(cfg) {}
+
 OpenAIServer::OpenAIServer(InklingEngine& engine, const std::string& host, int port, const std::string& default_effort)
-    : engine_(engine), host_(host), port_(port), default_effort_(default_effort) {}
+    : engine_(engine) {
+    cfg_.host = host;
+    cfg_.port = port;
+    cfg_.default_effort = default_effort;
+}
 
 bool OpenAIServer::run() {
+    if (cfg_.require_auth && cfg_.api_key.empty()) {
+        cfg_.api_key = generate_csprng_hex_token(16);
+        std::printf("[Server] Generated CSPRNG session Bearer token: %s\n", cfg_.api_key.c_str());
+    }
+
     WSADATA wsa{};
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
         std::fprintf(stderr, "[Server] WSAStartup failed\n");
@@ -634,59 +819,109 @@ bool OpenAIServer::run() {
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_port = htons((u_short)port_);
-    inet_pton(AF_INET, host_.c_str(), &addr.sin_addr);
+    addr.sin_port = htons((u_short)cfg_.port);
+    inet_pton(AF_INET, cfg_.host.c_str(), &addr.sin_addr);
 
     if (bind(srv, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
-        std::fprintf(stderr, "[Server] Failed to bind %s:%d\n", host_.c_str(), port_);
+        std::fprintf(stderr, "[Server] Failed to bind %s:%d\n", cfg_.host.c_str(), cfg_.port);
         closesocket(srv);
         WSACleanup();
         return false;
     }
     listen(srv, 16);
 
-    std::printf("[Server] OpenAI-compatible InkEngine listening on http://%s:%d (default effort=%s, vision=%s)\n",
-                host_.c_str(), port_, default_effort_.c_str(), engine_.has_vision() ? "ON" : "OFF");
+    std::printf("[Server] OpenAI-compatible InkEngine v3.3 listening on http://%s:%d (effort=%s, vision=%s, auth=%s, cors=%s)\n",
+                cfg_.host.c_str(), cfg_.port, cfg_.default_effort.c_str(),
+                engine_.has_vision() ? "ON" : "OFF",
+                cfg_.require_auth ? "Bearer" : "OFF",
+                cfg_.cors_origin.empty() ? "OFF" : cfg_.cors_origin.c_str());
     std::printf("         Endpoints: /v1/chat/completions (vision+tools+thinking+SSE+KV-cache), /v1/completions, /v1/models, /health, /stats, /shutdown\n");
     std::fflush(stdout);
 
     std::atomic<uint64_t> req_counter{1};
+    std::atomic<bool> stop_flag{false};
+    std::atomic<int> active_conns{0};
+    std::mutex gen_mu;
 
-    while (true) {
-        SOCKET cli = accept(srv, nullptr, nullptr);
-        if (cli == INVALID_SOCKET) continue;
+    auto handle_client = [&](SOCKET cli) {
+        struct ConnGuard {
+            SOCKET s;
+            std::atomic<int>& cnt;
+            ~ConnGuard() { closesocket(s); cnt.fetch_sub(1, std::memory_order_relaxed); }
+        } guard{cli, active_conns};
 
         int nodelay = 1;
         setsockopt(cli, IPPROTO_TCP, TCP_NODELAY, (const char*)&nodelay, sizeof(nodelay));
 
-        std::string method, path, body;
-        if (!read_http_request(cli, method, path, body)) {
-            closesocket(cli);
-            continue;
+        HttpRequest req;
+        if (!read_http_request(cli, req)) {
+            if (req.error_code == 400) {
+                send_json(cli, 400, "{\"error\":{\"message\":\"Malformed HTTP request\"}}", cfg_.cors_origin);
+            }
+            return;
         }
 
-        if (method == "OPTIONS") {
-            send_json(cli, 200, "{}");
-            closesocket(cli);
-            continue;
+        // Security (R2 / SR1-09): Block DNS rebinding via Host header validation
+        if (!is_allowed_host_header(req.host_hdr, cfg_.host)) {
+            send_json(cli, 403, "{\"error\":{\"message\":\"Forbidden Host header\"}}");
+            return;
         }
 
+        // Security (R2): Reject cross-origin preflights unless an explicit --cors-origin was configured
+        if (req.method == "OPTIONS") {
+            if (!cfg_.cors_origin.empty()) send_json(cli, 200, "{}", cfg_.cors_origin);
+            else                           send_json(cli, 403, "{\"error\":{\"message\":\"CORS disabled\"}}");
+            return;
+        }
+
+        // Security (R2): Require Authorization: Bearer <token> on ALL endpoints (including /shutdown & /stats)
+        if (cfg_.require_auth) {
+            bool auth_ok = false;
+            std::string ah = trim_ascii(req.auth_hdr);
+            if (ah.size() > 7 && to_lower_ascii(ah.substr(0, 7)) == "bearer ") {
+                std::string provided = trim_ascii(ah.substr(7));
+                auth_ok = const_time_eq(provided, cfg_.api_key);
+            }
+            if (!auth_ok) {
+                send_json(cli, 401,
+                    "{\"error\":{\"message\":\"Missing or invalid Authorization Bearer token\",\"type\":\"authentication_error\"}}",
+                    cfg_.cors_origin);
+                return;
+            }
+        }
+
+        const std::string& method = req.method;
+        const std::string& path   = req.path;
+        const std::string& body   = req.body;
+
+        // Lightweight endpoints NEVER wait behind active GPU generation or stalled sockets (R9)!
         if (path == "/health") {
             auto ks = engine_.kv_stats();
-            char hb[320];
-            std::snprintf(hb, sizeof(hb), "{\"status\":\"ok\",\"engine\":\"InkEngine\",\"model\":\"Inkling-2-Mini\",\"max_ctx\":%d,\"effort\":\"%s\",\"vision\":%s}",
-                          ks.max_ctx, json_escape(default_effort_).c_str(), engine_.has_vision() ? "true" : "false");
-            send_json(cli, 200, hb);
-        } else if (path == "/shutdown" && method == "POST") {
-            send_json(cli, 200, "{\"status\":\"shutting_down\"}");
-            closesocket(cli);
-            std::printf("[Server] Received /shutdown request. Stopping cleanly...\n");
+            char hb[384];
+            std::snprintf(hb, sizeof(hb),
+                "{\"status\":\"ok\",\"engine\":\"InkEngine\",\"version\":\"3.3\",\"model\":\"Inkling-2-Mini\","
+                "\"max_ctx\":%d,\"effort\":\"%s\",\"vision\":%s,\"auth\":%s}",
+                ks.max_ctx, json_escape(cfg_.default_effort).c_str(),
+                engine_.has_vision() ? "true" : "false",
+                cfg_.require_auth ? "true" : "false");
+            send_json(cli, 200, hb, cfg_.cors_origin);
+            return;
+        }
+        if (path == "/shutdown" && method == "POST") {
+            send_json(cli, 200, "{\"status\":\"shutting_down\"}", cfg_.cors_origin);
+            std::printf("[Server] Received authenticated /shutdown request. Stopping cleanly...\n");
             std::fflush(stdout);
-            break;
-        } else if (path == "/v1/models") {
+            stop_flag.store(true, std::memory_order_release);
+            closesocket(srv); // Wake main accept() immediately!
+            return;
+        }
+        if (path == "/v1/models") {
             send_json(cli, 200,
-                "{\"object\":\"list\",\"data\":[{\"id\":\"Inkling-2-Mini\",\"object\":\"model\",\"owned_by\":\"InkEngine\"}]}");
-        } else if (path == "/stats") {
+                "{\"object\":\"list\",\"data\":[{\"id\":\"Inkling-2-Mini\",\"object\":\"model\",\"owned_by\":\"InkEngine\"}]}",
+                cfg_.cors_origin);
+            return;
+        }
+        if (path == "/stats") {
             auto es = engine_.expert_stats();
             auto ks = engine_.kv_stats();
             double hr = es.total_lookups ? (100.0 * es.vram_hits / es.total_lookups) : 0.0;
@@ -704,383 +939,458 @@ bool OpenAIServer::run() {
                 ks.max_ctx, ks.cur_pos, ks.swa_vram_mb, ks.global_vram_mb, ks.quest_summary_vram_mb,
                 ks.ram_kv_mb, ks.ssd_kv_mb,
                 (unsigned long long)ks.ssd_page_reads, (unsigned long long)ks.ssd_page_writes);
-            send_json(cli, 200, jbuf);
-        } else if (path == "/v1/chat/completions" || path == "/v1/completions") {
-            JsonVal root;
-            JsonParser jp(body);
-            if (!jp.parse(root) || !root.is_obj()) {
-                send_json(cli, 400, "{\"error\":{\"message\":\"Invalid JSON request body\"}}");
-                closesocket(cli);
-                continue;
-            }
-
-            bool is_chat = (path == "/v1/chat/completions");
-            bool stream  = root.get_bool("stream", false);
-            bool include_usage = false;
-            if (const auto* so = root.get("stream_options"); so && so->is_obj()) {
-                include_usage = so->get_bool("include_usage", false);
-            }
-
-            // Official Inkling-2-Mini recommended defaults: temp=1.0, top_p=1.0, top_k=0, min_p=0.0
-            SamplingParams sp;
-            sp.temperature = (float)root.get_num("temperature", 1.0);
-            sp.top_p       = (float)root.get_num("top_p", 1.0);
-            sp.top_k       = (int)root.get_num("top_k", 0);
-            sp.min_p       = (float)root.get_num("min_p", 0.0);
-            int max_tok    = (int)root.get_num("max_completion_tokens", root.get_num("max_tokens", 4096));
-            sp.max_tokens  = std::max(1, std::min(max_tok, 32768));
-            uint64_t def_seed = (uint64_t)std::chrono::high_resolution_clock::now().time_since_epoch().count()
-                                ^ (0x9E3779B97F4A7C15ULL * (req_counter.load() + 1));
-            if (def_seed == 0) def_seed = 42;
-            sp.seed        = (root.get("seed") && root.get("seed")->is_num())
-                                ? (uint64_t)root.get_num("seed", (double)def_seed)
-                                : def_seed;
-
-            std::string effort = root.get_str("reasoning_effort", default_effort_);
-            std::string tools_json;
-            std::string prompt_text;
-            std::vector<std::string> image_urls;
-            size_t static_prefix_bytes = 0;
-            size_t tools_prefix_bytes = 0;
-            size_t full_sys_prefix_bytes = 0;
-
-            if (is_chat) {
-                auto msgs = parse_openai_messages(root, &image_urls);
-                tools_json = build_canonical_tools_json(root);
-                prompt_text = engine_.tokenizer().format_chat(msgs, effort, true, tools_json, &static_prefix_bytes, &tools_prefix_bytes, &full_sys_prefix_bytes);
-            } else {
-                prompt_text = root.get_str("prompt", "");
-            }
-
-            std::vector<EncodedImage> encoded_imgs;
-            MultimodalEmbeddings mm_embd;
-            if (!image_urls.empty()) {
-                if (!engine_.has_vision()) {
-                    send_json(cli, 400, "{\"error\":{\"message\":\"Vision encoder not loaded (place mmproj-F16.gguf next to the model GGUF or pass --mmproj)\"}}");
-                    closesocket(cli);
-                    continue;
-                }
-                encoded_imgs.reserve(image_urls.size());
-                bool img_ok = true;
-                for (size_t ii = 0; ii < image_urls.size(); ++ii) {
-                    EncodedImage enc;
-                    if (!engine_.encode_image_input(image_urls[ii], enc)) {
-                        img_ok = false;
-                        break;
-                    }
-                    encoded_imgs.push_back(std::move(enc));
-                }
-                if (!img_ok) {
-                    send_json(cli, 400, "{\"error\":{\"message\":\"Failed to decode or encode one or more input images\"}}");
-                    closesocket(cli);
-                    continue;
-                }
-            }
-
-            int static_prefix_tokens = 0;
-            int tools_prefix_tokens = 0;
-            int full_sys_prefix_tokens = 0;
-            if (tools_prefix_bytes > 0 && tools_prefix_bytes < prompt_text.size()) {
-                auto tp_ids = engine_.tokenizer().encode(prompt_text.substr(0, tools_prefix_bytes), true);
-                tools_prefix_tokens = (int)tp_ids.size();
-            }
-            if (static_prefix_bytes > 0 && static_prefix_bytes < prompt_text.size()) {
-                auto sp_ids = engine_.tokenizer().encode(prompt_text.substr(0, static_prefix_bytes), true);
-                static_prefix_tokens = (int)sp_ids.size();
-            }
-            if (full_sys_prefix_bytes > 0 && full_sys_prefix_bytes < prompt_text.size()) {
-                auto fp_ids = engine_.tokenizer().encode(prompt_text.substr(0, full_sys_prefix_bytes), true);
-                full_sys_prefix_tokens = (int)fp_ids.size();
-            }
-            auto raw_prompt_ids = engine_.tokenizer().encode(prompt_text, true);
-            std::vector<int32_t> prompt_ids;
-            const MultimodalEmbeddings* mm_ptr = nullptr;
-            if (!encoded_imgs.empty()) {
-                InklingEngine::expand_multimodal_tokens(
-                    raw_prompt_ids, engine_.tokenizer().image_placeholder_id(), encoded_imgs, prompt_ids, mm_embd);
-                mm_ptr = &mm_embd;
-            } else {
-                prompt_ids = std::move(raw_prompt_ids);
-            }
-
-            uint64_t rid = req_counter.fetch_add(1);
-            std::string chat_id = "chatcmpl-ink-" + std::to_string(rid);
-            auto created = (long long)std::chrono::duration_cast<std::chrono::seconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count();
-
-            // Inkling-2 output parser state machine: cleanly separates thinking, visible text, and tool invocations!
-            enum OutState { ST_HEADER, ST_THINKING, ST_TEXT, ST_TOOL_JSON, ST_TOOL_TEXT };
-            bool starts_thinking = is_chat && (effort != "none" && effort != "0" && effort != "0.0");
-            bool starts_text     = is_chat && !starts_thinking && tools_json.empty();
-            OutState st = starts_thinking ? ST_THINKING : (starts_text ? ST_TEXT : ST_HEADER);
-
-            std::string header_buf;
-            std::string tool_buf;
-            std::string full_text;
-            std::string full_reasoning;
-            std::vector<ToolCallSpec> emitted_tools;
-            int tool_idx = 0;
-            bool client_alive = true;
-
-            const auto& tok = engine_.tokenizer();
-            const int32_t id_model = tok.msg_model_id();
-            const int32_t id_think = tok.thinking_id();
-            const int32_t id_text  = tok.text_id();
-            const int32_t id_tjson = tok.invoke_tool_json_id();
-            const int32_t id_ttext = tok.invoke_tool_text_id();
-            const int32_t id_endm  = tok.end_msg_id();
-
-            if (stream) {
-                std::string hdr =
-                    "HTTP/1.1 200 OK\r\n"
-                    "Content-Type: text/event-stream\r\n"
-                    "Cache-Control: no-cache\r\n"
-                    "Access-Control-Allow-Origin: *\r\n"
-                    "Connection: close\r\n\r\n";
-                client_alive = send_all(cli, hdr);
-
-                if (client_alive && is_chat) {
-                    // Opening role chunk (expected by OpenAI / Vercel AI SDK / OpenCode!)
-                    std::ostringstream first;
-                    first << "data: {\"id\":\"" << chat_id << "\",\"object\":\"chat.completion.chunk\",\"created\":" << created
-                          << ",\"model\":\"Inkling-2-Mini\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n";
-                    client_alive = send_all(cli, first.str());
-                }
-            }
-
-            auto emit_sse_delta = [&](const std::string& delta_json) {
-                if (!stream || !client_alive) return;
-                std::ostringstream ev;
-                if (is_chat) {
-                    ev << "data: {\"id\":\"" << chat_id << "\",\"object\":\"chat.completion.chunk\",\"created\":" << created
-                       << ",\"model\":\"Inkling-2-Mini\",\"choices\":[{\"index\":0,\"delta\":" << delta_json
-                       << ",\"finish_reason\":null}]}\n\n";
-                } else {
-                    ev << "data: {\"id\":\"" << chat_id << "\",\"object\":\"text_completion\",\"created\":" << created
-                       << ",\"model\":\"Inkling-2-Mini\",\"choices\":[{\"index\":0,\"text\":" << delta_json
-                       << ",\"finish_reason\":null}]}\n\n";
-                }
-                client_alive = send_all(cli, ev.str());
-            };
-
-            // Real OpenAI SSE data-event heartbeat: resets client SSE chunkTimeout AND detects FIN/RST in <1 us!
-            auto emit_sse_heartbeat = [&]() {
-                if (!client_alive) return;
-                if (!is_client_alive(cli)) { client_alive = false; return; }
-                if (!stream) return;
-                if (is_chat) emit_sse_delta("{}");
-                else         client_alive = send_all(cli, ": keepalive\n\n");
-            };
-
-            auto flush_tool_call = [&]() {
-                std::string tname, targs;
-                if (parse_inkling_tool_invocation(tool_buf, header_buf, tname, targs)) {
-                    ToolCallSpec tc;
-                    tc.id = "call_ink_" + std::to_string(rid) + "_" + std::to_string(tool_idx);
-                    tc.name = tname;
-                    tc.arguments_json = targs;
-                    if (stream && is_chat) {
-                        std::ostringstream d;
-                        d << "{\"tool_calls\":[{\"index\":" << tool_idx
-                          << ",\"id\":\"" << tc.id << "\",\"type\":\"function\",\"function\":{\"name\":\""
-                          << json_escape(tc.name) << "\",\"arguments\":\"" << json_escape(tc.arguments_json) << "\"}}]}";
-                        emit_sse_delta(d.str());
-                    }
-                    emitted_tools.push_back(std::move(tc));
-                    tool_idx++;
-                }
-                tool_buf.clear();
-                header_buf.clear();
-            };
-
-            std::printf("[HTTP] Incoming %s (id=%llu): prompt=%zu tok (full_sys=%d, static=%d, tools=%d, imgs=%zu) | stream=%d | effort=%s | has_tools=%d | T=%.2f p=%.2f k=%d mp=%.2f\n",
-                        path.c_str(), (unsigned long long)rid, prompt_ids.size(), full_sys_prefix_tokens, static_prefix_tokens, tools_prefix_tokens,
-                        encoded_imgs.size(), stream ? 1 : 0, effort.c_str(), tools_json.empty() ? 0 : 1,
-                        sp.temperature, sp.top_p, sp.top_k, sp.min_p);
-            std::fflush(stdout);
-
-            int silent_toks = 0;
-            int poll_toks = 0;
-
-            auto res = engine_.generate(
-                prompt_ids, sp,
-                [&](int32_t tok_id, const std::string& piece) -> bool {
-                    if (!client_alive) return false;
-                    if ((++poll_toks & 7) == 0 && !is_client_alive(cli)) {
-                        client_alive = false;
-                        return false;
-                    }
-                    if (!is_chat) {
-                        full_text += piece;
-                        if (stream && !piece.empty()) emit_sse_delta("\"" + json_escape(piece) + "\"");
-                        return client_alive;
-                    }
-
-                    if (tok_id == id_model) {
-                        st = ST_HEADER;
-                        header_buf.clear();
-                        return true;
-                    }
-                    if (tok_id == id_think) {
-                        st = ST_THINKING;
-                        return true;
-                    }
-                    if (tok_id == id_text) {
-                        st = ST_TEXT;
-                        return true;
-                    }
-                    if (tok_id == id_tjson) {
-                        st = ST_TOOL_JSON;
-                        tool_buf.clear();
-                        silent_toks = 0;
-                        emit_sse_heartbeat();
-                        return client_alive;
-                    }
-                    if (tok_id == id_ttext) {
-                        st = ST_TOOL_TEXT;
-                        tool_buf.clear();
-                        silent_toks = 0;
-                        emit_sse_heartbeat();
-                        return client_alive;
-                    }
-                    if (tok_id == id_endm) {
-                        if (st == ST_TOOL_JSON || st == ST_TOOL_TEXT) {
-                            flush_tool_call();
-                            silent_toks = 0;
-                        }
-                        st = ST_HEADER;
-                        header_buf.clear();
-                        return client_alive;
-                    }
-
-                    if (piece.empty()) return client_alive;
-
-                    if (st == ST_HEADER) {
-                        header_buf += piece;
-                        if (++silent_toks >= 16) { silent_toks = 0; emit_sse_heartbeat(); }
-                    } else if (st == ST_THINKING) {
-                        full_reasoning += piece;
-                        silent_toks = 0;
-                        emit_sse_delta("{\"reasoning_content\":\"" + json_escape(piece) + "\"}");
-                    } else if (st == ST_TEXT) {
-                        full_text += piece;
-                        silent_toks = 0;
-                        emit_sse_delta("{\"content\":\"" + json_escape(piece) + "\"}");
-                    } else if (st == ST_TOOL_JSON || st == ST_TOOL_TEXT) {
-                        tool_buf += piece;
-                        // Keep SSE stream alive while buffering large file writes/edits (~every 0.7s)!
-                        if (++silent_toks >= 16) { silent_toks = 0; emit_sse_heartbeat(); }
-                    }
-                    return client_alive;
-                },
-                false, // enable_profile
-                true,  // reuse_kv_prefix (incremental KV + full Global/SWA/ShortConv RAM checkpoint!)
-                static_prefix_tokens,
-                [&](int done, int total) -> bool {
-                    emit_sse_heartbeat();
-                    if (!client_alive) {
-                        std::printf("[HTTP] Client disconnected mid-prefill (id=%llu at %d/%d tokens) - aborting immediately\n",
-                                    (unsigned long long)rid, done, total);
-                        std::fflush(stdout);
-                        return false;
-                    }
-                    if (total >= 256 && ((done % 256) == 0 || done == total)) {
-                        std::printf("[HTTP] Prefill id=%llu: %d / %d tokens\n", (unsigned long long)rid, done, total);
-                        std::fflush(stdout);
-                    }
-                    return client_alive;
-                },
-                tools_prefix_tokens,
-                full_sys_prefix_tokens,
-                mm_ptr);
-
-            if (client_alive && (st == ST_TOOL_JSON || st == ST_TOOL_TEXT) && !tool_buf.empty()) {
-                flush_tool_call();
-            }
-
-            std::string finish_reason = !emitted_tools.empty()
-                ? "tool_calls"
-                : (res.gen_tokens >= sp.max_tokens ? "length" : "stop");
-            double tps = res.decode_ms > 0 ? (res.gen_tokens * 1000.0 / res.decode_ms) : 0.0;
-            int new_prompt = res.prompt_tokens - res.cached_tokens;
-            double ptps = (res.prefill_ms > 0 && new_prompt > 0) ? (new_prompt * 1000.0 / res.prefill_ms) : 0.0;
-
-            if (stream) {
-                if (client_alive) {
-                    std::ostringstream done;
-                    if (is_chat) {
-                        done << "data: {\"id\":\"" << chat_id << "\",\"object\":\"chat.completion.chunk\",\"created\":" << created
-                             << ",\"model\":\"Inkling-2-Mini\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\""
-                             << finish_reason << "\"}]}\n\n";
-                        if (include_usage) {
-                            done << "data: {\"id\":\"" << chat_id << "\",\"object\":\"chat.completion.chunk\",\"created\":" << created
-                                 << ",\"model\":\"Inkling-2-Mini\",\"choices\":[],\"usage\":{\"prompt_tokens\":" << res.prompt_tokens
-                                 << ",\"completion_tokens\":" << res.gen_tokens
-                                 << ",\"total_tokens\":" << (res.prompt_tokens + res.gen_tokens)
-                                 << ",\"prompt_tokens_details\":{\"cached_tokens\":" << res.cached_tokens << "}}}\n\n";
-                        }
-                        done << "data: [DONE]\n\n";
-                    } else {
-                        done << "data: {\"id\":\"" << chat_id << "\",\"object\":\"text_completion\",\"created\":" << created
-                             << ",\"model\":\"Inkling-2-Mini\",\"choices\":[{\"index\":0,\"text\":\"\",\"finish_reason\":\""
-                             << finish_reason << "\"}]}\n\n"
-                             << "data: [DONE]\n\n";
-                    }
-                    send_all(cli, done.str());
-                }
-                std::printf("[HTTP] %s stream: prompt=%d (cached=%d, new=%d @ %.1f tok/s) | gen=%d (%.2f tok/s) | spec=%d/%d | tools=%zu%s\n",
-                            path.c_str(), res.prompt_tokens, res.cached_tokens, new_prompt, ptps,
-                            res.gen_tokens, tps, res.spec_accepted, res.spec_drafted, emitted_tools.size(),
-                            client_alive ? "" : " | ABORTED(client_closed)");
-                std::fflush(stdout);
-            } else {
-                std::ostringstream j;
-                if (is_chat) {
-                    j << "{\"id\":\"" << chat_id << "\",\"object\":\"chat.completion\",\"created\":" << created
-                      << ",\"model\":\"Inkling-2-Mini\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":";
-                    if (full_text.empty() && !emitted_tools.empty()) j << "null";
-                    else j << "\"" << json_escape(full_text) << "\"";
-                    if (!full_reasoning.empty()) {
-                        j << ",\"reasoning_content\":\"" << json_escape(full_reasoning) << "\"";
-                    }
-                    if (!emitted_tools.empty()) {
-                        j << ",\"tool_calls\":[";
-                        for (size_t i = 0; i < emitted_tools.size(); ++i) {
-                            if (i) j << ",";
-                            j << "{\"id\":\"" << emitted_tools[i].id << "\",\"type\":\"function\",\"function\":{\"name\":\""
-                              << json_escape(emitted_tools[i].name) << "\",\"arguments\":\""
-                              << json_escape(emitted_tools[i].arguments_json) << "\"}}";
-                        }
-                        j << "]";
-                    }
-                    j << "},\"finish_reason\":\"" << finish_reason << "\"}],"
-                      << "\"usage\":{\"prompt_tokens\":" << res.prompt_tokens
-                      << ",\"completion_tokens\":" << res.gen_tokens
-                      << ",\"total_tokens\":" << (res.prompt_tokens + res.gen_tokens)
-                      << ",\"prompt_tokens_details\":{\"cached_tokens\":" << res.cached_tokens << "}},"
-                      << "\"timings\":{\"prefill_ms\":" << res.prefill_ms
-                      << ",\"decode_ms\":" << res.decode_ms
-                      << ",\"tokens_per_second\":" << tps << "}}";
-                } else {
-                    j << "{\"id\":\"" << chat_id << "\",\"object\":\"text_completion\",\"created\":" << created
-                      << ",\"model\":\"Inkling-2-Mini\",\"choices\":[{\"index\":0,\"text\":\""
-                      << json_escape(full_text) << "\",\"finish_reason\":\"stop\"}],"
-                      << "\"timings\":{\"tokens_per_second\":" << tps << "}}";
-                }
-                send_json(cli, 200, j.str());
-                std::printf("[HTTP] %s: prompt=%d (cached=%d, new=%d @ %.1f tok/s) | gen=%d (%.2f tok/s) | spec=%d/%d | tools=%zu\n",
-                            path.c_str(), res.prompt_tokens, res.cached_tokens, new_prompt, ptps,
-                            res.gen_tokens, tps, res.spec_accepted, res.spec_drafted, emitted_tools.size());
-                std::fflush(stdout);
-            }
-        } else {
-            send_json(cli, 404, "{\"error\":\"Not found\"}");
+            send_json(cli, 200, jbuf, cfg_.cors_origin);
+            return;
+        }
+        if (path != "/v1/chat/completions" && path != "/v1/completions") {
+            send_json(cli, 404, "{\"error\":\"Not found\"}", cfg_.cors_origin);
+            return;
         }
 
-        closesocket(cli);
+        JsonVal root;
+        JsonParser jp(body);
+        if (!jp.parse(root) || !root.is_obj()) {
+            send_json(cli, 400, "{\"error\":{\"message\":\"Invalid JSON request body\"}}", cfg_.cors_origin);
+            return;
+        }
+
+        bool is_chat = (path == "/v1/chat/completions");
+        bool stream  = root.get_bool("stream", false);
+        bool include_usage = false;
+        if (const auto* so = root.get("stream_options"); so && so->is_obj()) {
+            include_usage = so->get_bool("include_usage", false);
+        }
+
+        // Official Inkling-2-Mini recommended defaults: temp=1.0, top_p=1.0, top_k=0, min_p=0.0
+        SamplingParams sp;
+        sp.temperature = (float)root.get_num("temperature", 1.0);
+        sp.top_p       = (float)root.get_num("top_p", 1.0);
+        sp.top_k       = (int)root.get_num("top_k", 0);
+        sp.min_p       = (float)root.get_num("min_p", 0.0);
+        int max_tok    = (int)root.get_num("max_completion_tokens", root.get_num("max_tokens", 4096));
+        sp.max_tokens  = std::max(1, std::min(max_tok, 32768));
+        uint64_t def_seed = (uint64_t)std::chrono::high_resolution_clock::now().time_since_epoch().count()
+                            ^ (0x9E3779B97F4A7C15ULL * (req_counter.load() + 1));
+        if (def_seed == 0) def_seed = 42;
+        sp.seed        = (root.get("seed") && root.get("seed")->is_num())
+                            ? (uint64_t)root.get_num("seed", (double)def_seed)
+                            : def_seed;
+
+        std::string effort = root.get_str("reasoning_effort", cfg_.default_effort);
+        std::string tools_json;
+        std::string prompt_text;
+        std::vector<std::string> image_urls;
+        size_t static_prefix_bytes = 0;
+        size_t tools_prefix_bytes = 0;
+        size_t full_sys_prefix_bytes = 0;
+
+        if (is_chat) {
+            auto msgs = parse_openai_messages(root, &image_urls);
+            tools_json = build_canonical_tools_json(root);
+            prompt_text = engine_.tokenizer().format_chat(msgs, effort, true, tools_json, &static_prefix_bytes, &tools_prefix_bytes, &full_sys_prefix_bytes);
+        } else {
+            prompt_text = root.get_str("prompt", "");
+        }
+
+        // Serialize GPU/KV engine execution (while /health and /stats remain completely non-blocking!)
+        std::lock_guard<std::mutex> glk(gen_mu);
+        if (stop_flag.load(std::memory_order_acquire)) {
+            send_json(cli, 503, "{\"error\":{\"message\":\"Server shutting down\"}}", cfg_.cors_origin);
+            return;
+        }
+
+        std::vector<EncodedImage> encoded_imgs;
+        MultimodalEmbeddings mm_embd;
+        if (!image_urls.empty()) {
+            if (!engine_.has_vision()) {
+                send_json(cli, 400, "{\"error\":{\"message\":\"Vision encoder not loaded (place mmproj-F16.gguf next to the model GGUF or pass --mmproj)\"}}", cfg_.cors_origin);
+                return;
+            }
+            encoded_imgs.reserve(image_urls.size());
+            bool img_ok = true;
+            for (size_t ii = 0; ii < image_urls.size(); ++ii) {
+                EncodedImage enc;
+                // Security (R2 / SR1-09): allow_local_files = false over HTTP (only data: base64 allowed!)
+                if (!engine_.encode_image_input(image_urls[ii], enc, /*allow_local_files=*/false)) {
+                    img_ok = false;
+                    break;
+                }
+                encoded_imgs.push_back(std::move(enc));
+            }
+            if (!img_ok) {
+                send_json(cli, 400, "{\"error\":{\"message\":\"Failed to decode input image (over HTTP only data:image/...;base64,... URIs are permitted)\"}}", cfg_.cors_origin);
+                return;
+            }
+        }
+
+        int static_prefix_tokens = 0;
+        int tools_prefix_tokens = 0;
+        int full_sys_prefix_tokens = 0;
+        if (tools_prefix_bytes > 0 && tools_prefix_bytes < prompt_text.size()) {
+            auto tp_ids = engine_.tokenizer().encode(prompt_text.substr(0, tools_prefix_bytes), true);
+            tools_prefix_tokens = (int)tp_ids.size();
+        }
+        if (static_prefix_bytes > 0 && static_prefix_bytes < prompt_text.size()) {
+            auto sp_ids = engine_.tokenizer().encode(prompt_text.substr(0, static_prefix_bytes), true);
+            static_prefix_tokens = (int)sp_ids.size();
+        }
+        if (full_sys_prefix_bytes > 0 && full_sys_prefix_bytes < prompt_text.size()) {
+            auto fp_ids = engine_.tokenizer().encode(prompt_text.substr(0, full_sys_prefix_bytes), true);
+            full_sys_prefix_tokens = (int)fp_ids.size();
+        }
+        auto raw_prompt_ids = engine_.tokenizer().encode(prompt_text, true);
+        std::vector<int32_t> prompt_ids;
+        const MultimodalEmbeddings* mm_ptr = nullptr;
+        if (!encoded_imgs.empty()) {
+            InklingEngine::expand_multimodal_tokens(
+                raw_prompt_ids, engine_.tokenizer().image_placeholder_id(), encoded_imgs, prompt_ids, mm_embd);
+            mm_ptr = &mm_embd;
+        } else {
+            prompt_ids = std::move(raw_prompt_ids);
+        }
+
+        // Context overflow protection (R3 / SR1-02): return standard OpenAI context_length_exceeded so OpenCode compacts!
+        int max_ctx = engine_.max_ctx();
+        if ((int)prompt_ids.size() >= max_ctx) {
+            char ebuf[384];
+            std::snprintf(ebuf, sizeof(ebuf),
+                "{\"error\":{\"message\":\"This model's maximum context length is %d tokens. However, your messages resulted in %zu tokens. Please reduce the length of the messages.\","
+                "\"type\":\"invalid_request_error\",\"param\":\"messages\",\"code\":\"context_length_exceeded\"}}",
+                max_ctx, prompt_ids.size());
+            send_json(cli, 400, ebuf, cfg_.cors_origin);
+            return;
+        }
+        int avail_gen = max_ctx - (int)prompt_ids.size();
+        if (sp.max_tokens > avail_gen) sp.max_tokens = std::max(1, avail_gen);
+
+        uint64_t rid = req_counter.fetch_add(1);
+        std::string chat_id = "chatcmpl-ink-" + std::to_string(rid);
+        auto created = (long long)std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+
+        // Inkling-2 output parser state machine: cleanly separates thinking, visible text, and tool invocations!
+        bool starts_thinking = is_chat && (effort != "none" && effort != "0" && effort != "0.0");
+        bool starts_text     = is_chat && !starts_thinking && tools_json.empty();
+        OutState st = starts_thinking ? ST_THINKING : (starts_text ? ST_TEXT : ST_HEADER);
+
+        std::string header_buf;
+        std::string tool_buf;
+        std::string full_text;
+        std::string full_reasoning;
+        Utf8StreamBuffer utf8_think;
+        Utf8StreamBuffer utf8_text;
+        std::vector<ToolCallSpec> emitted_tools;
+        int tool_idx = 0;
+        bool client_alive = true;
+
+        const auto& tok = engine_.tokenizer();
+        const int32_t id_model = tok.msg_model_id();
+        const int32_t id_think = tok.thinking_id();
+        const int32_t id_text  = tok.text_id();
+        const int32_t id_tjson = tok.invoke_tool_json_id();
+        const int32_t id_ttext = tok.invoke_tool_text_id();
+        const int32_t id_endm  = tok.end_msg_id();
+
+        if (stream) {
+            std::ostringstream hdr;
+            hdr << "HTTP/1.1 200 OK\r\n"
+                << "Content-Type: text/event-stream\r\n"
+                << "Cache-Control: no-cache\r\n";
+            if (!cfg_.cors_origin.empty()) {
+                hdr << "Access-Control-Allow-Origin: " << cfg_.cors_origin << "\r\n"
+                    << "Vary: Origin\r\n";
+            }
+            hdr << "Connection: close\r\n\r\n";
+            client_alive = send_all(cli, hdr.str());
+
+            if (client_alive && is_chat) {
+                // Opening role chunk (expected by OpenAI / Vercel AI SDK / OpenCode!)
+                std::ostringstream first;
+                first << "data: {\"id\":\"" << chat_id << "\",\"object\":\"chat.completion.chunk\",\"created\":" << created
+                      << ",\"model\":\"Inkling-2-Mini\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n";
+                client_alive = send_all(cli, first.str());
+            }
+        }
+
+        auto emit_sse_delta = [&](const std::string& delta_json) {
+            if (!stream || !client_alive) return;
+            std::ostringstream ev;
+            if (is_chat) {
+                ev << "data: {\"id\":\"" << chat_id << "\",\"object\":\"chat.completion.chunk\",\"created\":" << created
+                   << ",\"model\":\"Inkling-2-Mini\",\"choices\":[{\"index\":0,\"delta\":" << delta_json
+                   << ",\"finish_reason\":null}]}\n\n";
+            } else {
+                ev << "data: {\"id\":\"" << chat_id << "\",\"object\":\"text_completion\",\"created\":" << created
+                   << ",\"model\":\"Inkling-2-Mini\",\"choices\":[{\"index\":0,\"text\":" << delta_json
+                   << ",\"finish_reason\":null}]}\n\n";
+            }
+            client_alive = send_all(cli, ev.str());
+        };
+
+        auto flush_utf8_buffers = [&]() {
+            std::string rt = utf8_think.flush();
+            if (!rt.empty()) emit_sse_delta("{\"reasoning_content\":\"" + json_escape(rt) + "\"}");
+            std::string tx = utf8_text.flush();
+            if (!tx.empty()) {
+                if (is_chat) emit_sse_delta("{\"content\":\"" + json_escape(tx) + "\"}");
+                else         emit_sse_delta("\"" + json_escape(tx) + "\"");
+            }
+        };
+
+        // Real OpenAI SSE data-event heartbeat: resets client SSE chunkTimeout AND detects FIN/RST in <1 us!
+        auto emit_sse_heartbeat = [&]() {
+            if (!client_alive) return;
+            if (!is_client_alive(cli)) { client_alive = false; return; }
+            if (!stream) return;
+            if (is_chat) emit_sse_delta("{}");
+            else         client_alive = send_all(cli, ": keepalive\n\n");
+        };
+
+        auto flush_tool_call = [&]() {
+            std::string tname, targs;
+            if (parse_inkling_tool_invocation(tool_buf, header_buf, tname, targs)) {
+                ToolCallSpec tc;
+                tc.id = "call_ink_" + std::to_string(rid) + "_" + std::to_string(tool_idx);
+                tc.name = tname;
+                tc.arguments_json = targs;
+                if (stream && is_chat) {
+                    std::ostringstream d;
+                    d << "{\"tool_calls\":[{\"index\":" << tool_idx
+                      << ",\"id\":\"" << tc.id << "\",\"type\":\"function\",\"function\":{\"name\":\""
+                      << json_escape(tc.name) << "\",\"arguments\":\"" << json_escape(tc.arguments_json) << "\"}}]}";
+                    emit_sse_delta(d.str());
+                }
+                emitted_tools.push_back(std::move(tc));
+                tool_idx++;
+            }
+            tool_buf.clear();
+            header_buf.clear();
+        };
+
+        std::printf("[HTTP] Incoming %s (id=%llu): prompt=%zu tok (full_sys=%d, static=%d, tools=%d, imgs=%zu) | stream=%d | effort=%s | has_tools=%d | T=%.2f p=%.2f k=%d mp=%.2f\n",
+                    path.c_str(), (unsigned long long)rid, prompt_ids.size(), full_sys_prefix_tokens, static_prefix_tokens, tools_prefix_tokens,
+                    encoded_imgs.size(), stream ? 1 : 0, effort.c_str(), tools_json.empty() ? 0 : 1,
+                    sp.temperature, sp.top_p, sp.top_k, sp.min_p);
+        std::fflush(stdout);
+
+        int silent_toks = 0;
+        int poll_toks = 0;
+
+        auto res = engine_.generate(
+            prompt_ids, sp,
+            [&](int32_t tok_id, const std::string& piece) -> bool {
+                if (!client_alive) return false;
+                if ((++poll_toks & 7) == 0 && !is_client_alive(cli)) {
+                    client_alive = false;
+                    return false;
+                }
+                if (!is_chat) {
+                    full_text += piece;
+                    if (stream && !piece.empty()) {
+                        std::string valid = utf8_text.push(piece);
+                        if (!valid.empty()) emit_sse_delta("\"" + json_escape(valid) + "\"");
+                    }
+                    return client_alive;
+                }
+
+                if (tok_id == id_model) {
+                    flush_utf8_buffers();
+                    st = ST_HEADER;
+                    header_buf.clear();
+                    return client_alive;
+                }
+                if (tok_id == id_think) {
+                    flush_utf8_buffers();
+                    st = ST_THINKING;
+                    return client_alive;
+                }
+                if (tok_id == id_text) {
+                    flush_utf8_buffers();
+                    st = ST_TEXT;
+                    return client_alive;
+                }
+                if (tok_id == id_tjson) {
+                    flush_utf8_buffers();
+                    st = ST_TOOL_JSON;
+                    tool_buf.clear();
+                    silent_toks = 0;
+                    emit_sse_heartbeat();
+                    return client_alive;
+                }
+                if (tok_id == id_ttext) {
+                    flush_utf8_buffers();
+                    st = ST_TOOL_TEXT;
+                    tool_buf.clear();
+                    silent_toks = 0;
+                    emit_sse_heartbeat();
+                    return client_alive;
+                }
+                if (tok_id == id_endm) {
+                    flush_utf8_buffers();
+                    if (st == ST_TOOL_JSON || st == ST_TOOL_TEXT) {
+                        flush_tool_call();
+                        silent_toks = 0;
+                    }
+                    st = ST_HEADER;
+                    header_buf.clear();
+                    return client_alive;
+                }
+
+                if (piece.empty()) return client_alive;
+
+                if (st == ST_HEADER) {
+                    header_buf += piece;
+                    if (++silent_toks >= 16) { silent_toks = 0; emit_sse_heartbeat(); }
+                } else if (st == ST_THINKING) {
+                    full_reasoning += piece;
+                    silent_toks = 0;
+                    if (stream) {
+                        std::string valid = utf8_think.push(piece);
+                        if (!valid.empty()) emit_sse_delta("{\"reasoning_content\":\"" + json_escape(valid) + "\"}");
+                    }
+                } else if (st == ST_TEXT) {
+                    full_text += piece;
+                    silent_toks = 0;
+                    if (stream) {
+                        std::string valid = utf8_text.push(piece);
+                        if (!valid.empty()) emit_sse_delta("{\"content\":\"" + json_escape(valid) + "\"}");
+                    }
+                } else if (st == ST_TOOL_JSON || st == ST_TOOL_TEXT) {
+                    tool_buf += piece;
+                    // Keep SSE stream alive while buffering large file writes/edits (~every 0.7s)!
+                    if (++silent_toks >= 16) { silent_toks = 0; emit_sse_heartbeat(); }
+                }
+                return client_alive;
+            },
+            false, // enable_profile
+            true,  // reuse_kv_prefix (incremental KV + full Global/SWA/ShortConv RAM checkpoint!)
+            static_prefix_tokens,
+            [&](int done, int total) -> bool {
+                emit_sse_heartbeat();
+                if (!client_alive) {
+                    std::printf("[HTTP] Client disconnected mid-prefill (id=%llu at %d/%d tokens) - aborting immediately\n",
+                                (unsigned long long)rid, done, total);
+                    std::fflush(stdout);
+                    return false;
+                }
+                if (total >= 256 && ((done % 256) == 0 || done == total)) {
+                    std::printf("[HTTP] Prefill id=%llu: %d / %d tokens\n", (unsigned long long)rid, done, total);
+                    std::fflush(stdout);
+                }
+                return client_alive;
+            },
+            tools_prefix_tokens,
+            full_sys_prefix_tokens,
+            mm_ptr);
+
+        if (client_alive) {
+            flush_utf8_buffers();
+            if ((st == ST_TOOL_JSON || st == ST_TOOL_TEXT) && !tool_buf.empty()) {
+                flush_tool_call();
+            }
+        }
+
+        std::string finish_reason = !emitted_tools.empty()
+            ? "tool_calls"
+            : ((res.hit_max_ctx || res.gen_tokens >= sp.max_tokens) ? "length" : "stop");
+        double tps = res.decode_ms > 0 ? (res.gen_tokens * 1000.0 / res.decode_ms) : 0.0;
+        int new_prompt = res.prompt_tokens - res.cached_tokens;
+        double ptps = (res.prefill_ms > 0 && new_prompt > 0) ? (new_prompt * 1000.0 / res.prefill_ms) : 0.0;
+
+        if (stream) {
+            if (client_alive) {
+                std::ostringstream done;
+                if (is_chat) {
+                    done << "data: {\"id\":\"" << chat_id << "\",\"object\":\"chat.completion.chunk\",\"created\":" << created
+                         << ",\"model\":\"Inkling-2-Mini\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\""
+                         << finish_reason << "\"}]}\n\n";
+                    if (include_usage) {
+                        done << "data: {\"id\":\"" << chat_id << "\",\"object\":\"chat.completion.chunk\",\"created\":" << created
+                             << ",\"model\":\"Inkling-2-Mini\",\"choices\":[],\"usage\":{\"prompt_tokens\":" << res.prompt_tokens
+                             << ",\"completion_tokens\":" << res.gen_tokens
+                             << ",\"total_tokens\":" << (res.prompt_tokens + res.gen_tokens)
+                             << ",\"prompt_tokens_details\":{\"cached_tokens\":" << res.cached_tokens << "}}}\n\n";
+                    }
+                    done << "data: [DONE]\n\n";
+                } else {
+                    done << "data: {\"id\":\"" << chat_id << "\",\"object\":\"text_completion\",\"created\":" << created
+                         << ",\"model\":\"Inkling-2-Mini\",\"choices\":[{\"index\":0,\"text\":\"\",\"finish_reason\":\""
+                         << finish_reason << "\"}]}\n\n"
+                         << "data: [DONE]\n\n";
+                }
+                send_all(cli, done.str());
+            }
+            std::printf("[HTTP] %s stream: prompt=%d (cached=%d, new=%d @ %.1f tok/s) | gen=%d (%.2f tok/s) | spec=%d/%d | tools=%zu%s\n",
+                        path.c_str(), res.prompt_tokens, res.cached_tokens, new_prompt, ptps,
+                        res.gen_tokens, tps, res.spec_accepted, res.spec_drafted, emitted_tools.size(),
+                        client_alive ? "" : " | ABORTED(client_closed)");
+            std::fflush(stdout);
+        } else {
+            std::ostringstream j;
+            if (is_chat) {
+                j << "{\"id\":\"" << chat_id << "\",\"object\":\"chat.completion\",\"created\":" << created
+                  << ",\"model\":\"Inkling-2-Mini\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":";
+                if (full_text.empty() && !emitted_tools.empty()) j << "null";
+                else j << "\"" << json_escape(full_text) << "\"";
+                if (!full_reasoning.empty()) {
+                    j << ",\"reasoning_content\":\"" << json_escape(full_reasoning) << "\"";
+                }
+                if (!emitted_tools.empty()) {
+                    j << ",\"tool_calls\":[";
+                    for (size_t i = 0; i < emitted_tools.size(); ++i) {
+                        if (i) j << ",";
+                        j << "{\"id\":\"" << emitted_tools[i].id << "\",\"type\":\"function\",\"function\":{\"name\":\""
+                          << json_escape(emitted_tools[i].name) << "\",\"arguments\":\""
+                          << json_escape(emitted_tools[i].arguments_json) << "\"}}";
+                    }
+                    j << "]";
+                }
+                j << "},\"finish_reason\":\"" << finish_reason << "\"}],"
+                  << "\"usage\":{\"prompt_tokens\":" << res.prompt_tokens
+                  << ",\"completion_tokens\":" << res.gen_tokens
+                  << ",\"total_tokens\":" << (res.prompt_tokens + res.gen_tokens)
+                  << ",\"prompt_tokens_details\":{\"cached_tokens\":" << res.cached_tokens << "}},"
+                  << "\"timings\":{\"prefill_ms\":" << res.prefill_ms
+                  << ",\"decode_ms\":" << res.decode_ms
+                  << ",\"tokens_per_second\":" << tps << "}}";
+            } else {
+                j << "{\"id\":\"" << chat_id << "\",\"object\":\"text_completion\",\"created\":" << created
+                  << ",\"model\":\"Inkling-2-Mini\",\"choices\":[{\"index\":0,\"text\":\""
+                  << json_escape(full_text) << "\",\"finish_reason\":\"" << finish_reason << "\"}],"
+                  << "\"timings\":{\"tokens_per_second\":" << tps << "}}";
+            }
+            send_json(cli, 200, j.str(), cfg_.cors_origin);
+            std::printf("[HTTP] %s: prompt=%d (cached=%d, new=%d @ %.1f tok/s) | gen=%d (%.2f tok/s) | spec=%d/%d | tools=%zu\n",
+                        path.c_str(), res.prompt_tokens, res.cached_tokens, new_prompt, ptps,
+                        res.gen_tokens, tps, res.spec_accepted, res.spec_drafted, emitted_tools.size());
+            std::fflush(stdout);
+        }
+    };
+
+    while (!stop_flag.load(std::memory_order_acquire)) {
+        SOCKET cli = accept(srv, nullptr, nullptr);
+        if (cli == INVALID_SOCKET) {
+            if (stop_flag.load(std::memory_order_acquire)) break;
+            continue;
+        }
+        if (active_conns.load(std::memory_order_relaxed) >= 16) {
+            send_json(cli, 503, "{\"error\":{\"message\":\"Too many concurrent connections\"}}", cfg_.cors_origin);
+            closesocket(cli);
+            continue;
+        }
+        active_conns.fetch_add(1, std::memory_order_relaxed);
+        std::thread(handle_client, cli).detach();
     }
 
-    closesocket(srv);
+    // Wait cleanly for any in-flight GPU work before tearing down CUDA context
+    {
+        std::lock_guard<std::mutex> glk(gen_mu);
+    }
+    for (int w = 0; w < 50 && active_conns.load(std::memory_order_relaxed) > 0; ++w) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+
+    if (srv != INVALID_SOCKET) closesocket(srv);
     WSACleanup();
     return true;
 }

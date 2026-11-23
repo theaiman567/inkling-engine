@@ -33,8 +33,9 @@ public:
     const std::string& path() const { return mmproj_path_; }
     int projection_dim() const { return proj_dim_; }
 
-    // Decode base64 data URI ("data:image/...;base64,..."), file:// URI, or local image path -> raw encoded file bytes.
-    static bool resolve_image_input(const std::string& url_or_path, std::vector<uint8_t>& out_bytes);
+    // Decode base64 data URI ("data:image/...;base64,..."), or (CLI only when allow_local_files=true) local image path -> raw encoded file bytes.
+    // Always refuses UNC network paths (\\host\share, //host/share, \\?\, \\.\) to prevent SMB/NTLM leakage!
+    static bool resolve_image_input(const std::string& url_or_path, std::vector<uint8_t>& out_bytes, bool allow_local_files = false);
     static bool base64_decode(const std::string& b64, std::vector<uint8_t>& out_bytes);
     static uint64_t hash_bytes(const uint8_t* data, size_t len);
 

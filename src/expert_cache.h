@@ -108,6 +108,10 @@ public:
     // Direct lookup helpers for grouped batched prefill (Stage 4 & v3.0 PCIe streaming)
     bool is_in_vram(int uid) const { return uid >= 0 && uid < total_experts_ && uid_to_vram_slot_[uid] != -1; }
     const uint8_t* get_ram_expert_ptr(int uid); // ensures expert is in RAM (demand-pages SSD if needed)
+    // Pin a cold expert in RAM so it CANNOT be evicted until unpin_ram_slots() is called!
+    // Returns nullptr if every fitting RAM slot is already pinned (caller should flush current batch first).
+    const uint8_t* pin_ram_expert(int uid, int* out_slot = nullptr);
+    void unpin_ram_slots(const int* slots, int n);
     void record_batch_hit_stats(int ip, int n_vram_hits, int n_cpu_misses);
     cudaStream_t dma_stream() const { return stream_dma_; }
     size_t max_slot_bytes() const { return max_slot_bytes_; }
@@ -146,6 +150,8 @@ public:
     }
     ExpertCacheStats stats() const { return stats_; }
     void reset_stats();
+    void set_swaps_frozen(bool frozen) { swaps_frozen_ = frozen; }
+    bool swaps_frozen() const { return swaps_frozen_; }
 
 private:
     int ensure_in_ram_unlocked(int uid);
@@ -199,6 +205,7 @@ private:
     std::vector<uint8_t*> ram_slot_ptr_;    // [n_ram_slots]
     std::vector<size_t>   ram_slot_cap_;    // [n_ram_slots]
     std::vector<int>      ram_slot_owner_;  // [n_ram_slots] -> uid or -1
+    std::vector<uint8_t>  ram_slot_pin_;    // [n_ram_slots] active consumer pin count (0 = evictable)
     std::vector<int>      uid_to_ram_slot_; // [total_experts] -> slot or -1
     std::vector<uint64_t> ram_slot_lru_;
     uint64_t clock_ = 0;
@@ -246,6 +253,7 @@ private:
     cudaStream_t stream_dma_ = nullptr;
     cudaEvent_t  ev_compute_done_ = nullptr;
     uint64_t*    h_ptr_update_ = nullptr; // pinned [MAX_INFLIGHT_DMA * 4] for zero-stall 8-byte table updates
+    bool         swaps_frozen_ = false;
 
     ExpertCacheStats stats_{};
 };

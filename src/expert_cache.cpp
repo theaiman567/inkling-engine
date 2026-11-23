@@ -161,7 +161,7 @@ bool ExpertCache::init(
     INK_CUDA_CHECK(cudaEventCreateWithFlags(&ev_compute_done_, cudaEventDisableTiming));
     INK_CUDA_CHECK(cudaHostAlloc(&h_ptr_update_, MAX_INFLIGHT_DMA * 4 * sizeof(uint64_t), cudaHostAllocDefault));
     for (int i = 0; i < MAX_INFLIGHT_DMA; ++i) {
-        INK_CUDA_CHECK(cudaHostAlloc(&dma_[i].h_in_staging,  max_slot_bytes_, cudaHostAllocWriteCombined));
+        INK_CUDA_CHECK(cudaHostAlloc(&dma_[i].h_in_staging,  max_slot_bytes_, cudaHostAllocDefault));
         INK_CUDA_CHECK(cudaHostAlloc(&dma_[i].h_out_staging, max_slot_bytes_, cudaHostAllocDefault));
         INK_CUDA_CHECK(cudaEventCreateWithFlags(&dma_[i].event, cudaEventDisableTiming));
     }
@@ -390,6 +390,7 @@ bool ExpertCache::init(
         ram_slot_ptr_.resize(n_ram_slots_);
         ram_slot_cap_.resize(n_ram_slots_);
         ram_slot_owner_.assign(n_ram_slots_, -1);
+        ram_slot_pin_.assign(n_ram_slots_, 0);
         ram_slot_lru_.assign(n_ram_slots_, 0);
         size_t off = 0;
         for (int s = 0; s < n_ram_small_; ++s) {
@@ -487,11 +488,11 @@ void ExpertCache::bg_preload_ram_worker() {
 
             int rslot = -1;
             if (fits_small) {
-                while (scan_s < n_ram_small_ && ram_slot_owner_[scan_s] != -1) scan_s++;
+                while (scan_s < n_ram_small_ && (ram_slot_owner_[scan_s] != -1 || ram_slot_pin_[scan_s] != 0)) scan_s++;
                 if (scan_s < n_ram_small_) rslot = scan_s++;
             }
             if (rslot < 0) {
-                while (scan_l < n_ram_slots_ && ram_slot_owner_[scan_l] != -1) scan_l++;
+                while (scan_l < n_ram_slots_ && (ram_slot_owner_[scan_l] != -1 || ram_slot_pin_[scan_l] != 0)) scan_l++;
                 if (scan_l < n_ram_slots_) rslot = scan_l++;
             }
             if (rslot < 0) break; // RAM pool full
@@ -538,6 +539,7 @@ bool ExpertCache::read_expert_from_ssd(int uid, uint8_t* dst) {
 
 int ExpertCache::find_ram_victim_unlocked(size_t need_bytes) const {
     auto is_busy_ram = [&](int s) {
+        if (ram_slot_pin_[s] > 0) return true;
         for (int i = 0; i < MAX_INFLIGHT_DMA; ++i) {
             if (dma_[i].active && dma_[i].ram_slot == s) return true;
         }
@@ -555,7 +557,7 @@ int ExpertCache::find_ram_victim_unlocked(size_t need_bytes) const {
             best = s;
         }
     }
-    return best >= 0 ? best : start_s;
+    return best;
 }
 
 int ExpertCache::ensure_in_ram_unlocked(int uid) {
@@ -565,15 +567,20 @@ int ExpertCache::ensure_in_ram_unlocked(int uid) {
         stats_.ram_hits++;
         return rslot;
     }
-    // Tier-2 SSD miss! Demand-page from GGUF file directly into a fitting LRU RAM slot!
+    // Tier-2 SSD miss! Demand-page from GGUF file directly into an unpinned fitting LRU RAM slot!
     size_t need = layers_[uid / n_experts_].combined_bytes;
     rslot = find_ram_victim_unlocked(need);
+    if (rslot < 0) return -1;
     int old_uid = ram_slot_owner_[rslot];
     if (old_uid >= 0) {
         uid_to_ram_slot_[old_uid] = -1;
+        ram_slot_owner_[rslot] = -1;
     }
     uint8_t* dst = ram_slot_ptr_[rslot];
-    read_expert_from_ssd(uid, dst);
+    if (!read_expert_from_ssd(uid, dst)) {
+        std::fprintf(stderr, "[ExpertCache] ERROR: SSD read failed for expert uid=%d\n", uid);
+        return -1;
+    }
     ram_slot_owner_[rslot] = uid;
     uid_to_ram_slot_[uid] = rslot;
     ram_slot_lru_[rslot] = ++clock_;
@@ -639,14 +646,18 @@ void ExpertCache::complete_dma_unlocked(int i, cudaStream_t compute_stream) {
                 // Free the smaller RAM slot and acquire a fitting universal RAM slot
                 ram_slot_owner_[dst_rslot] = -1;
                 dst_rslot = find_ram_victim_unlocked(d.out_bytes);
-                int prev = ram_slot_owner_[dst_rslot];
-                if (prev >= 0) uid_to_ram_slot_[prev] = -1;
+                if (dst_rslot >= 0) {
+                    int prev = ram_slot_owner_[dst_rslot];
+                    if (prev >= 0) uid_to_ram_slot_[prev] = -1;
+                }
             }
-            uint8_t* rdst = ram_slot_ptr_[dst_rslot];
-            std::memcpy(rdst, d.h_out_staging, d.out_bytes);
-            ram_slot_owner_[dst_rslot] = d.uid_out;
-            uid_to_ram_slot_[d.uid_out] = dst_rslot;
-            ram_slot_lru_[dst_rslot]   = ++clock_;
+            if (dst_rslot >= 0) {
+                uint8_t* rdst = ram_slot_ptr_[dst_rslot];
+                std::memcpy(rdst, d.h_out_staging, d.out_bytes);
+                ram_slot_owner_[dst_rslot] = d.uid_out;
+                uid_to_ram_slot_[d.uid_out] = dst_rslot;
+                ram_slot_lru_[dst_rslot]   = ++clock_;
+            }
         } else {
             ram_slot_owner_[d.ram_slot] = -1;
         }
@@ -836,7 +847,7 @@ int ExpertCache::apply_predictor_scores(
     float min_bg_gain,
     cudaStream_t compute_stream)
 {
-    if ((int)pred_scores.size() != total_experts_ || n_vram_slots_ <= 0) return 0;
+    if (swaps_frozen_ || (int)pred_scores.size() != total_experts_ || n_vram_slots_ <= 0) return 0;
 
     finish_token_end_swaps(compute_stream, false);
 
@@ -916,7 +927,36 @@ int ExpertCache::apply_predictor_scores(
 
 const uint8_t* ExpertCache::get_ram_expert_ptr(int uid) {
     int rslot = ensure_in_ram(uid);
-    return ram_slot_ptr_[rslot];
+    return (rslot >= 0) ? ram_slot_ptr_[rslot] : nullptr;
+}
+
+const uint8_t* ExpertCache::pin_ram_expert(int uid, int* out_slot) {
+    auto work = [&]() -> int {
+        int rslot = ensure_in_ram_unlocked(uid);
+        if (rslot >= 0 && ram_slot_pin_[rslot] < 255) {
+            ram_slot_pin_[rslot]++;
+        }
+        return rslot;
+    };
+    int rslot = -1;
+    if (ram_preload_done_.load(std::memory_order_acquire)) rslot = work();
+    else { std::lock_guard<std::mutex> lk(ram_mu_); rslot = work(); }
+    if (out_slot) *out_slot = rslot;
+    return (rslot >= 0) ? ram_slot_ptr_[rslot] : nullptr;
+}
+
+void ExpertCache::unpin_ram_slots(const int* slots, int n) {
+    if (!slots || n <= 0) return;
+    auto work = [&]() {
+        for (int i = 0; i < n; ++i) {
+            int s = slots[i];
+            if (s >= 0 && s < n_ram_slots_ && ram_slot_pin_[s] > 0) {
+                ram_slot_pin_[s]--;
+            }
+        }
+    };
+    if (ram_preload_done_.load(std::memory_order_acquire)) work();
+    else { std::lock_guard<std::mutex> lk(ram_mu_); work(); }
 }
 
 void ExpertCache::record_batch_hit_stats(int ip, int n_vram_hits, int n_cpu_misses) {
@@ -928,7 +968,7 @@ void ExpertCache::record_batch_hit_stats(int ip, int n_vram_hits, int n_cpu_miss
 }
 
 void ExpertCache::begin_phased_swaps(cudaStream_t compute_stream, int phase_filter, int max_swaps) {
-    if (n_vram_slots_ <= 0 || max_swaps <= 0) return;
+    if (swaps_frozen_ || n_vram_slots_ <= 0 || max_swaps <= 0) return;
 
     int free_ch = 0;
     for (int i = 0; i < MAX_INFLIGHT_DMA; ++i) {

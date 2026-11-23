@@ -118,7 +118,7 @@ bool InklingEngine::load(const EngineConfig& cfg) {
 
     auto t_start = now_ms();
     std::printf("================================================================\n");
-    std::printf("  InkEngine v3.2 - Custom Looped-MoE 3-Tier Serving Engine\n");
+    std::printf("  InkEngine v3.3 - Custom Looped-MoE 3-Tier Serving Engine\n");
     std::printf("================================================================\n");
 
     if (!gguf_.open(cfg.model_path)) return false;
@@ -316,7 +316,7 @@ bool InklingEngine::load(const EngineConfig& cfg) {
     alloc_f32(d_logits_, hp_.vocab_padded);
     INK_CUDA_CHECK(cudaMalloc(&d_argmax_, sizeof(int32_t)));
 
-    INK_CUDA_CHECK(cudaHostAlloc(&h_embd_row_,      D * sizeof(float), cudaHostAllocWriteCombined));
+    INK_CUDA_CHECK(cudaHostAlloc(&h_embd_row_,      D * sizeof(float), cudaHostAllocDefault));
     INK_CUDA_CHECK(cudaHostAlloc(&h_top_ids_,       hp_.n_expert_used * sizeof(int32_t), cudaHostAllocDefault));
     INK_CUDA_CHECK(cudaHostAlloc(&h_top_weights_,   hp_.n_expert_used * sizeof(float), cudaHostAllocDefault));
     INK_CUDA_CHECK(cudaHostAlloc(&h_ffn_in_,        D * sizeof(float), cudaHostAllocMapped));
@@ -324,7 +324,7 @@ bool InklingEngine::load(const EngineConfig& cfg) {
     INK_CUDA_CHECK(cudaHostAlloc(&h_split_pkt_,     sizeof(MoESplitPacket), cudaHostAllocMapped));
     INK_CUDA_CHECK(cudaHostGetDevicePointer(&d_split_pkt_, h_split_pkt_, 0));
     INK_CUDA_CHECK(cudaHostAlloc(&h_zero_sync_ids_, (size_t)hp_.n_layer_logical * hp_.n_expert_used * sizeof(int32_t), cudaHostAllocDefault));
-    INK_CUDA_CHECK(cudaHostAlloc(&h_moe_cpu_out_,   D * sizeof(float), cudaHostAllocWriteCombined));
+    INK_CUDA_CHECK(cudaHostAlloc(&h_moe_cpu_out_,   D * sizeof(float), cudaHostAllocDefault));
     INK_CUDA_CHECK(cudaHostAlloc(&h_argmax_,        sizeof(int32_t), cudaHostAllocDefault));
     INK_CUDA_CHECK(cudaEventCreateWithFlags(&ev_split_, cudaEventDisableTiming));
 
@@ -800,6 +800,8 @@ void InklingEngine::capture_cuda_graphs() {
                 now_ms() - tg0);
 }
 
+static std::vector<float>* g_l0_attn_capture = nullptr;
+
 int32_t InklingEngine::forward_token(int32_t token_id, int pos, bool need_logits, bool enable_profile,
                                      bool is_answer, bool capture_pred_hidden) {
     double t0 = 0, t_step = 0;
@@ -835,7 +837,8 @@ int32_t InklingEngine::forward_token(int32_t token_id, int pos, bool need_logits
     float eff = (float)(pos + 1) / (float)hp_.log_scale_floor;
     float tau_global = 1.0f + hp_.log_scale_alpha * std::log(std::max(eff, 1.0f));
     if (tau_global != last_tau_global_) {
-        INK_CUDA_CHECK(cudaMemcpyAsync(d_tau_global_, &tau_global, sizeof(float), cudaMemcpyHostToDevice, stream_));
+        INK_CUDA_CHECK(cudaStreamSynchronize(stream_));
+        INK_CUDA_CHECK(cudaMemcpy(d_tau_global_, &tau_global, sizeof(float), cudaMemcpyHostToDevice));
         last_tau_global_ = tau_global;
     }
 
@@ -883,6 +886,12 @@ int32_t InklingEngine::forward_token(int32_t token_id, int pos, bool need_logits
         // Dynamic Paged Attention (SWA ring or 3-tier Global + Quest)
         int rel_ext = L.is_swa ? hp_.swa_window : hp_.rel_extent;
         kv_.append_and_attend(il, pos, d_Q_, d_K_conv_, d_V_conv_, d_rel_table_, d_sinks_, d_attn_out_, rel_ext, stream_);
+        if (il == 0 && g_l0_attn_capture) {
+            int qdim = hp_.n_head * hp_.head_dim;
+            g_l0_attn_capture->resize(qdim);
+            INK_CUDA_CHECK(cudaStreamSynchronize(stream_));
+            INK_CUDA_CHECK(cudaMemcpy(g_l0_attn_capture->data(), d_attn_out_, (size_t)qdim * sizeof(float), cudaMemcpyDeviceToHost));
+        }
 
         // Subgraph B: GateMul + Wo + AttnPostConv + Residual + FFN AttnRes + LoopCtrl + FFN RMSNorm + MoE Router
         if (use_graphs) {
@@ -962,7 +971,8 @@ int32_t InklingEngine::forward_token(int32_t token_id, int pos, bool need_logits
         INK_CUDA_CHECK(cudaStreamSynchronize(stream_));
         greedy = *h_argmax_;
         mark(prof_.lm_head_ms);
-    } else if (n_zero_sync > 0 || capture_pred_hidden) {
+    } else {
+        // Always sync before returning so host staging buffers (h_embd_row_, per-layer page tables) are safe for next token
         INK_CUDA_CHECK(cudaStreamSynchronize(stream_));
     }
 
@@ -999,7 +1009,8 @@ int32_t InklingEngine::forward_token_1loop_draft(int32_t token_id, int pos) {
     float eff = (float)(pos + 1) / (float)hp_.log_scale_floor;
     float tau_global = 1.0f + hp_.log_scale_alpha * std::log(std::max(eff, 1.0f));
     if (tau_global != last_tau_global_) {
-        INK_CUDA_CHECK(cudaMemcpyAsync(d_tau_global_, &tau_global, sizeof(float), cudaMemcpyHostToDevice, stream_));
+        INK_CUDA_CHECK(cudaStreamSynchronize(stream_));
+        INK_CUDA_CHECK(cudaMemcpy(d_tau_global_, &tau_global, sizeof(float), cudaMemcpyHostToDevice));
         last_tau_global_ = tau_global;
     }
 
@@ -1118,7 +1129,7 @@ void InklingEngine::alloc_batch_buffers() {
     for (int i = 0; i < STAGE_EXPS; ++i) seq_ids[i] = i;
     for (int s = 0; s < STAGE_BUFS; ++s) {
         INK_CUDA_CHECK(cudaMalloc(&d_prefill_stage_[s], (size_t)STAGE_EXPS * STAGE_SLOT_BYTES));
-        INK_CUDA_CHECK(cudaHostAlloc(&h_prefill_stage_[s], (size_t)STAGE_EXPS * STAGE_SLOT_BYTES, cudaHostAllocWriteCombined));
+        INK_CUDA_CHECK(cudaHostAlloc(&h_prefill_stage_[s], (size_t)STAGE_EXPS * STAGE_SLOT_BYTES, cudaHostAllocDefault));
         INK_CUDA_CHECK(cudaMalloc(&stage_tbl_[s].d_gu_ptrs,   STAGE_EXPS * sizeof(uint64_t)));
         INK_CUDA_CHECK(cudaMalloc(&stage_tbl_[s].d_dn_ptrs,   STAGE_EXPS * sizeof(uint64_t)));
         INK_CUDA_CHECK(cudaMalloc(&stage_tbl_[s].d_gu_scales, STAGE_EXPS * sizeof(float)));
@@ -1361,6 +1372,11 @@ int32_t InklingEngine::forward_batch(
 
         kv_.append_and_attend_batch(il, pos0, B, d_b_Q_, d_b_K_conv_, d_b_V_conv_,
                                     d_b_rel_table_, d_b_sinks_, d_b_attn_out_, rel_ext, stream_);
+        if (il == 0 && g_l0_attn_capture) {
+            g_l0_attn_capture->resize(Qdim);
+            INK_CUDA_CHECK(cudaStreamSynchronize(stream_));
+            INK_CUDA_CHECK(cudaMemcpy(g_l0_attn_capture->data(), d_b_attn_out_, (size_t)Qdim * sizeof(float), cudaMemcpyDeviceToHost));
+        }
 
         ink_cuda_gate_sigmoid_mul(d_b_attn_out_, d_b_attn_gate_, B * Qdim, stream_);
         ink_cuda_gemm_batch(L.wo.type, L.wo.ptr, d_b_attn_out_, d_b_wo_out_, B, D, Qdim, stream_);
@@ -1422,6 +1438,7 @@ int32_t InklingEngine::forward_batch(
 
         int n_gpu_grp = 0, gpu_pairs = 0;
         int n_cpu_grp = 0, cpu_pairs = 0;
+        int cpu_uids[128];
         h_grp_tok_off_[0] = 0;
         for (int e = 0; e < hp_.n_expert; ++e) {
             int cnt = bucket_cnt[e];
@@ -1437,10 +1454,11 @@ int32_t InklingEngine::forward_batch(
                 n_gpu_grp++;
                 h_grp_tok_off_[n_gpu_grp] = gpu_pairs;
             } else {
-                const uint8_t* rptr = experts_.get_ram_expert_ptr(uid);
+                // Defer RAM pinning until each micro-batch is consumed so tight RAM can NEVER evict an expert before read!
+                cpu_uids[n_cpu_grp] = uid;
                 CPUExpertGroupTask& cg = cpu_groups[n_cpu_grp++];
-                cg.gate_up_data  = rptr;
-                cg.down_data     = rptr + lm.down_aligned_off;
+                cg.gate_up_data  = nullptr;
+                cg.down_data     = nullptr;
                 cg.gate_up_type  = lm.gate_up_type;
                 cg.down_type     = lm.down_type;
                 cg.gate_up_scale = lm.gate_up_scales[e];
@@ -1480,13 +1498,34 @@ int32_t InklingEngine::forward_batch(
             const size_t exp_bytes = lm.combined_bytes;
             bool x_ready = (n_gpu_grp > 0);
             int batch_idx = 0;
-            for (int base_g = 0; base_g < n_cpu_grp; base_g += STAGE_EXPS, ++batch_idx) {
+            for (int base_g = 0; base_g < n_cpu_grp; ++batch_idx) {
                 int buf = batch_idx & 1;
-                int cnt_g = std::min(STAGE_EXPS, n_cpu_grp - base_g);
+                int want_g = std::min(STAGE_EXPS, n_cpu_grp - base_g);
                 if (batch_idx >= STAGE_BUFS) {
                     INK_CUDA_CHECK(cudaEventSynchronize(ev_stage_gpu_[buf]));
                 }
-                // Parallel DDR4 memcpy of 1..4 cold experts into pinned WC bounce buffer (~0.35 ms!)
+
+                // Pin ONLY this micro-batch (<= 4 experts) in RAM until memcpy into pinned staging buffer completes!
+                int pin_slots[STAGE_EXPS];
+                int cnt_g = 0;
+                for (int k = 0; k < want_g; ++k) {
+                    int rslot = -1;
+                    const uint8_t* rptr = experts_.pin_ram_expert(cpu_uids[base_g + k], &rslot);
+                    if (!rptr && cnt_g == 0) {
+                        experts_.finish_phased_swaps(stream_);
+                        rptr = experts_.pin_ram_expert(cpu_uids[base_g + k], &rslot);
+                    }
+                    if (!rptr) break; // Every fitting RAM slot is already pinned; drain this partial micro-batch!
+                    cpu_groups[base_g + k].gate_up_data = rptr;
+                    cpu_groups[base_g + k].down_data    = rptr + lm.down_aligned_off;
+                    pin_slots[cnt_g++] = rslot;
+                }
+                if (cnt_g <= 0) {
+                    std::fprintf(stderr, "[Model] FATAL: Unable to pin cold expert uid=%d in RAM!\n", cpu_uids[base_g]);
+                    std::abort();
+                }
+
+                // Parallel DDR4 memcpy of 1..4 pinned cold experts into pinned WC bounce buffer (~0.35 ms!)
                 cpu_pool_->parallel_for_threads([&](int tid, int nth) {
                     size_t total_b = (size_t)cnt_g * exp_bytes;
                     size_t chunk_b = (total_b + (size_t)nth - 1) / (size_t)nth;
@@ -1501,6 +1540,8 @@ int32_t InklingEngine::forward_batch(
                         lo += take;
                     }
                 });
+                // Staging copy into h_prefill_stage_[buf] is done -> immediately release RAM pins!
+                experts_.unpin_ram_slots(pin_slots, cnt_g);
 
                 int st_pairs = 0;
                 h_stage_tok_off_[buf][0] = 0;
@@ -1540,6 +1581,7 @@ int32_t InklingEngine::forward_batch(
                 INK_CUDA_CHECK(cudaEventRecord(ev_stage_gpu_[buf], stream_));
                 cudaStreamQuery(s_dma);
                 cudaStreamQuery(stream_);
+                base_g += cnt_g;
             }
             // Ensure staging buffers are done on GPU before next layer reuses them
             int used_bufs = std::min(batch_idx, STAGE_BUFS);
@@ -1548,10 +1590,48 @@ int32_t InklingEngine::forward_batch(
             }
         } else if (n_cpu_grp > 0) {
             // Ultra-low-latency CPU AVX2 overlap for tiny batches (e.g. Speculative Verification B <= 7!)
+            // Pin experts in RAM slots before reading; if RAM is super tight, split into safe sub-batches!
             cudaStreamQuery(stream_);
-            cpu_pool_->run_moe_experts_grouped(h_b_ffn_in_, h_b_moe_cpu_out_, B,
-                                               cpu_groups, n_cpu_grp, cpu_tok_ids, cpu_tok_w, cpu_pairs,
-                                               D, hp_.n_ff_exp, hp_.situ_beta, hp_.situ_linear_beta);
+            int pin_slots[128];
+            std::vector<float> split_acc;
+            bool used_split = false;
+            int base_g = 0;
+            while (base_g < n_cpu_grp) {
+                int cnt_g = 0;
+                for (int k = base_g; k < n_cpu_grp; ++k) {
+                    int rslot = -1;
+                    const uint8_t* rptr = experts_.pin_ram_expert(cpu_uids[k], &rslot);
+                    if (!rptr && cnt_g == 0) {
+                        experts_.finish_phased_swaps(stream_);
+                        rptr = experts_.pin_ram_expert(cpu_uids[k], &rslot);
+                    }
+                    if (!rptr) break;
+                    cpu_groups[k].gate_up_data = rptr;
+                    cpu_groups[k].down_data    = rptr + lm.down_aligned_off;
+                    pin_slots[cnt_g++] = rslot;
+                }
+                if (cnt_g <= 0) {
+                    std::fprintf(stderr, "[Model] FATAL: Unable to pin cold expert uid=%d for CPU grouped MoE!\n", cpu_uids[base_g]);
+                    std::abort();
+                }
+                cpu_pool_->run_moe_experts_grouped(h_b_ffn_in_, h_b_moe_cpu_out_, B,
+                                                   cpu_groups + base_g, cnt_g, cpu_tok_ids, cpu_tok_w, cpu_pairs,
+                                                   D, hp_.n_ff_exp, hp_.situ_beta, hp_.situ_linear_beta);
+                experts_.unpin_ram_slots(pin_slots, cnt_g);
+
+                if (base_g == 0 && cnt_g == n_cpu_grp) {
+                    break; // Fast single-pass path (99.99% of runs!)
+                }
+                if (!used_split) {
+                    split_acc.assign((size_t)B * D, 0.0f);
+                    used_split = true;
+                }
+                for (size_t idx = 0; idx < (size_t)B * D; ++idx) split_acc[idx] += h_b_moe_cpu_out_[idx];
+                base_g += cnt_g;
+            }
+            if (used_split) {
+                std::memcpy(h_b_moe_cpu_out_, split_acc.data(), (size_t)B * D * sizeof(float));
+            }
             INK_CUDA_CHECK(cudaMemcpyAsync(d_b_moe_cpu_out_, h_b_moe_cpu_out_, (size_t)B * D * sizeof(float), cudaMemcpyHostToDevice, stream_));
             ink_cuda_add_inplace(d_b_moe_out_, d_b_moe_cpu_out_, B * D, stream_);
         }
@@ -1624,6 +1704,13 @@ int32_t InklingEngine::prefill(const std::vector<int32_t>& tokens, int start_pos
 void InklingEngine::copy_logits_to_host(std::vector<float>& dst) const {
     dst.resize(hp_.vocab_unpadded);
     INK_CUDA_CHECK(cudaMemcpy(dst.data(), d_logits_, (size_t)hp_.vocab_unpadded * sizeof(float), cudaMemcpyDeviceToHost));
+}
+
+void InklingEngine::copy_batch_logits_to_host(int b, std::vector<float>& dst) const {
+    if (b < 0 || b >= HybridPagedKV::SPEC_MAX_B || !d_b_logits_) { dst.clear(); return; }
+    dst.resize(hp_.vocab_unpadded);
+    INK_CUDA_CHECK(cudaMemcpy(dst.data(), d_b_logits_ + (size_t)b * hp_.vocab_unpadded,
+                              (size_t)hp_.vocab_unpadded * sizeof(float), cudaMemcpyDeviceToHost));
 }
 
 int32_t InklingEngine::sample_from_logits(
@@ -1744,10 +1831,10 @@ int32_t InklingEngine::sample_next(const SamplingParams& sp, uint64_t& rng_state
     return sample_from_logits(d_logits_, *h_argmax_, sp, rng_state);
 }
 
-bool InklingEngine::encode_image_input(const std::string& url_or_path, EncodedImage& out) {
+bool InklingEngine::encode_image_input(const std::string& url_or_path, EncodedImage& out, bool allow_local_files) {
     if (!vision_.loaded()) return false;
     std::vector<uint8_t> bytes;
-    if (!VisionEncoder::resolve_image_input(url_or_path, bytes)) return false;
+    if (!VisionEncoder::resolve_image_input(url_or_path, bytes, allow_local_files)) return false;
     void* d_stg = batch_ready_ ? (void*)d_prefill_stage_[0] : nullptr;
     void* h_stg = batch_ready_ ? (void*)h_prefill_stage_[0] : nullptr;
     size_t stg_bytes = batch_ready_ ? ((size_t)STAGE_EXPS * STAGE_SLOT_BYTES) : 0;
@@ -1807,8 +1894,9 @@ InklingEngine::GenResult InklingEngine::generate(
 
     int P = (int)prompt_tokens.size();
     if (P >= cfg_.max_ctx) {
-        std::fprintf(stderr, "[Engine] Prompt length %d >= max_ctx %d; truncating to fit.\n", P, cfg_.max_ctx);
-        P = cfg_.max_ctx - 1;
+        std::fprintf(stderr, "[Engine] Prompt length %d >= max_ctx %d (context_length_exceeded).\n", P, cfg_.max_ctx);
+        res.hit_max_ctx = true;
+        return res;
     }
 
     int want_full_ckpt  = (reuse_kv_prefix && full_sys_prefix_tokens >= 128) ? ((full_sys_prefix_tokens / 64) * 64) : 0;
@@ -2140,7 +2228,8 @@ InklingEngine::GenResult InklingEngine::generate(
         res.gen_tokens++;
 
         if (on_token && !on_token(next_tok, piece)) break;
-        if (res.gen_tokens >= sp.max_tokens || pos >= cfg_.max_ctx - 1) break;
+        if (pos >= cfg_.max_ctx - 1) { res.hit_max_ctx = true; break; }
+        if (res.gen_tokens >= sp.max_tokens) break;
 
         bool need_pred_now = pred_main_.loaded() && (res.gen_tokens >= next_pred_at);
 
@@ -2219,7 +2308,8 @@ InklingEngine::GenResult InklingEngine::generate(
             res.spec_drafted += K_draft;
             res.spec_steps++;
 
-            if (stopped || res.gen_tokens >= sp.max_tokens || pos >= cfg_.max_ctx - 1) break;
+            if (pos >= cfg_.max_ctx - 1) { res.hit_max_ctx = true; break; }
+            if (stopped || res.gen_tokens >= sp.max_tokens) break;
             next_tok = bonus_tok;
         } else {
             forward_token(next_tok, pos, true, enable_profile, /*is_answer=*/true, /*capture_pred_hidden=*/need_pred_now);
@@ -2328,4 +2418,293 @@ void InklingEngine::probe_early_exit(const std::string& prompt_text, int n_token
                 total, top1_match, total, total ? 100.0 * top1_match / total : 0.0,
                 top5_match, total, total ? 100.0 * top5_match / total : 0.0);
     std::fflush(stdout);
+}
+
+// =========================================================================
+// R0 (SR1-01): Long-Context Parity Gate Suite (SWA Wrap, Speculative, Checkpoints)
+// =========================================================================
+bool InklingEngine::run_parity_suite() {
+    std::printf("\n================================================================\n");
+    std::printf("  [PARITY SUITE R0] Long-Context (>1024), Speculative & Restore Gate\n");
+    std::printf("================================================================\n");
+    std::fflush(stdout);
+
+    if (cfg_.max_ctx < 2048) {
+        std::fprintf(stderr, "[PARITY] Requires --ctx >= 2048 (got %d)\n", cfg_.max_ctx);
+        return false;
+    }
+
+    auto cmp_logits = [](const std::vector<float>& a, const std::vector<float>& b,
+                         float& out_max_abs, double& out_mean_abs, double& out_cos, int& out_top1_a, int& out_top1_b) {
+        out_max_abs = 0.0f;
+        out_mean_abs = 0.0;
+        out_cos = 0.0;
+        out_top1_a = 0; out_top1_b = 0;
+        float best_a = -1e30f, best_b = -1e30f;
+        double dot = 0.0, na = 0.0, nb = 0.0;
+        size_t n = std::min(a.size(), b.size());
+        for (size_t i = 0; i < n; ++i) {
+            float d = std::fabs(a[i] - b[i]);
+            if (d > out_max_abs) out_max_abs = d;
+            out_mean_abs += (double)d;
+            dot += (double)a[i] * (double)b[i];
+            na  += (double)a[i] * (double)a[i];
+            nb  += (double)b[i] * (double)b[i];
+            if (a[i] > best_a) { best_a = a[i]; out_top1_a = (int)i; }
+            if (b[i] > best_b) { best_b = b[i]; out_top1_b = (int)i; }
+        }
+        if (n > 0) out_mean_abs /= (double)n;
+        if (na > 0.0 && nb > 0.0) out_cos = dot / (std::sqrt(na) * std::sqrt(nb));
+    };
+
+    // Build deterministic realistic code prompt > 1,280 tokens (crosses 1,024 SWA wrap cleanly!)
+    std::string code_blk =
+        "class MetricsCalculator:\n"
+        "    def __init__(self, window_size: int = 1024):\n"
+        "        self.window_size = window_size\n"
+        "        self.values = []\n"
+        "    def record(self, value: float) -> None:\n"
+        "        self.values.append(value)\n"
+        "        if len(self.values) > self.window_size:\n"
+        "            self.values.pop(0)\n"
+        "    def mean(self) -> float:\n"
+        "        return sum(self.values) / len(self.values) if self.values else 0.0\n\n";
+    std::string big_prompt = "Here is a Python module repeated for context testing:\n\n";
+    for (int r = 0; r < 14; ++r) {
+        big_prompt += "# Section " + std::to_string(r) + "\n" + code_blk;
+    }
+    big_prompt += "Repeat the exact MetricsCalculator class verbatim below without commentary:\n";
+    std::string fmt = tok_.format_chat({{"user", big_prompt}}, "none", true);
+    auto toks = tok_.encode(fmt, true);
+    if ((int)toks.size() < 1200) {
+        std::fprintf(stderr, "[PARITY] Prompt too short (%zu tokens)\n", toks.size());
+        return false;
+    }
+
+    bool all_ok = true;
+    const bool orig_batch = cfg_.use_batched_prefill;
+    const bool orig_spec  = cfg_.use_speculative;
+    const bool is_q4_kv   = (cfg_.kv_quant == KV_QUANT_Q4_0);
+    // Freeze dynamic VRAM/RAM expert swaps across paired parity comparisons so CPU AVX2 vs GPU dp4a
+    // 1-ULP FP32 rounding never shifts placement mid-comparison!
+    struct SwapFreezeGuard {
+        ExpertCache& ec;
+        bool prev;
+        explicit SwapFreezeGuard(ExpertCache& e) : ec(e), prev(e.swaps_frozen()) { ec.set_swaps_frozen(true); }
+        ~SwapFreezeGuard() { ec.set_swaps_frozen(prev); }
+    };
+
+    auto max_abs_diff = [](const std::vector<float>& a, const std::vector<float>& b) {
+        float md = 0.0f;
+        for (size_t i = 0; i < std::min(a.size(), b.size()); ++i) {
+            md = std::max(md, std::fabs(a[i] - b[i]));
+        }
+        return md;
+    };
+
+    // Warm base prefix [0..1023] cleanly (1024 = 16*64 pages, right at the SWA wrap boundary!)
+    reset_context();
+    std::vector<int32_t> prefix_1024(toks.begin(), toks.begin() + 1024);
+    prefill(prefix_1024, 0);
+    KVCheckpoint ckpt_1024;
+    kv_.save_checkpoint(ckpt_1024, 1024, stream_);
+    ckpt_1024.tokens = prefix_1024;
+
+    // Also prepare unaligned prefix [0..1099] to test B=128 wrapping across physical ring boundary 1152!
+    std::vector<int32_t> p1024_1100(toks.begin() + 1024, toks.begin() + 1100);
+    prefill(p1024_1100, 1024);
+    KVCheckpoint ckpt_1100;
+    kv_.save_checkpoint(ckpt_1100, 1100, stream_);
+    ckpt_1100.tokens.assign(toks.begin(), toks.begin() + 1100);
+
+    // -------------------------------------------------------------------------
+    // TEST 1A: Direct SWA Ring-Wrap Parity at pos=1024 (B=7) & pos=1100 (B=128 crossing 1152!)
+    // -------------------------------------------------------------------------
+    std::printf("\n[GATE 1A] SWA Ring-Wrap Query-0 Parity (pos=1024 B=7 & pos=1100 B=128 vs B=1)...\n");
+    float max_d = 0.0f; double mean_d = 0.0, cos_sim = 0.0; int t1a = 0, t1b = 0;
+    {
+        SwapFreezeGuard guard(experts_);
+        std::vector<float> ref_1024, b7_1024, l0_ref, l0_b7;
+        kv_.restore_checkpoint(ckpt_1024, stream_);
+        g_l0_attn_capture = &l0_ref;
+        forward_token(toks[1024], 1024, true, false, false, false);
+        g_l0_attn_capture = nullptr;
+        copy_logits_to_host(ref_1024);
+
+        kv_.restore_checkpoint(ckpt_1024, stream_);
+        int32_t argm7[HybridPagedKV::SPEC_MAX_B];
+        g_l0_attn_capture = &l0_b7;
+        forward_batch(toks.data() + 1024, 7, 1024, false, true, false, false, false, argm7);
+        g_l0_attn_capture = nullptr;
+        copy_batch_logits_to_host(0, b7_1024);
+
+        float l0_err = max_abs_diff(l0_ref, l0_b7);
+        cmp_logits(ref_1024, b7_1024, max_d, mean_d, cos_sim, t1a, t1b);
+        double min_cos = is_q4_kv ? 0.9400 : 0.9850;
+        double max_mean = is_q4_kv ? 1.35 : 0.60;
+        bool pass_1a_1024 = (l0_err < 1e-4f) && (t1a == t1b) && (cos_sim > min_cos) && (mean_d < max_mean);
+        std::printf("  pos=1024 (B=  7[0] vs B=1): L0_SWA_err=%.6f | top1=%d vs %d (%s) | cos=%.6f | mean|d|=%.5f -> %s\n",
+                    l0_err, t1b, t1a, (t1a == t1b) ? "MATCH" : "MISMATCH", cos_sim, mean_d, pass_1a_1024 ? "PASS" : "FAIL");
+        if (!pass_1a_1024) all_ok = false;
+
+        // Unaligned B=128 at pos=1100 writes slots [1100..1151] + [0..75] (crosses 1152 ring wrap!)
+        // In v3.2 (1024 ring), this catastrophically overwrote 127 live SWA keys in L0!
+        std::vector<float> l0_1100_ref, l0_1100_b128;
+        kv_.restore_checkpoint(ckpt_1100, stream_);
+        g_l0_attn_capture = &l0_1100_ref;
+        forward_token(toks[1100], 1100, false, false, false, false);
+        g_l0_attn_capture = nullptr;
+
+        kv_.restore_checkpoint(ckpt_1100, stream_);
+        g_l0_attn_capture = &l0_1100_b128;
+        forward_batch(toks.data() + 1100, 128, 1100, false, false, false, false, false);
+        g_l0_attn_capture = nullptr;
+
+        float l0_wrap_err = max_abs_diff(l0_1100_ref, l0_1100_b128);
+        bool pass_1a_1100 = (l0_wrap_err < 2e-2f); // WMMA FP16 QKV vs dp4a Q8_1 QKV (v3.2 bug gave >0.5-5.0!)
+        std::printf("  pos=1100 (B=128[0] crossing 1152 wrap vs B=1): L0_SWA_err=%.6f -> %s\n",
+                    l0_wrap_err, pass_1a_1100 ? "PASS" : "FAIL");
+        if (!pass_1a_1100) all_ok = false;
+    }
+
+    // -------------------------------------------------------------------------
+    // TEST 1B: Post-Wrap Chunked Prefill Parity [1024..1151] (B=128, B=32, B=7 vs B=1)
+    // -------------------------------------------------------------------------
+    std::printf("\n[GATE 1B] Post-Wrap Prefill Parity across pos [1024..1151] (B=128, B=32, B=7 vs B=1)...\n");
+    {
+        SwapFreezeGuard guard(experts_);
+        std::vector<float> ref_1151;
+        kv_.restore_checkpoint(ckpt_1024, stream_);
+        for (int i = 0; i < 128; ++i) {
+            forward_token(toks[1024 + i], 1024 + i, (i == 127), false, false, false);
+        }
+        copy_logits_to_host(ref_1151);
+
+        int chunk_sizes[3] = {128, 32, 7};
+        double min_cos = is_q4_kv ? 0.9850 : 0.9980;
+        double max_mean = is_q4_kv ? 0.65 : 0.25;
+        for (int cs : chunk_sizes) {
+            kv_.restore_checkpoint(ckpt_1024, stream_);
+            int done = 0;
+            while (done < 128) {
+                int cur_b = std::min(cs, 128 - done);
+                bool is_last = (done + cur_b == 128);
+                forward_batch(toks.data() + 1024 + done, cur_b, 1024 + done, is_last, false, false, false, false);
+                done += cur_b;
+            }
+            std::vector<float> got_1151;
+            copy_logits_to_host(got_1151);
+            cmp_logits(ref_1151, got_1151, max_d, mean_d, cos_sim, t1a, t1b);
+            bool ok = (t1a == t1b) && (cos_sim > min_cos) && (mean_d < max_mean);
+            std::printf("  chunk B=%3d vs B=1 @ pos=1151: top1=%d vs %d (%s) | cos=%.6f | max|d|=%.5f | mean|d|=%.5f -> %s\n",
+                        cs, t1b, t1a, (t1a == t1b) ? "MATCH" : "MISMATCH", cos_sim, max_d, mean_d, ok ? "PASS" : "FAIL");
+            if (!ok) all_ok = false;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // TEST 2: Speculative ON vs OFF Past Position 1,024 (96 Greedy Tokens!)
+    // -------------------------------------------------------------------------
+    std::printf("\n[GATE 2] Speculative ON vs OFF Past pos=1024 (greedy 96 tokens from identical KV)...\n");
+    {
+        SamplingParams gsp;
+        gsp.temperature = 0.0f;
+        gsp.max_tokens = 96;
+
+        // Prefill prompt prefix [0..P-2] ONCE so spec_off and spec_on begin from bit-exact KV state!
+        reset_context();
+        cfg_.use_batched_prefill = true;
+        int pref_n = (int)toks.size() - 1;
+        std::vector<int32_t> g2_pref(toks.begin(), toks.begin() + pref_n);
+        prefill(g2_pref, 0);
+        KVCheckpoint ckpt_g2;
+        kv_.save_checkpoint(ckpt_g2, pref_n, stream_);
+        ckpt_g2.tokens = g2_pref;
+
+        SwapFreezeGuard guard(experts_);
+
+        cfg_.use_speculative = false;
+        kv_.restore_checkpoint(ckpt_g2, stream_);
+        kv_tokens_ = g2_pref;
+        auto res_off = generate(toks, gsp, nullptr, false, true);
+
+        cfg_.use_speculative = true;
+        kv_.restore_checkpoint(ckpt_g2, stream_);
+        kv_tokens_ = g2_pref;
+        auto res_on = generate(toks, gsp, nullptr, false, true);
+
+        bool exact_spec = (res_off.tokens == res_on.tokens);
+        int first_diff = -1;
+        size_t min_len = std::min(res_off.tokens.size(), res_on.tokens.size());
+        for (size_t i = 0; i < min_len; ++i) {
+            if (res_off.tokens[i] != res_on.tokens[i]) { first_diff = (int)i; break; }
+        }
+        bool pass_2 = exact_spec && (res_on.spec_accepted > 0);
+        std::printf("  Prompt=%zu tok | spec_off=%zu tok | spec_on=%zu tok (accepted=%d/%d) | exact=%s",
+                    toks.size(), res_off.tokens.size(), res_on.tokens.size(),
+                    res_on.spec_accepted, res_on.spec_drafted, exact_spec ? "YES" : "NO");
+        if (first_diff >= 0) std::printf(" (first_diff=%d)", first_diff);
+        std::printf(" -> %s\n", pass_2 ? "PASS" : "FAIL");
+        if (!pass_2) all_ok = false;
+    }
+
+    // -------------------------------------------------------------------------
+    // TEST 3: Turn-Rewind Snapshot & Disk v3 Checkpoint Restore Bit-Exactness
+    // -------------------------------------------------------------------------
+    std::printf("\n[GATE 3] Turn-Rewind & Disk v3 Checkpoint Restore Parity (pos=1088 -> 1089, scalar deterministic)...\n");
+    {
+        reset_context();
+        std::vector<int32_t> p1088(toks.begin(), toks.begin() + 1088);
+        prefill(p1088, 0);
+        TurnRewindSnapshot tr_snap;
+        kv_.save_turn_snapshot(tr_snap, 1088, stream_);
+        tr_snap.tokens = p1088;
+
+        KVCheckpoint ckpt_1088;
+        kv_.save_checkpoint(ckpt_1088, 1088, stream_);
+        ckpt_1088.tokens = p1088;
+        std::string tmp_ckpt = kv_cache_dir_.empty() ? "parity_test_v3.ckpt" : (kv_cache_dir_ + "\\parity_test_v3.ckpt");
+        bool disk_saved = kv_.save_checkpoint_disk(ckpt_1088, tmp_ckpt, model_sig_);
+
+        SwapFreezeGuard guard(experts_);
+
+        kv_.rewind_to_turn_snapshot(tr_snap, stream_);
+        forward_token(toks[1088], 1088, true, false, false, false);
+        std::vector<float> ref_1088;
+        copy_logits_to_host(ref_1088);
+
+        // 3A: Turn-rewind in-place (tests live Global KV + restored ShortConv & 1152-slot SWA ring!)
+        bool rew_ok = kv_.rewind_to_turn_snapshot(tr_snap, stream_);
+        forward_token(toks[1088], 1088, true, false, false, false);
+        std::vector<float> got_rew;
+        copy_logits_to_host(got_rew);
+        cmp_logits(ref_1088, got_rew, max_d, mean_d, cos_sim, t1a, t1b);
+        bool pass_3a = rew_ok && (t1a == t1b) && (max_d == 0.0f);
+        std::printf("  Turn-Rewind (1088->1089): restored=%s | max|dlogit|=%.6f | top1=%d vs %d -> %s\n",
+                    rew_ok ? "YES" : "NO", max_d, t1b, t1a, pass_3a ? "PASS (BIT-EXACT)" : "FAIL");
+        if (!pass_3a) all_ok = false;
+
+        // 3B: Disk v3 checkpoint round-trip (tests full serialized ShortConv + 1152-slot SWA + Global KV + Quest Q8!)
+        KVCheckpoint loaded_ckpt;
+        bool disk_loaded = disk_saved && kv_.load_checkpoint_disk(loaded_ckpt, tmp_ckpt, model_sig_, p1088.data(), 1088);
+        DeleteFileA(tmp_ckpt.c_str());
+        bool rest_ok = disk_loaded && kv_.restore_checkpoint(loaded_ckpt, stream_);
+        forward_token(toks[1088], 1088, true, false, false, false);
+        std::vector<float> got_disk;
+        copy_logits_to_host(got_disk);
+        cmp_logits(ref_1088, got_disk, max_d, mean_d, cos_sim, t1a, t1b);
+        bool pass_3b = rest_ok && (t1a == t1b) && (max_d == 0.0f);
+        std::printf("  Disk v3 Ckpt (1088->1089): saved=%s loaded=%s | max|dlogit|=%.6f | top1=%d vs %d -> %s\n",
+                    disk_saved ? "YES" : "NO", disk_loaded ? "YES" : "NO", max_d, t1b, t1a,
+                    pass_3b ? "PASS (BIT-EXACT)" : "FAIL");
+        if (!pass_3b) all_ok = false;
+    }
+
+    cfg_.use_batched_prefill = orig_batch;
+    cfg_.use_speculative = orig_spec;
+    std::printf("================================================================\n");
+    std::printf("  [PARITY SUITE R0] OVERALL: %s\n", all_ok ? "ALL GATES PASSED!" : "FAILED!");
+    std::printf("================================================================\n");
+    std::fflush(stdout);
+    return all_ok;
 }
