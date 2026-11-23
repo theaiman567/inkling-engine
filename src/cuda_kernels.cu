@@ -4075,3 +4075,300 @@ void ink_cuda_logit_softcap_argmax_batch(float* logits, int B, int n_unpadded, f
                                       d_argmax ? (d_argmax + b) : nullptr, stream);
     }
 }
+
+// =========================================================================
+// InkEngine v3.2: Streamed Multimodal Vision Kernels (inkling2v ViT + Projector)
+// =========================================================================
+
+__global__ void k_vision_layernorm(const float* __restrict__ x, const float* __restrict__ w,
+                                   const float* __restrict__ b, float* __restrict__ out,
+                                   int D, float eps) {
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    const float* xr = x + (size_t)row * D;
+    float* orow = out + (size_t)row * D;
+    __shared__ float s_sum[8];
+    __shared__ float s_sq[8];
+
+    float sum = 0.0f;
+    for (int i = tid; i < D; i += blockDim.x) sum += xr[i];
+    sum = warp_reduce_sum(sum);
+    if ((tid & 31) == 0) s_sum[tid >> 5] = sum;
+    __syncthreads();
+    if (tid < 32) {
+        float v = (tid < 8) ? s_sum[tid] : 0.0f;
+        v = warp_reduce_sum(v);
+        if (tid == 0) s_sum[0] = v / (float)D;
+    }
+    __syncthreads();
+    float mean = s_sum[0];
+
+    float sq = 0.0f;
+    for (int i = tid; i < D; i += blockDim.x) {
+        float d = xr[i] - mean;
+        sq = fmaf(d, d, sq);
+    }
+    sq = warp_reduce_sum(sq);
+    if ((tid & 31) == 0) s_sq[tid >> 5] = sq;
+    __syncthreads();
+    if (tid < 32) {
+        float v = (tid < 8) ? s_sq[tid] : 0.0f;
+        v = warp_reduce_sum(v);
+        if (tid == 0) s_sq[0] = rsqrtf(v / (float)D + eps);
+    }
+    __syncthreads();
+    float inv = s_sq[0];
+
+    for (int i = tid; i < D; i += blockDim.x) {
+        float norm_v = (xr[i] - mean) * inv;
+        if (w) norm_v *= w[i];
+        if (b) norm_v += b[i];
+        orow[i] = norm_v;
+    }
+}
+
+void ink_cuda_vision_layernorm(const float* x, const float* w, const float* b, float* out,
+                               int N, int D, float eps, cudaStream_t stream) {
+    if (N <= 0) return;
+    k_vision_layernorm<<<N, 256, 0, stream>>>(x, w, b, out, D, eps);
+}
+
+// Fast WMMA FP16->FP32 Tensor Core GEMM for F16 / BF16 / F32 weights: Y[N, M] = X[N, K] @ W[M, K]^T + bias[M]
+template <uint32_t W_TYPE>
+__global__ void k_vision_gemm_wmma(const uint8_t* __restrict__ W, const float* __restrict__ bias,
+                                   const __half* __restrict__ X_f16, float* __restrict__ Y,
+                                   int N, int M, int K, int ld_out, size_t w_row_bytes) {
+    using namespace nvcuda;
+    int m_base = blockIdx.x * 32;
+    int n_base = blockIdx.y * 32;
+    int warp   = threadIdx.x >> 5;
+    int lane   = threadIdx.x & 31;
+    int wm     = (warp & 1) * 16;
+    int wn     = (warp >> 1) * 16;
+
+    __shared__ __half s_W[32][16];
+    __shared__ __half s_X[32][16];
+    __shared__ float  s_C[4][256];
+
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> frag_a;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> frag_b;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> frag_c;
+    wmma::fill_fragment(frag_c, 0.0f);
+
+    for (int k0 = 0; k0 < K; k0 += 16) {
+        // 128 threads cooperatively load 32x16 = 512 elements of W and 32x16 = 512 elements of X (4 elems/thread)
+        #pragma unroll
+        for (int idx = threadIdx.x; idx < 512; idx += 128) {
+            int r = idx >> 4;
+            int c = idx & 15;
+            int gm = m_base + r;
+            int gk = k0 + c;
+            __half wv = __float2half(0.0f);
+            if (gm < M && gk < K) {
+                const uint8_t* rp = W + (size_t)gm * w_row_bytes;
+                if constexpr (W_TYPE == GGML_TYPE_F16) {
+                    wv = ((const __half*)rp)[gk];
+                } else if constexpr (W_TYPE == GGML_TYPE_BF16) {
+                    wv = __float2half(d_bf16_to_f32(((const uint16_t*)rp)[gk]));
+                } else {
+                    wv = __float2half(((const float*)rp)[gk]);
+                }
+            }
+            s_W[r][c] = wv;
+
+            int gn = n_base + r;
+            __half xv = (gn < N && gk < K) ? X_f16[(size_t)gn * K + gk] : __float2half(0.0f);
+            s_X[r][c] = xv;
+        }
+        __syncthreads();
+
+        wmma::load_matrix_sync(frag_a, &s_X[wn][0], 16);
+        wmma::load_matrix_sync(frag_b, &s_W[wm][0], 16);
+        wmma::mma_sync(frag_c, frag_a, frag_b, frag_c);
+        __syncthreads();
+    }
+
+    wmma::store_matrix_sync(s_C[warp], frag_c, 16, wmma::mem_row_major);
+    __syncwarp();
+    for (int i = lane; i < 256; i += 32) {
+        int r = i >> 4;
+        int c = i & 15;
+        int gn = n_base + wn + r;
+        int gm = m_base + wm + c;
+        if (gn < N && gm < M) {
+            float val = s_C[warp][i];
+            if (bias) val += bias[gm];
+            Y[(size_t)gn * ld_out + gm] = val;
+        }
+    }
+}
+
+void ink_cuda_vision_gemm(uint32_t w_type, const void* W, const float* bias,
+                          const float* X, float* Y,
+                          int N, int M, int K, int ld_out, cudaStream_t stream) {
+    if (N <= 0 || M <= 0 || K <= 0) return;
+    if (ld_out < M) ld_out = M;
+    size_t elem_bytes = (w_type == GGML_TYPE_F32) ? 4 : 2;
+    size_t w_row_bytes = (size_t)K * elem_bytes;
+    const uint8_t* Wp = (const uint8_t*)W;
+
+    // g_batch_f16_buf holds 1024 * 3072 = 3,145,728 halfs (6 MiB, zero new VRAM!)
+    int max_chunk = std::max(32, (int)((1024ull * 3072ull) / (size_t)K));
+    max_chunk = (max_chunk / 32) * 32;
+    if (max_chunk < 32) max_chunk = 32;
+
+    for (int n0 = 0; n0 < N; n0 += max_chunk) {
+        int cn = std::min(max_chunk, N - n0);
+        int tot_x = cn * K;
+        k_f32_to_f16_vec<<<(tot_x + 255) / 256, 256, 0, stream>>>(X + (size_t)n0 * K, g_batch_f16_buf, tot_x);
+        dim3 grid((M + 31) / 32, (cn + 31) / 32);
+        float* Yc = Y + (size_t)n0 * ld_out;
+        if (w_type == GGML_TYPE_F16) {
+            k_vision_gemm_wmma<GGML_TYPE_F16> <<<grid, 128, 0, stream>>>(Wp, bias, g_batch_f16_buf, Yc, cn, M, K, ld_out, w_row_bytes);
+        } else if (w_type == GGML_TYPE_BF16) {
+            k_vision_gemm_wmma<GGML_TYPE_BF16><<<grid, 128, 0, stream>>>(Wp, bias, g_batch_f16_buf, Yc, cn, M, K, ld_out, w_row_bytes);
+        } else {
+            k_vision_gemm_wmma<GGML_TYPE_F32> <<<grid, 128, 0, stream>>>(Wp, bias, g_batch_f16_buf, Yc, cn, M, K, ld_out, w_row_bytes);
+        }
+    }
+}
+
+// 2D Vision RoPE: dims [0..d/2) rotated by pos_w, dims [d/2..d) rotated by pos_h, adjacent pairs (mode=0)
+__global__ void k_vision_rope_2d(float* __restrict__ x, const int32_t* __restrict__ pos_w,
+                                 const int32_t* __restrict__ pos_h, int N, int n_head, int d_head, float theta) {
+    int half_d = d_head >> 1;
+    int n_pairs = half_d >> 1; // 16 pairs per half for d_head=64
+    int total = N * n_head * n_pairs;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    int pair = idx % n_pairs;
+    int tmp  = idx / n_pairs;
+    int h    = tmp % n_head;
+    int t    = tmp / n_head;
+
+    float inv_freq = powf(theta, -(float)(2 * pair) / (float)half_d);
+    float* ptr = x + ((size_t)t * n_head + h) * d_head;
+
+    // First half: pos_w
+    float ang_w = (float)pos_w[t] * inv_freq;
+    float cw = cosf(ang_w), sw = sinf(ang_w);
+    float x0 = ptr[2 * pair];
+    float x1 = ptr[2 * pair + 1];
+    ptr[2 * pair]     = x0 * cw - x1 * sw;
+    ptr[2 * pair + 1] = x0 * sw + x1 * cw;
+
+    // Second half: pos_h
+    float ang_h = (float)pos_h[t] * inv_freq;
+    float ch = cosf(ang_h), sh = sinf(ang_h);
+    float y0 = ptr[half_d + 2 * pair];
+    float y1 = ptr[half_d + 2 * pair + 1];
+    ptr[half_d + 2 * pair]     = y0 * ch - y1 * sh;
+    ptr[half_d + 2 * pair + 1] = y0 * sh + y1 * ch;
+}
+
+void ink_cuda_vision_rope_2d(float* x, const int32_t* pos_w, const int32_t* pos_h,
+                             int N, int n_head, int d_head, float theta, cudaStream_t stream) {
+    int n_pairs = d_head >> 2;
+    int total = N * n_head * n_pairs;
+    if (total <= 0) return;
+    k_vision_rope_2d<<<(total + 255) / 256, 256, 0, stream>>>(x, pos_w, pos_h, N, n_head, d_head, theta);
+}
+
+// Tiled Bidirectional FlashAttention for ViT (d_head = 64, 4 warps/block = 4 queries/block, O(1) VRAM!)
+__global__ void k_vision_flash_attn_d64(const float* __restrict__ Q, const float* __restrict__ K,
+                                        const float* __restrict__ V, float* __restrict__ out,
+                                        int N, int n_head, float scale) {
+    constexpr int TILE_K = 32;
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int q_idx = blockIdx.x * 4 + warp;
+    int h = blockIdx.y;
+    int stride = n_head * 64;
+
+    __shared__ float s_K[TILE_K][64];
+    __shared__ float s_V[TILE_K][64];
+
+    float q0 = 0.0f, q1 = 0.0f;
+    if (q_idx < N) {
+        const float* qp = Q + (size_t)q_idx * stride + h * 64;
+        q0 = qp[lane];
+        q1 = qp[lane + 32];
+    }
+
+    float m_max = -FLT_MAX;
+    float l_sum = 0.0f;
+    float o0 = 0.0f, o1 = 0.0f;
+
+    for (int k0 = 0; k0 < N; k0 += TILE_K) {
+        int tile_len = min(TILE_K, N - k0);
+        // 128 threads cooperatively load TILE_K x 64 = 2048 floats (16 floats/thread)
+        for (int idx = threadIdx.x; idx < tile_len * 64; idx += 128) {
+            int r = idx >> 6;
+            int c = idx & 63;
+            size_t off = (size_t)(k0 + r) * stride + h * 64 + c;
+            s_K[r][c] = K[off];
+            s_V[r][c] = V[off];
+        }
+        __syncthreads();
+
+        if (q_idx < N) {
+            for (int t = 0; t < tile_len; ++t) {
+                float dot = q0 * s_K[t][lane] + q1 * s_K[t][lane + 32];
+                dot = warp_reduce_sum(dot);
+                float score = __shfl_sync(0xFFFFFFFFu, dot, 0) * scale;
+                float m_new = fmaxf(m_max, score);
+                float alpha = (m_max == -FLT_MAX) ? 0.0f : expf(m_max - m_new);
+                float p     = expf(score - m_new);
+                l_sum = l_sum * alpha + p;
+                o0 = fmaf(o0, alpha, p * s_V[t][lane]);
+                o1 = fmaf(o1, alpha, p * s_V[t][lane + 32]);
+                m_max = m_new;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (q_idx < N) {
+        float inv_l = (l_sum > 0.0f) ? (1.0f / l_sum) : 0.0f;
+        float* op = out + (size_t)q_idx * stride + h * 64;
+        op[lane]      = o0 * inv_l;
+        op[lane + 32] = o1 * inv_l;
+    }
+}
+
+void ink_cuda_vision_flash_attn(const float* Q, const float* K, const float* V, float* out,
+                                int N, int n_head, int d_head, float scale, cudaStream_t stream) {
+    if (N <= 0 || d_head != 64) return;
+    dim3 grid((N + 3) / 4, n_head);
+    k_vision_flash_attn_d64<<<grid, 128, 0, stream>>>(Q, K, V, out, N, n_head, scale);
+}
+
+__global__ void k_vision_gelu_erf(float* __restrict__ x, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float v = x[i];
+        x[i] = v * 0.5f * (1.0f + erff(v * 0.7071067811865475f));
+    }
+}
+
+void ink_cuda_vision_gelu_erf(float* x, int total_elems, cudaStream_t stream) {
+    if (total_elems <= 0) return;
+    k_vision_gelu_erf<<<(total_elems + 255) / 256, 256, 0, stream>>>(x, total_elems);
+}
+
+__global__ void k_vision_layerscale_add(float* __restrict__ residual, const float* __restrict__ delta,
+                                        const float* __restrict__ ls, int N, int D) {
+    int total = N * D;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < total) {
+        residual[i] += delta[i] * ls[i % D];
+    }
+}
+
+void ink_cuda_vision_layerscale_add(float* residual, const float* delta, const float* ls_weight,
+                                    int N, int D, cudaStream_t stream) {
+    int total = N * D;
+    if (total <= 0) return;
+    k_vision_layerscale_add<<<(total + 255) / 256, 256, 0, stream>>>(residual, delta, ls_weight, N, D);
+}

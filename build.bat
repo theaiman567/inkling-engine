@@ -57,10 +57,10 @@ echo [2/2] Compiling C++ AVX2 engine and linking inkengine.exe...
 cl /nologo /O2 /arch:AVX2 /fp:fast /std:c++17 /EHsc /MD /DNOMINMAX ^
    /I"%CUDA_PATH%\include" ^
    src/gguf.cpp src/cpu_kernels.cpp src/expert_cache.cpp src/moe_predictor.cpp ^
-   src/paged_kv.cpp src/tokenizer.cpp src/model.cpp src/server.cpp src/main.cpp ^
+   src/paged_kv.cpp src/tokenizer.cpp src/vision.cpp src/model.cpp src/server.cpp src/main.cpp ^
    build/cuda_kernels.obj ^
    /Fe:build/inkengine.exe /Fo:build/ ^
-   /link /LIBPATH:"%CUDA_PATH%\lib\x64" cudart.lib ws2_32.lib
+   /link /LIBPATH:"%CUDA_PATH%\lib\x64" cudart.lib ws2_32.lib windowscodecs.lib ole32.lib
 if errorlevel 1 exit /b 1
 
 echo [SUCCESS] Built build\inkengine.exe (%CUDA_ARCH%)

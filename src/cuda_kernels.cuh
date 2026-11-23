@@ -488,3 +488,36 @@ void ink_cuda_logit_softcap_argmax_batch(
     int B, int n_unpadded, float softcap,
     int32_t* d_argmax,   // [B]
     cudaStream_t stream);
+
+// =========================================================================
+// InkEngine v3.2: Streamed Multimodal Vision Kernels (inkling2v ViT + Projector)
+// =========================================================================
+void ink_cuda_vision_layernorm(
+    const float* x, const float* w, const float* b, float* out,
+    int N, int D, float eps, cudaStream_t stream);
+
+// WMMA FP16->FP32 Tensor Core GEMM for vision weights (F16 / BF16 / F32) + optional bias.
+// Supports arbitrary N (internally chunked via g_batch_f16_buf -> 0 extra VRAM) and custom ld_out >= M.
+void ink_cuda_vision_gemm(
+    uint32_t w_type, const void* W, const float* bias,
+    const float* X, float* Y,
+    int N, int M, int K, int ld_out,
+    cudaStream_t stream);
+
+// 2D RoPE on Q or K [N, n_head * d_head]: dims [0..d/2) use pos_w, [d/2..d) use pos_h (adjacent pairs)
+void ink_cuda_vision_rope_2d(
+    float* x, const int32_t* pos_w, const int32_t* pos_h,
+    int N, int n_head, int d_head, float theta,
+    cudaStream_t stream);
+
+// Zero-VRAM-matrix Bidirectional Multi-Head FlashAttention (d_head == 64)
+void ink_cuda_vision_flash_attn(
+    const float* Q, const float* K, const float* V, float* out,
+    int N, int n_head, int d_head, float scale,
+    cudaStream_t stream);
+
+void ink_cuda_vision_gelu_erf(float* x, int total_elems, cudaStream_t stream);
+
+void ink_cuda_vision_layerscale_add(
+    float* residual, const float* delta, const float* ls_weight,
+    int N, int D, cudaStream_t stream);

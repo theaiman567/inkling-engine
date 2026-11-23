@@ -70,6 +70,7 @@ public:
     std::string get_str(const std::string& key, const std::string& def = "") const;
     const std::vector<uint8_t>&     get_bool_arr(const std::string& key) const;
     const std::vector<int32_t>&     get_i32_arr(const std::string& key) const;
+    const std::vector<float>&       get_f32_arr(const std::string& key) const;
     const std::vector<std::string>& get_str_arr(const std::string& key) const;
 
     uint64_t data_offset() const { return data_offset_; }

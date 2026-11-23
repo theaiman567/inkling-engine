@@ -33,6 +33,7 @@ void InklingEngine::destroy_cuda_graphs() {
 void InklingEngine::unload() {
     destroy_cuda_graphs();
     free_batch_buffers();
+    vision_.unload();
     experts_.shutdown();
     kv_.shutdown();
     for (void* p : gpu_allocs_) {
@@ -117,7 +118,7 @@ bool InklingEngine::load(const EngineConfig& cfg) {
 
     auto t_start = now_ms();
     std::printf("================================================================\n");
-    std::printf("  InkEngine v3.0 - Custom Looped-MoE 3-Tier Serving Engine\n");
+    std::printf("  InkEngine v3.2 - Custom Looped-MoE 3-Tier Serving Engine\n");
     std::printf("================================================================\n");
 
     if (!gguf_.open(cfg.model_path)) return false;
@@ -467,6 +468,33 @@ bool InklingEngine::load(const EngineConfig& cfg) {
         }
         if (!p_start.empty()) {
             pred_start_.load(p_start, hp_.n_layer_phys, hp_.n_expert, hp_.n_embd);
+        }
+    }
+
+    if (cfg.use_vision) {
+        auto file_exists = [](const std::string& p) {
+            DWORD a = GetFileAttributesA(p.c_str());
+            return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
+        };
+        std::string mm_path = cfg.mmproj_path;
+        if (mm_path.empty()) {
+            // Auto-detect mmproj beside model GGUF (F16 preferred -> BF16 -> F32)
+            std::string mdir = cfg.model_path;
+            size_t sl = mdir.find_last_of("\\/");
+            mdir = (sl != std::string::npos) ? mdir.substr(0, sl + 1) : "";
+            static const char* kCandidates[] = {
+                "mmproj-F16.gguf",
+                "mmproj-Inkling-2-Mini-F16.gguf",
+                "mmproj-BF16.gguf",
+                "mmproj-Inkling-2-Mini-BF16.gguf",
+                "mmproj-F32.gguf"
+            };
+            for (const char* cand : kCandidates) {
+                if (file_exists(mdir + cand)) { mm_path = mdir + cand; break; }
+            }
+        }
+        if (!mm_path.empty() && file_exists(mm_path)) {
+            vision_.load(mm_path);
         }
     }
 
@@ -1158,10 +1186,11 @@ int32_t InklingEngine::forward_batch(
     bool need_last_logits, bool need_all_logits,
     bool is_answer, bool capture_last_pred_hidden,
     bool save_spec_states,
-    int32_t* out_argmax_batch)
+    int32_t* out_argmax_batch,
+    const float* raw_embd)
 {
     if (B <= 0) return -1;
-    if (B == 1 && !save_spec_states && !need_all_logits) {
+    if (B == 1 && !save_spec_states && !need_all_logits && raw_embd == nullptr) {
         int32_t g = forward_token(tokens[0], pos0, need_last_logits, false, is_answer, capture_last_pred_hidden);
         if (out_argmax_batch) out_argmax_batch[0] = g;
         return g;
@@ -1184,15 +1213,21 @@ int32_t InklingEngine::forward_batch(
         }
     }
 
-    // 1. Parallel CPU token embedding dequantize -> single H2D upload + Batched RMSNorm
-    cpu_pool_->parallel_for_threads([&](int tid, int nth) {
-        for (int b = tid; b < B; b += nth) {
-            const uint8_t* src = h_tok_embd_.data() + (size_t)tokens[b] * tok_embd_row_bytes_;
-            CPUThreadPool::dequantize_row(tok_embd_type_, src, h_b_embd_ + (size_t)b * D, D);
-        }
-    });
-    INK_CUDA_CHECK(cudaMemcpyAsync(d_b_cur_, h_b_embd_, (size_t)B * D * sizeof(float), cudaMemcpyHostToDevice, stream_));
-    ink_cuda_rms_norm_batch(d_b_cur_, (const float*)tok_norm_.ptr, d_b_cur_, B, D, hp_.rms_eps, stream_);
+    // 1. Input embeddings:
+    //    - Text tokens: parallel CPU dequant -> H2D -> tok_norm (RMSNorm)
+    //    - Raw multimodal vision embeddings: H2D straight into d_b_cur_, BYPASSING tok_norm! (matches inkling2 spec)
+    if (raw_embd != nullptr) {
+        INK_CUDA_CHECK(cudaMemcpyAsync(d_b_cur_, raw_embd, (size_t)B * D * sizeof(float), cudaMemcpyHostToDevice, stream_));
+    } else {
+        cpu_pool_->parallel_for_threads([&](int tid, int nth) {
+            for (int b = tid; b < B; b += nth) {
+                const uint8_t* src = h_tok_embd_.data() + (size_t)tokens[b] * tok_embd_row_bytes_;
+                CPUThreadPool::dequantize_row(tok_embd_type_, src, h_b_embd_ + (size_t)b * D, D);
+            }
+        });
+        INK_CUDA_CHECK(cudaMemcpyAsync(d_b_cur_, h_b_embd_, (size_t)B * D * sizeof(float), cudaMemcpyHostToDevice, stream_));
+        ink_cuda_rms_norm_batch(d_b_cur_, (const float*)tok_norm_.ptr, d_b_cur_, B, D, hp_.rms_eps, stream_);
+    }
 
     const int n_loop_core = (hp_.num_loops > 1) ? (hp_.core_end - hp_.core_start) : 0;
     int n_blocks = 0, prelude_n_blocks = 0, n_bank = 0;
@@ -1709,6 +1744,51 @@ int32_t InklingEngine::sample_next(const SamplingParams& sp, uint64_t& rng_state
     return sample_from_logits(d_logits_, *h_argmax_, sp, rng_state);
 }
 
+bool InklingEngine::encode_image_input(const std::string& url_or_path, EncodedImage& out) {
+    if (!vision_.loaded()) return false;
+    std::vector<uint8_t> bytes;
+    if (!VisionEncoder::resolve_image_input(url_or_path, bytes)) return false;
+    void* d_stg = batch_ready_ ? (void*)d_prefill_stage_[0] : nullptr;
+    void* h_stg = batch_ready_ ? (void*)h_prefill_stage_[0] : nullptr;
+    size_t stg_bytes = batch_ready_ ? ((size_t)STAGE_EXPS * STAGE_SLOT_BYTES) : 0;
+    return vision_.encode_bytes(bytes.data(), bytes.size(), out, d_stg, h_stg, stg_bytes, stream_);
+}
+
+void InklingEngine::expand_multimodal_tokens(
+    const std::vector<int32_t>& raw_tokens,
+    int32_t image_placeholder_id,
+    const std::vector<EncodedImage>& images,
+    std::vector<int32_t>& out_tokens,
+    MultimodalEmbeddings& out_mm)
+{
+    out_tokens.clear();
+    out_mm.id_to_embd.clear();
+    if (images.empty()) {
+        out_tokens = raw_tokens;
+        return;
+    }
+    size_t extra = 0;
+    for (const auto& im : images) extra += (size_t)im.n_tokens;
+    out_tokens.reserve(raw_tokens.size() + extra);
+
+    size_t img_idx = 0;
+    for (int32_t tid : raw_tokens) {
+        if (tid == image_placeholder_id && img_idx < images.size()) {
+            const auto& im = images[img_idx++];
+            uint32_t hbase = (uint32_t)((im.hash ^ (im.hash >> 32)) * 2654435761ULL);
+            for (int k = 0; k < im.n_tokens; ++k) {
+                uint32_t h = hbase ^ ((uint32_t)k * 2246822519U);
+                int32_t syn = -(int32_t)((h & 0x3FFFFFFFu) + 1000000u);
+                while (out_mm.id_to_embd.find(syn) != out_mm.id_to_embd.end()) --syn;
+                out_mm.id_to_embd[syn] = im.embd.data() + (size_t)k * im.n_embd;
+                out_tokens.push_back(syn);
+            }
+        } else {
+            out_tokens.push_back(tid);
+        }
+    }
+}
+
 InklingEngine::GenResult InklingEngine::generate(
     const std::vector<int32_t>& prompt_tokens,
     const SamplingParams& sp,
@@ -1718,7 +1798,8 @@ InklingEngine::GenResult InklingEngine::generate(
     int static_prefix_tokens,
     const std::function<bool(int, int)>& on_prefill,
     int tools_prefix_tokens,
-    int full_sys_prefix_tokens)
+    int full_sys_prefix_tokens,
+    const MultimodalEmbeddings* mm_embd)
 {
     GenResult res;
     res.prompt_tokens = (int)prompt_tokens.size();
@@ -1884,10 +1965,23 @@ InklingEngine::GenResult InklingEngine::generate(
     }
 
     // Stage 4: Batched GEMM + Grouped Hybrid MoE Prefill (B <= 128, ~3x faster TTFT!)
-    if (cfg_.use_batched_prefill && total_new > 1) {
+    // Also handles raw multimodal vision embeddings cleanly (splitting image vs text chunks so tok_norm is bypassed on image tokens!)
+    bool has_mm = (mm_embd != nullptr && !mm_embd->id_to_embd.empty());
+    if ((cfg_.use_batched_prefill && total_new > 1) || has_mm) {
+        std::vector<float> img_chunk_buf;
         int i = start_pos;
         while (i < P) {
             int chunk = std::min(BATCH_MAX, P - i);
+            bool chunk_is_img = (prompt_tokens[i] < 0);
+            if (has_mm) {
+                // Keep each chunk homogeneous (all raw image embeddings OR all text tokens)
+                for (int k = 1; k < chunk; ++k) {
+                    if ((prompt_tokens[i + k] < 0) != chunk_is_img) {
+                        chunk = k;
+                        break;
+                    }
+                }
+            }
             // Align chunk boundaries cleanly on all 3 prefix KV checkpoints + turn rewind boundary!
             if (want_tools_ckpt >= 256 && i < want_tools_ckpt && i + chunk > want_tools_ckpt) {
                 chunk = want_tools_ckpt - i;
@@ -1902,10 +1996,24 @@ InklingEngine::GenResult InklingEngine::generate(
                 chunk = want_turn_snap - i;
             }
             bool is_last = (i + chunk == P);
+            const float* raw_ptr = nullptr;
+            if (chunk_is_img && has_mm) {
+                int D = hp_.n_embd;
+                img_chunk_buf.resize((size_t)chunk * D);
+                for (int k = 0; k < chunk; ++k) {
+                    auto it = mm_embd->id_to_embd.find(prompt_tokens[i + k]);
+                    if (it != mm_embd->id_to_embd.end() && it->second) {
+                        std::memcpy(img_chunk_buf.data() + (size_t)k * D, it->second, (size_t)D * sizeof(float));
+                    } else {
+                        std::memset(img_chunk_buf.data() + (size_t)k * D, 0, (size_t)D * sizeof(float));
+                    }
+                }
+                raw_ptr = img_chunk_buf.data();
+            }
             forward_batch(prompt_tokens.data() + i, chunk, i,
                           /*need_last_logits=*/is_last, /*need_all_logits=*/false,
                           /*is_answer=*/false, /*capture_last_pred_hidden=*/is_last && pred_main_.loaded(),
-                          /*save_spec_states=*/false);
+                          /*save_spec_states=*/false, nullptr, raw_ptr);
             for (int k = 0; k < chunk; ++k) kv_tokens_.push_back(prompt_tokens[i + k]);
             i += chunk;
 

@@ -379,7 +379,14 @@ std::string InkTokenizer::format_chat(
         if (m.role == "system") {
             s += "<|message_system|><|content_text|>" + m.content + "<|end_message|>";
         } else if (m.role == "user") {
-            s += "<|message_user|><|content_text|>" + m.content + "<|end_message|>";
+            if (!m.parts.empty()) {
+                for (const auto& pt : m.parts) {
+                    if (pt.is_image) s += "<|message_user|><|content_image|><|unused_200054|><|end_message|>";
+                    else             s += "<|message_user|><|content_text|>" + pt.text + "<|end_message|>";
+                }
+            } else {
+                s += "<|message_user|><|content_text|>" + m.content + "<|end_message|>";
+            }
         } else if (m.role == "tool") {
             std::string tname = m.name;
             if (tname.empty() && !m.tool_call_id.empty()) {
@@ -395,7 +402,14 @@ std::string InkTokenizer::format_chat(
                     if (!tname.empty()) break;
                 }
             }
-            s += "<|message_tool|>" + tname + "<|content_text|>" + m.content + "<|end_message|>";
+            if (!m.parts.empty()) {
+                for (const auto& pt : m.parts) {
+                    if (pt.is_image) s += "<|message_tool|>" + tname + "<|content_image|><|unused_200054|><|end_message|>";
+                    else             s += "<|message_tool|>" + tname + "<|content_text|>" + pt.text + "<|end_message|>";
+                }
+            } else {
+                s += "<|message_tool|>" + tname + "<|content_text|>" + m.content + "<|end_message|>";
+            }
         } else if (m.role == "assistant") {
             std::string rtok = "<|message_model|>" + m.name;
             if (!m.reasoning_content.empty()) {

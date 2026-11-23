@@ -451,7 +451,28 @@ std::string extract_content_text(const JsonVal* cv) {
     return "";
 }
 
-std::vector<ChatMessage> parse_openai_messages(const JsonVal& root) {
+std::string extract_image_url_from_part(const JsonVal& part) {
+    if (!part.is_obj()) return "";
+    std::string ptype = part.get_str("type", "");
+    if (ptype == "image_url" || ptype == "input_image") {
+        const auto* iu = part.get("image_url");
+        if (iu && iu->is_obj()) return iu->get_str("url", "");
+        if (iu && iu->is_str()) return iu->str;
+        std::string u = part.get_str("url", "");
+        if (!u.empty()) return u;
+    } else if (ptype == "image") {
+        std::string u = part.get_str("image", part.get_str("url", ""));
+        if (!u.empty()) return u;
+        if (const auto* src = part.get("source"); src && src->is_obj()) {
+            std::string data = src->get_str("data", "");
+            std::string mt   = src->get_str("media_type", "image/png");
+            if (!data.empty()) return "data:" + mt + ";base64," + data;
+        }
+    }
+    return "";
+}
+
+std::vector<ChatMessage> parse_openai_messages(const JsonVal& root, std::vector<std::string>* out_image_urls = nullptr) {
     std::vector<ChatMessage> out;
     const auto* arr = root.get("messages");
     if (!arr || !arr->is_arr()) return out;
@@ -463,8 +484,43 @@ std::vector<ChatMessage> parse_openai_messages(const JsonVal& root) {
         if (m.role == "developer") m.role = "system"; // OpenAI o-series alias -> system
         m.name = item.get_str("name", "");
         m.tool_call_id = item.get_str("tool_call_id", "");
-        m.content = extract_content_text(item.get("content"));
+        const auto* cv = item.get("content");
+        m.content = extract_content_text(cv);
         m.reasoning_content = item.get_str("reasoning_content", "");
+
+        // Preserve ordered multimodal parts for user & tool messages when images are present
+        if (cv && cv->is_arr() && (m.role == "user" || m.role == "tool")) {
+            bool has_img = false;
+            std::vector<ChatContentPart> parts;
+            for (const auto& part : cv->arr) {
+                if (part.is_str()) {
+                    if (!part.str.empty()) {
+                        ChatContentPart cp; cp.is_image = false; cp.text = part.str;
+                        parts.push_back(std::move(cp));
+                    }
+                } else if (part.is_obj()) {
+                    std::string img_url = extract_image_url_from_part(part);
+                    if (!img_url.empty()) {
+                        has_img = true;
+                        ChatContentPart cp; cp.is_image = true; cp.image_url = img_url;
+                        parts.push_back(std::move(cp));
+                        if (out_image_urls) out_image_urls->push_back(std::move(img_url));
+                    } else {
+                        std::string ptype = part.get_str("type", "text");
+                        if (ptype == "text" || ptype == "input_text") {
+                            std::string t = part.get_str("text", "");
+                            if (!t.empty()) {
+                                ChatContentPart cp; cp.is_image = false; cp.text = std::move(t);
+                                parts.push_back(std::move(cp));
+                            }
+                        }
+                    }
+                }
+            }
+            if (has_img) {
+                m.parts = std::move(parts);
+            }
+        }
 
         if (const auto* tcs = item.get("tool_calls"); tcs && tcs->is_arr()) {
             for (const auto& tc : tcs->arr) {
@@ -589,9 +645,9 @@ bool OpenAIServer::run() {
     }
     listen(srv, 16);
 
-    std::printf("[Server] OpenAI-compatible InkEngine listening on http://%s:%d (default effort=%s)\n",
-                host_.c_str(), port_, default_effort_.c_str());
-    std::printf("         Endpoints: /v1/chat/completions (tools+thinking+SSE+KV-cache), /v1/completions, /v1/models, /health, /stats, /shutdown\n");
+    std::printf("[Server] OpenAI-compatible InkEngine listening on http://%s:%d (default effort=%s, vision=%s)\n",
+                host_.c_str(), port_, default_effort_.c_str(), engine_.has_vision() ? "ON" : "OFF");
+    std::printf("         Endpoints: /v1/chat/completions (vision+tools+thinking+SSE+KV-cache), /v1/completions, /v1/models, /health, /stats, /shutdown\n");
     std::fflush(stdout);
 
     std::atomic<uint64_t> req_counter{1};
@@ -617,9 +673,9 @@ bool OpenAIServer::run() {
 
         if (path == "/health") {
             auto ks = engine_.kv_stats();
-            char hb[256];
-            std::snprintf(hb, sizeof(hb), "{\"status\":\"ok\",\"engine\":\"InkEngine\",\"model\":\"Inkling-2-Mini\",\"max_ctx\":%d,\"effort\":\"%s\"}",
-                          ks.max_ctx, json_escape(default_effort_).c_str());
+            char hb[320];
+            std::snprintf(hb, sizeof(hb), "{\"status\":\"ok\",\"engine\":\"InkEngine\",\"model\":\"Inkling-2-Mini\",\"max_ctx\":%d,\"effort\":\"%s\",\"vision\":%s}",
+                          ks.max_ctx, json_escape(default_effort_).c_str(), engine_.has_vision() ? "true" : "false");
             send_json(cli, 200, hb);
         } else if (path == "/shutdown" && method == "POST") {
             send_json(cli, 200, "{\"status\":\"shutting_down\"}");
@@ -683,16 +739,42 @@ bool OpenAIServer::run() {
             std::string effort = root.get_str("reasoning_effort", default_effort_);
             std::string tools_json;
             std::string prompt_text;
+            std::vector<std::string> image_urls;
             size_t static_prefix_bytes = 0;
             size_t tools_prefix_bytes = 0;
             size_t full_sys_prefix_bytes = 0;
 
             if (is_chat) {
-                auto msgs = parse_openai_messages(root);
+                auto msgs = parse_openai_messages(root, &image_urls);
                 tools_json = build_canonical_tools_json(root);
                 prompt_text = engine_.tokenizer().format_chat(msgs, effort, true, tools_json, &static_prefix_bytes, &tools_prefix_bytes, &full_sys_prefix_bytes);
             } else {
                 prompt_text = root.get_str("prompt", "");
+            }
+
+            std::vector<EncodedImage> encoded_imgs;
+            MultimodalEmbeddings mm_embd;
+            if (!image_urls.empty()) {
+                if (!engine_.has_vision()) {
+                    send_json(cli, 400, "{\"error\":{\"message\":\"Vision encoder not loaded (place mmproj-F16.gguf next to the model GGUF or pass --mmproj)\"}}");
+                    closesocket(cli);
+                    continue;
+                }
+                encoded_imgs.reserve(image_urls.size());
+                bool img_ok = true;
+                for (size_t ii = 0; ii < image_urls.size(); ++ii) {
+                    EncodedImage enc;
+                    if (!engine_.encode_image_input(image_urls[ii], enc)) {
+                        img_ok = false;
+                        break;
+                    }
+                    encoded_imgs.push_back(std::move(enc));
+                }
+                if (!img_ok) {
+                    send_json(cli, 400, "{\"error\":{\"message\":\"Failed to decode or encode one or more input images\"}}");
+                    closesocket(cli);
+                    continue;
+                }
             }
 
             int static_prefix_tokens = 0;
@@ -710,7 +792,16 @@ bool OpenAIServer::run() {
                 auto fp_ids = engine_.tokenizer().encode(prompt_text.substr(0, full_sys_prefix_bytes), true);
                 full_sys_prefix_tokens = (int)fp_ids.size();
             }
-            auto prompt_ids = engine_.tokenizer().encode(prompt_text, true);
+            auto raw_prompt_ids = engine_.tokenizer().encode(prompt_text, true);
+            std::vector<int32_t> prompt_ids;
+            const MultimodalEmbeddings* mm_ptr = nullptr;
+            if (!encoded_imgs.empty()) {
+                InklingEngine::expand_multimodal_tokens(
+                    raw_prompt_ids, engine_.tokenizer().image_placeholder_id(), encoded_imgs, prompt_ids, mm_embd);
+                mm_ptr = &mm_embd;
+            } else {
+                prompt_ids = std::move(raw_prompt_ids);
+            }
 
             uint64_t rid = req_counter.fetch_add(1);
             std::string chat_id = "chatcmpl-ink-" + std::to_string(rid);
@@ -802,9 +893,9 @@ bool OpenAIServer::run() {
                 header_buf.clear();
             };
 
-            std::printf("[HTTP] Incoming %s (id=%llu): prompt=%zu tok (full_sys=%d, static=%d, tools=%d) | stream=%d | effort=%s | has_tools=%d | T=%.2f p=%.2f k=%d mp=%.2f\n",
+            std::printf("[HTTP] Incoming %s (id=%llu): prompt=%zu tok (full_sys=%d, static=%d, tools=%d, imgs=%zu) | stream=%d | effort=%s | has_tools=%d | T=%.2f p=%.2f k=%d mp=%.2f\n",
                         path.c_str(), (unsigned long long)rid, prompt_ids.size(), full_sys_prefix_tokens, static_prefix_tokens, tools_prefix_tokens,
-                        stream ? 1 : 0, effort.c_str(), tools_json.empty() ? 0 : 1,
+                        encoded_imgs.size(), stream ? 1 : 0, effort.c_str(), tools_json.empty() ? 0 : 1,
                         sp.temperature, sp.top_p, sp.top_k, sp.min_p);
             std::fflush(stdout);
 
@@ -900,7 +991,8 @@ bool OpenAIServer::run() {
                     return client_alive;
                 },
                 tools_prefix_tokens,
-                full_sys_prefix_tokens);
+                full_sys_prefix_tokens,
+                mm_ptr);
 
             if (client_alive && (st == ST_TOOL_JSON || st == ST_TOOL_TEXT) && !tool_buf.empty()) {
                 flush_tool_call();
