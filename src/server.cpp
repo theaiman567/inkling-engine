@@ -17,6 +17,9 @@
 #include <atomic>
 #include <mutex>
 #include <thread>
+#include <list>
+#include <unordered_map>
+#include <functional>
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -33,6 +36,7 @@ struct JsonVal {
     std::string str;
     std::vector<JsonVal> arr;
     std::map<std::string, JsonVal> obj; // std::map keeps keys sorted -> canonical Inkling-2 JSON!
+    std::vector<std::string> keys;      // v4.1: original key insertion order (for template-faithful nested args)
 
     bool is_obj() const { return type == J_OBJ; }
     bool is_arr() const { return type == J_ARR; }
@@ -130,6 +134,47 @@ void json_dump(const JsonVal& v, std::string& out) {
 std::string json_stringify(const JsonVal& v) {
     std::string out;
     json_dump(v, out);
+    return out;
+}
+
+// v4.1 (R2-01): render tool-call arguments exactly like the official Inkling-2 chat template:
+//   top-level keys sorted (dictsort, case-sensitive) and every nested value via tojson(separators=(",",":"))
+//   WITHOUT sort_keys, i.e. nested objects keep their original key order. std::map alone sorts every level.
+void json_dump_template(const JsonVal& v, std::string& out, bool top_level) {
+    if (v.type == JsonVal::J_ARR) {
+        out.push_back('[');
+        for (size_t i = 0; i < v.arr.size(); ++i) {
+            if (i) out.push_back(',');
+            json_dump_template(v.arr[i], out, false);
+        }
+        out.push_back(']');
+        return;
+    }
+    if (v.type != JsonVal::J_OBJ) { json_dump(v, out); return; }
+    out.push_back('{');
+    bool first = true;
+    auto emit_kv = [&](const std::string& k, const JsonVal& val) {
+        if (!first) out.push_back(',');
+        first = false;
+        out.push_back('"');
+        out += json_escape(k);
+        out += "\":";
+        json_dump_template(val, out, false);
+    };
+    if (top_level || v.keys.size() != v.obj.size()) {
+        for (const auto& kv : v.obj) emit_kv(kv.first, kv.second);
+    } else {
+        for (const auto& k : v.keys) {
+            auto it = v.obj.find(k);
+            if (it != v.obj.end()) emit_kv(it->first, it->second);
+        }
+    }
+    out.push_back('}');
+}
+
+std::string json_args_template(const JsonVal& v) {
+    std::string out;
+    json_dump_template(v, out, /*top_level=*/true);
     return out;
 }
 
@@ -243,6 +288,7 @@ private:
                 ++i_;
                 JsonVal val;
                 if (!parse_value(val, depth + 1)) return false;
+                if (out.obj.find(key) == out.obj.end()) out.keys.push_back(key);
                 out.obj[std::move(key)] = std::move(val);
                 skip_ws();
                 if (i_ < n_ && s_[i_] == ',') { ++i_; continue; }
@@ -389,6 +435,159 @@ struct Utf8StreamBuffer {
         pending.clear();
         return out;
     }
+};
+
+// Order-insensitive canonical form (all levels sorted) used only to compare argument objects semantically.
+std::string json_args_canonical(const std::string& args_json) {
+    JsonVal v;
+    JsonParser p(args_json);
+    if (p.parse(v)) return json_stringify(v);
+    return args_json;
+}
+
+std::string trim_ws(const std::string& s) {
+    size_t b = 0, e = s.size();
+    while (b < e && std::isspace((unsigned char)s[b])) ++b;
+    while (e > b && std::isspace((unsigned char)s[e - 1])) --e;
+    return s.substr(b, e - b);
+}
+
+// =========================================================================
+// v4.1 (R2-05): incremental scanner over the model's {"name":...,"args":{...}} tool payload.
+// Yields the raw bytes of the top-level "args"/"arguments" object as they are generated, so a large
+// file write streams to the client as OpenAI function.arguments deltas instead of minutes of silence.
+// =========================================================================
+struct ToolArgStreamer {
+    enum Mode { SCAN, IN_ARGS, DONE, FALLBACK };
+    Mode mode = SCAN;
+    int depth = 0;
+    bool in_str = false, esc = false;
+    bool expect_key = false, reading_key = false, after_key = false, want_value = false;
+    std::string key;
+    std::string emitted; // everything yielded so far (== complete arguments text once mode == DONE)
+
+    std::string feed(const std::string& piece) {
+        std::string out;
+        for (char c : piece) {
+            if (mode == DONE || mode == FALLBACK) break;
+            if (mode == IN_ARGS) {
+                out.push_back(c);
+                if (in_str) {
+                    if (esc) esc = false;
+                    else if (c == '\\') esc = true;
+                    else if (c == '"') in_str = false;
+                } else if (c == '"') {
+                    in_str = true;
+                } else if (c == '{' || c == '[') {
+                    ++depth;
+                } else if (c == '}' || c == ']') {
+                    if (--depth <= 1) mode = DONE;
+                }
+                continue;
+            }
+            // SCAN: locate the top-level "args"/"arguments" key and the first byte of its value.
+            if (in_str) {
+                if (esc) { esc = false; if (reading_key) key.push_back(c); }
+                else if (c == '\\') { esc = true; if (reading_key) key.push_back(c); }
+                else if (c == '"') { in_str = false; if (reading_key) { reading_key = false; after_key = true; } }
+                else if (reading_key) key.push_back(c);
+                continue;
+            }
+            if (want_value) {
+                if (c == ' ' || c == '\t' || c == '\n' || c == '\r') continue;
+                want_value = false;
+                if (c == '{') { mode = IN_ARGS; depth = 2; out.push_back(c); continue; }
+                mode = FALLBACK; // string or scalar args: the end-of-call parser handles these
+                break;
+            }
+            if (c == '"') {
+                in_str = true;
+                if (depth == 1 && expect_key) { reading_key = true; key.clear(); expect_key = false; }
+                continue;
+            }
+            if (c == '{' || c == '[') { ++depth; if (depth == 1 && c == '{') expect_key = true; continue; }
+            if (c == '}' || c == ']') { --depth; continue; }
+            if (depth == 1 && c == ',') { expect_key = true; after_key = false; continue; }
+            if (depth == 1 && c == ':' && after_key) {
+                after_key = false;
+                if (key == "args" || key == "arguments") want_value = true;
+                continue;
+            }
+        }
+        emitted += out;
+        return out;
+    }
+};
+
+// =========================================================================
+// v4.1 (R2-01): token-exact replay of assistant turns.
+// The engine reuses its KV cache only if the next prompt starts with EXACTLY the tokens it already
+// holds. Re-rendering an assistant turn from text (re-serialised tool JSON, escapes, non-canonical
+// BPE splits sampled at T=1) can differ by one token and throw away a 10K-token turn. So every turn
+// this server generates is kept as its exact token sequence and spliced back when the client returns
+// that turn unchanged (same tool_call ids, names, arguments, reasoning and text).
+// =========================================================================
+struct TurnRecord {
+    std::vector<std::string> call_ids;
+    std::vector<std::string> call_names;
+    std::vector<std::string> call_args_canon;
+    std::string reasoning; // trimmed
+    std::string content;   // trimmed
+    std::vector<int32_t> tokens; // generation prompt + generated tokens + closing tokens
+};
+
+class TurnRecordStore {
+public:
+    static constexpr size_t kMaxTokens  = 8u * 1024u * 1024u; // ~32 MB of token IDs
+    static constexpr size_t kMaxRecords = 8192;
+
+    void add(TurnRecord&& r) {
+        std::string k = key_for(r.call_ids, r.reasoning, r.content);
+        auto it = by_key_.find(k);
+        if (it != by_key_.end()) {
+            total_tokens_ -= it->second->tokens.size();
+            recs_.erase(it->second);
+            by_key_.erase(it);
+        }
+        total_tokens_ += r.tokens.size();
+        recs_.push_back(std::move(r));
+        by_key_[k] = std::prev(recs_.end());
+        while (!recs_.empty() && (total_tokens_ > kMaxTokens || recs_.size() > kMaxRecords)) {
+            auto& old = recs_.front();
+            auto oit = by_key_.find(key_for(old.call_ids, old.reasoning, old.content));
+            if (oit != by_key_.end() && oit->second == recs_.begin()) by_key_.erase(oit);
+            total_tokens_ -= old.tokens.size();
+            recs_.pop_front();
+        }
+    }
+
+    const TurnRecord* match(const ChatMessage& m) const {
+        if (m.role != "assistant") return nullptr;
+        std::vector<std::string> ids;
+        for (const auto& tc : m.tool_calls) ids.push_back(tc.id);
+        const std::string rs = trim_ws(m.reasoning_content);
+        const std::string ct = trim_ws(m.content);
+        auto it = by_key_.find(key_for(ids, rs, ct));
+        if (it == by_key_.end()) return nullptr;
+        const TurnRecord& r = *it->second;
+        if (r.call_ids != ids || r.reasoning != rs || r.content != ct) return nullptr;
+        for (size_t i = 0; i < m.tool_calls.size(); ++i) {
+            if (r.call_names[i] != m.tool_calls[i].name) return nullptr;
+            if (r.call_args_canon[i] != json_args_canonical(m.tool_calls[i].arguments_json)) return nullptr;
+        }
+        return &r;
+    }
+
+    size_t size() const { return recs_.size(); }
+
+private:
+    static std::string key_for(const std::vector<std::string>& ids, const std::string& reasoning, const std::string& content) {
+        if (!ids.empty()) return "c:" + ids[0];
+        return "h:" + std::to_string(std::hash<std::string>{}(reasoning + '\x1f' + content));
+    }
+    std::list<TurnRecord> recs_;
+    std::unordered_map<std::string, std::list<TurnRecord>::iterator> by_key_;
+    size_t total_tokens_ = 0;
 };
 
 bool send_all(SOCKET sock, const std::string& data) {
@@ -659,7 +858,11 @@ std::vector<ChatMessage> parse_openai_messages(const JsonVal& root, std::vector<
         m.tool_call_id = item.get_str("tool_call_id", "");
         const auto* cv = item.get("content");
         m.content = extract_content_text(cv);
+        // Inkling must get its previous thinking back (the official template re-inserts it into every
+        // assistant turn). Accept the common client spellings so no harness silently drops it (R2-03b).
         m.reasoning_content = item.get_str("reasoning_content", "");
+        if (m.reasoning_content.empty()) m.reasoning_content = item.get_str("reasoning", "");
+        if (m.reasoning_content.empty()) m.reasoning_content = item.get_str("thinking", "");
 
         // Preserve ordered multimodal parts for user & tool messages when images are present
         if (cv && cv->is_arr() && (m.role == "user" || m.role == "tool")) {
@@ -705,16 +908,16 @@ std::vector<ChatMessage> parse_openai_messages(const JsonVal& root, std::vector<
                     spec.name = fn->get_str("name", "");
                     const auto* av = fn->get("arguments");
                     if (av && av->is_str()) {
-                        // Canonicalize JSON string arguments into sorted-key JSON object!
+                        // Render like the official template: sorted top-level keys, nested values in original order.
                         JsonVal parsed_args;
                         JsonParser ap(av->str);
                         if (ap.parse(parsed_args) && parsed_args.is_obj()) {
-                            spec.arguments_json = json_stringify(parsed_args);
+                            spec.arguments_json = json_args_template(parsed_args);
                         } else {
                             spec.arguments_json = av->str.empty() ? "{}" : av->str;
                         }
                     } else if (av && av->is_obj()) {
-                        spec.arguments_json = json_stringify(*av);
+                        spec.arguments_json = json_args_template(*av);
                     } else {
                         spec.arguments_json = "{}";
                     }
@@ -774,7 +977,7 @@ bool parse_inkling_tool_invocation(const std::string& raw_json, const std::strin
         out_name = v.get_str("name", header_hint);
         const auto* av = v.get("args");
         if (!av) av = v.get("arguments");
-        if (av && av->is_obj()) out_args_json = json_stringify(*av);
+        if (av && av->is_obj()) out_args_json = json_args_template(*av);
         else if (av && av->is_str()) out_args_json = av->str;
         else out_args_json = "{}";
         return !out_name.empty();
@@ -842,6 +1045,8 @@ bool OpenAIServer::run() {
     std::atomic<bool> stop_flag{false};
     std::atomic<int> active_conns{0};
     std::mutex gen_mu;
+    TurnRecordStore turn_records;                              // guarded by gen_mu (R2-01)
+    const std::string call_nonce = generate_csprng_hex_token(4); // tool_call ids stay unique across restarts
 
     auto handle_client = [&](SOCKET cli) {
         struct ConnGuard {
@@ -983,11 +1188,15 @@ bool OpenAIServer::run() {
         size_t static_prefix_bytes = 0;
         size_t tools_prefix_bytes = 0;
         size_t full_sys_prefix_bytes = 0;
+        std::vector<ChatMessage> msgs;
+        std::vector<std::pair<size_t, size_t>> msg_ranges;
+        size_t gen_prompt_bytes = 0;
 
         if (is_chat) {
-            auto msgs = parse_openai_messages(root, &image_urls);
+            msgs = parse_openai_messages(root, &image_urls);
             tools_json = build_canonical_tools_json(root);
-            prompt_text = engine_.tokenizer().format_chat(msgs, effort, true, tools_json, &static_prefix_bytes, &tools_prefix_bytes, &full_sys_prefix_bytes);
+            prompt_text = engine_.tokenizer().format_chat(msgs, effort, true, tools_json, &static_prefix_bytes, &tools_prefix_bytes,
+                                                          &full_sys_prefix_bytes, &msg_ranges, &gen_prompt_bytes);
         } else {
             prompt_text = root.get_str("prompt", "");
         }
@@ -1038,7 +1247,28 @@ bool OpenAIServer::run() {
             auto fp_ids = engine_.tokenizer().encode(prompt_text.substr(0, full_sys_prefix_bytes), true);
             full_sys_prefix_tokens = (int)fp_ids.size();
         }
-        auto raw_prompt_ids = engine_.tokenizer().encode(prompt_text, true);
+        // R2-01: splice the exact generated tokens of every assistant turn we still hold, so the prompt
+        // reproduces the KV-resident sequence token-for-token. Ranges start and end on special tokens,
+        // and the tokenizer never merges across special tokens, so piecewise encoding is exact.
+        std::vector<int32_t> raw_prompt_ids;
+        int replayed_turns = 0, replay_candidates = 0;
+        {
+            size_t cur = 0;
+            for (size_t mi = 0; mi < msgs.size() && mi < msg_ranges.size(); ++mi) {
+                if (msgs[mi].role != "assistant") continue;
+                ++replay_candidates;
+                const TurnRecord* rec = turn_records.match(msgs[mi]);
+                const auto rg = msg_ranges[mi];
+                if (!rec || rg.first < cur || rg.second <= rg.first) continue;
+                auto seg = engine_.tokenizer().encode(prompt_text.substr(cur, rg.first - cur), true);
+                raw_prompt_ids.insert(raw_prompt_ids.end(), seg.begin(), seg.end());
+                raw_prompt_ids.insert(raw_prompt_ids.end(), rec->tokens.begin(), rec->tokens.end());
+                cur = rg.second;
+                ++replayed_turns;
+            }
+            auto tail = engine_.tokenizer().encode(prompt_text.substr(cur), true);
+            raw_prompt_ids.insert(raw_prompt_ids.end(), tail.begin(), tail.end());
+        }
         std::vector<int32_t> prompt_ids;
         const MultimodalEmbeddings* mm_ptr = nullptr;
         if (!encoded_imgs.empty()) {
@@ -1082,6 +1312,17 @@ bool OpenAIServer::run() {
         std::vector<ToolCallSpec> emitted_tools;
         int tool_idx = 0;
         bool client_alive = true;
+        // R2-05: live tool-call argument streaming state
+        bool tool_streaming = false;
+        std::string tool_stream_id, tool_stream_name;
+        ToolArgStreamer arg_streamer;
+        Utf8StreamBuffer utf8_args;
+        // R2-10: decode-only expert-cache telemetry (snapshot taken at the first generated token)
+        bool decode_started = false;
+        ExpertCacheStats es_dec0{};
+        auto make_call_id = [&](int idx) {
+            return "call_ink_" + call_nonce + "_" + std::to_string(rid) + "_" + std::to_string(idx);
+        };
 
         const auto& tok = engine_.tokenizer();
         const int32_t id_model = tok.msg_model_id();
@@ -1146,11 +1387,54 @@ bool OpenAIServer::run() {
             else         client_alive = send_all(cli, ": keepalive\n\n");
         };
 
+        auto emit_args_delta = [&](const std::string& frag) {
+            if (frag.empty()) return;
+            std::ostringstream d;
+            d << "{\"tool_calls\":[{\"index\":" << tool_idx
+              << ",\"function\":{\"arguments\":\"" << json_escape(frag) << "\"}}]}";
+            emit_sse_delta(d.str());
+        };
+
+        // R2-05: open a streamed tool call as soon as the header names the tool, then forward the
+        // raw "args" object bytes as they are generated (standard OpenAI chunked tool-call deltas).
+        auto begin_tool_stream = [&]() {
+            tool_streaming = false;
+            if (!stream || !is_chat || st != ST_TOOL_JSON) return;
+            std::string nm = trim_ws(header_buf);
+            if (nm.empty()) return;
+            tool_stream_id = make_call_id(tool_idx);
+            tool_stream_name = nm;
+            arg_streamer = ToolArgStreamer{};
+            utf8_args = Utf8StreamBuffer{};
+            std::ostringstream d;
+            d << "{\"tool_calls\":[{\"index\":" << tool_idx
+              << ",\"id\":\"" << tool_stream_id << "\",\"type\":\"function\",\"function\":{\"name\":\""
+              << json_escape(nm) << "\",\"arguments\":\"\"}}]}";
+            emit_sse_delta(d.str());
+            tool_streaming = true;
+        };
+
         auto flush_tool_call = [&]() {
             std::string tname, targs;
-            if (parse_inkling_tool_invocation(tool_buf, header_buf, tname, targs)) {
+            const bool parsed = parse_inkling_tool_invocation(tool_buf, header_buf, tname, targs);
+            if (tool_streaming) {
+                emit_args_delta(utf8_args.flush());
+                std::string sent = arg_streamer.emitted;
+                if (arg_streamer.mode != ToolArgStreamer::DONE && sent.empty()) {
+                    // The args object never started streaming (e.g. string-valued args): send it whole now.
+                    sent = parsed ? targs : "{}";
+                    emit_args_delta(sent);
+                }
                 ToolCallSpec tc;
-                tc.id = "call_ink_" + std::to_string(rid) + "_" + std::to_string(tool_idx);
+                tc.id = tool_stream_id;
+                tc.name = tool_stream_name;
+                tc.arguments_json = sent;
+                emitted_tools.push_back(std::move(tc));
+                tool_idx++;
+                tool_streaming = false;
+            } else if (parsed) {
+                ToolCallSpec tc;
+                tc.id = make_call_id(tool_idx);
                 tc.name = tname;
                 tc.arguments_json = targs;
                 if (stream && is_chat) {
@@ -1179,6 +1463,7 @@ bool OpenAIServer::run() {
         auto res = engine_.generate(
             prompt_ids, sp,
             [&](int32_t tok_id, const std::string& piece) -> bool {
+                if (!decode_started) { decode_started = true; es_dec0 = engine_.expert_stats(); }
                 if (!client_alive) return false;
                 if ((++poll_toks & 7) == 0 && !is_client_alive(cli)) {
                     client_alive = false;
@@ -1214,7 +1499,8 @@ bool OpenAIServer::run() {
                     st = ST_TOOL_JSON;
                     tool_buf.clear();
                     silent_toks = 0;
-                    emit_sse_heartbeat();
+                    begin_tool_stream();
+                    if (!tool_streaming) emit_sse_heartbeat();
                     return client_alive;
                 }
                 if (tok_id == id_ttext) {
@@ -1257,7 +1543,11 @@ bool OpenAIServer::run() {
                     }
                 } else if (st == ST_TOOL_JSON || st == ST_TOOL_TEXT) {
                     tool_buf += piece;
-                    // Keep SSE stream alive while buffering large file writes/edits (~every 0.7s)!
+                    if (tool_streaming && st == ST_TOOL_JSON) {
+                        std::string frag = utf8_args.push(arg_streamer.feed(piece));
+                        if (!frag.empty()) { emit_args_delta(frag); silent_toks = 0; }
+                    }
+                    // Keep SSE stream alive while buffering (or before the args object starts streaming)
                     if (++silent_toks >= 16) { silent_toks = 0; emit_sse_heartbeat(); }
                 }
                 return client_alive;
@@ -1299,7 +1589,7 @@ bool OpenAIServer::run() {
 
         if (client_alive) {
             flush_utf8_buffers();
-            if ((st == ST_TOOL_JSON || st == ST_TOOL_TEXT) && !tool_buf.empty()) {
+            if ((st == ST_TOOL_JSON || st == ST_TOOL_TEXT) && (!tool_buf.empty() || tool_streaming)) {
                 flush_tool_call();
             }
         }
@@ -1310,6 +1600,59 @@ bool OpenAIServer::run() {
         double tps = res.decode_ms > 0 ? (res.gen_tokens * 1000.0 / res.decode_ms) : 0.0;
         int new_prompt = res.prompt_tokens - res.cached_tokens;
         double ptps = (res.prefill_ms > 0 && new_prompt > 0) ? (new_prompt * 1000.0 / res.prefill_ms) : 0.0;
+
+        // R2-01: remember this turn's exact tokens so the next request can replay them token-for-token.
+        bool recorded_turn = false;
+        if (is_chat && client_alive && !res.io_error && res.gen_tokens > 0) {
+            std::vector<int32_t> closing;
+            const bool hit_length = res.hit_max_ctx || res.gen_tokens >= sp.max_tokens;
+            if (res.stop_token >= 0) {
+                closing.push_back(res.stop_token);
+            } else if (hit_length && (st == ST_THINKING || st == ST_TEXT)) {
+                // Cut mid-block: the template closes it with <|end_message|> + end-of-turn.
+                closing.push_back(id_endm);
+                closing.push_back(tok.eos_id());
+            } else if (hit_length && st == ST_HEADER && res.tokens.back() == id_endm) {
+                closing.push_back(tok.eos_id());
+            }
+            if (!closing.empty()) {
+                TurnRecord rec;
+                for (const auto& tc : emitted_tools) {
+                    rec.call_ids.push_back(tc.id);
+                    rec.call_names.push_back(tc.name);
+                    rec.call_args_canon.push_back(json_args_canonical(tc.arguments_json));
+                }
+                rec.reasoning = trim_ws(full_reasoning);
+                rec.content = trim_ws(full_text);
+                rec.tokens = tok.encode(prompt_text.substr(std::min(gen_prompt_bytes, prompt_text.size())), true);
+                rec.tokens.insert(rec.tokens.end(), res.tokens.begin(), res.tokens.end());
+                rec.tokens.insert(rec.tokens.end(), closing.begin(), closing.end());
+                turn_records.add(std::move(rec));
+                recorded_turn = true;
+            }
+        }
+
+        // R2-10: per-request decode telemetry (decode-only expert hit rate, scalar vs speculative step cost)
+        std::string telem;
+        {
+            char tb[512];
+            ExpertCacheStats es1 = engine_.expert_stats();
+            auto pct = [](uint64_t hit, uint64_t tot) { return tot ? 100.0 * (double)hit / (double)tot : 0.0; };
+            const uint64_t dl = es1.total_lookups - es_dec0.total_lookups;
+            const double scalar_ms_tok = res.scalar_steps ? res.scalar_ms / res.scalar_steps : 0.0;
+            const double spec_ms_step  = res.spec_steps ? res.spec_ms / res.spec_steps : 0.0;
+            const double spec_tok_step = res.spec_steps ? (double)(res.spec_accepted + res.spec_steps) / res.spec_steps : 0.0;
+            const double spec_gain = (spec_ms_step > 0 && scalar_ms_tok > 0) ? scalar_ms_tok * spec_tok_step / spec_ms_step : 0.0;
+            std::snprintf(tb, sizeof(tb),
+                "\n         decode: scalar %.1f ms/tok x%d | spec %.1f ms/step x%d (%.2f tok/step, gain %.2fx) | "
+                "expert VRAM hit %.1f%% (core %.1f%%, outer %.1f%%) | replayed %d/%d turns%s",
+                scalar_ms_tok, res.scalar_steps, spec_ms_step, res.spec_steps, spec_tok_step, spec_gain,
+                decode_started && dl ? pct(es1.vram_hits - es_dec0.vram_hits, dl) : 0.0,
+                pct(es1.core_vram_hits - es_dec0.core_vram_hits, es1.core_lookups - es_dec0.core_lookups),
+                pct(es1.outer_vram_hits - es_dec0.outer_vram_hits, es1.outer_lookups - es_dec0.outer_lookups),
+                replayed_turns, replay_candidates, recorded_turn ? " | turn recorded" : "");
+            telem = tb;
+        }
 
         if (stream) {
             if (client_alive) {
@@ -1334,10 +1677,10 @@ bool OpenAIServer::run() {
                 }
                 send_all(cli, done.str());
             }
-            std::printf("[HTTP] %s stream: prompt=%d (cached=%d, new=%d @ %.1f tok/s) | gen=%d (%.2f tok/s) | spec=%d/%d | tools=%zu%s\n",
+            std::printf("[HTTP] %s stream: prompt=%d (cached=%d, new=%d @ %.1f tok/s) | gen=%d (%.2f tok/s) | spec=%d/%d | tools=%zu%s%s\n",
                         path.c_str(), res.prompt_tokens, res.cached_tokens, new_prompt, ptps,
                         res.gen_tokens, tps, res.spec_accepted, res.spec_drafted, emitted_tools.size(),
-                        client_alive ? "" : " | ABORTED(client_closed)");
+                        client_alive ? "" : " | ABORTED(client_closed)", telem.c_str());
             std::fflush(stdout);
         } else {
             std::ostringstream j;
@@ -1374,9 +1717,9 @@ bool OpenAIServer::run() {
                   << "\"timings\":{\"tokens_per_second\":" << tps << "}}";
             }
             send_json(cli, 200, j.str(), cfg_.cors_origin);
-            std::printf("[HTTP] %s: prompt=%d (cached=%d, new=%d @ %.1f tok/s) | gen=%d (%.2f tok/s) | spec=%d/%d | tools=%zu\n",
+            std::printf("[HTTP] %s: prompt=%d (cached=%d, new=%d @ %.1f tok/s) | gen=%d (%.2f tok/s) | spec=%d/%d | tools=%zu%s\n",
                         path.c_str(), res.prompt_tokens, res.cached_tokens, new_prompt, ptps,
-                        res.gen_tokens, tps, res.spec_accepted, res.spec_drafted, emitted_tools.size());
+                        res.gen_tokens, tps, res.spec_accepted, res.spec_drafted, emitted_tools.size(), telem.c_str());
             std::fflush(stdout);
         }
     };
