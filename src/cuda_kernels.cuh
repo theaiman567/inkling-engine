@@ -19,6 +19,7 @@ enum KVQuantMode : int {
 
 constexpr int INK_PAGE_TOKENS = 64;
 constexpr int INK_MAX_GPU_EXPERTS = 8;
+constexpr int INK_SPEC_MAX_B = 8;
 
 struct GPUExpertBatch {
     const void* gate_up_ptrs[INK_MAX_GPU_EXPERTS];
@@ -37,11 +38,22 @@ struct PinnedLayerDeviceTable {
 };
 
 struct alignas(64) MoESplitPacket {
-    int32_t n_gpu;
-    int32_t n_cpu;
-    int32_t all_ids[8];
-    int32_t miss_ids[8];
-    float   miss_weights[8];
+    int32_t  n_gpu;
+    int32_t  n_cpu;
+    int32_t  all_ids[8];
+    int32_t  miss_ids[8];
+    float    miss_weights[8];
+    uint32_t seq; // R19: monotonic release counter written last after __threadfence_system()
+};
+
+struct alignas(64) MoEBatchSplitPacket {
+    int32_t  n_gpu_tot;
+    int32_t  n_cpu_tot;
+    int32_t  all_ids[INK_SPEC_MAX_B * INK_MAX_GPU_EXPERTS];
+    int16_t  miss_tok[INK_SPEC_MAX_B * INK_MAX_GPU_EXPERTS];
+    int16_t  miss_exp[INK_SPEC_MAX_B * INK_MAX_GPU_EXPERTS];
+    float    miss_w[INK_SPEC_MAX_B * INK_MAX_GPU_EXPERTS];
+    uint32_t seq; // R13 + R19: monotonic release counter for zero-bubble speculative verify!
 };
 
 struct BlockPtrList {
@@ -354,6 +366,7 @@ void ink_cuda_moe_split_hits(
     float* d_gpu_hit_weights,
     MoESplitPacket* d_mapped_pkt,
     float* d_mapped_ffn_in,
+    uint32_t seq,
     cudaStream_t stream);
 
 // GPU-First Dynamic Indirect MoE: launches IMMEDIATELY after ink_cuda_moe_split_hits with ZERO host sync!
@@ -368,6 +381,52 @@ void ink_cuda_moe_dynamic_indirect(
     const float* x,
     float* h_scratch,        // [max_k * n_ff]
     float* out,              // [n_embd]
+    int n_embd, int n_ff,
+    float situ_beta, float situ_linear_beta,
+    cudaStream_t stream);
+
+// R13: Zero-Sync GPU-Indirect Batch MoE for B <= INK_SPEC_MAX_B on 100%-resident layers (0 syncs, 0 atomicAdd!)
+void ink_cuda_moe_pinned_indirect_batch(
+    uint32_t gate_up_type,
+    uint32_t down_type,
+    const PinnedLayerDeviceTable& tbl,
+    const int32_t* d_top_ids,      // [B * k]
+    const float* d_top_weights,    // [B * k]
+    int B, int k,
+    const float* x,                // [B * n_embd]
+    float* h_scratch,              // [B * k * n_ff]
+    float* out,                    // [B * n_embd]
+    int n_embd, int n_ff,
+    float situ_beta, float situ_linear_beta,
+    cudaStream_t stream);
+
+// R13 + R19: GPU-First Zero-Bubble Batch Split + Dynamic Indirect MoE for B <= INK_SPEC_MAX_B on hybrid layers!
+void ink_cuda_moe_split_hits_batch(
+    const PinnedLayerDeviceTable& tbl,
+    const int32_t* d_top_ids,      // [B * k]
+    const float* d_top_weights,    // [B * k]
+    int B, int k,
+    const float* d_x,              // [B * n_embd]
+    int n_embd,
+    int32_t* d_n_gpu,              // [B]
+    int32_t* d_gpu_hit_ids,        // [B * k]
+    float* d_gpu_hit_weights,      // [B * k]
+    MoEBatchSplitPacket* d_mapped_pkt,
+    float* d_mapped_ffn_in,        // [B * n_embd]
+    uint32_t seq,
+    cudaStream_t stream);
+
+void ink_cuda_moe_dynamic_indirect_batch(
+    uint32_t gate_up_type,
+    uint32_t down_type,
+    const PinnedLayerDeviceTable& tbl,
+    const int32_t* d_n_gpu,        // [B]
+    const int32_t* d_gpu_hit_ids,  // [B * max_k]
+    const float* d_gpu_hit_weights,// [B * max_k]
+    int B, int max_k,
+    const float* x,                // [B * n_embd]
+    float* h_scratch,              // [B * max_k * n_ff]
+    float* out,                    // [B * n_embd]
     int n_embd, int n_ff,
     float situ_beta, float situ_linear_beta,
     cudaStream_t stream);

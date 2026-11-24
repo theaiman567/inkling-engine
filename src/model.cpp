@@ -6,6 +6,9 @@
 #include <chrono>
 #include <numeric>
 #include <stdexcept>
+#include <atomic>
+#include <thread>
+#include <immintrin.h>
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -125,7 +128,7 @@ bool InklingEngine::load(const EngineConfig& cfg) {
 
     auto t_start = now_ms();
     std::printf("================================================================\n");
-    std::printf("  InkEngine v3.4 - Custom Looped-MoE 3-Tier Serving Engine\n");
+    std::printf("  InkEngine v4.0 - Custom Looped-MoE 3-Tier Serving Engine\n");
     std::printf("================================================================\n");
 
     if (!gguf_.open(cfg.model_path)) return false;
@@ -329,6 +332,8 @@ bool InklingEngine::load(const EngineConfig& cfg) {
     INK_CUDA_CHECK(cudaHostAlloc(&h_ffn_in_,        D * sizeof(float), cudaHostAllocMapped));
     INK_CUDA_CHECK(cudaHostGetDevicePointer(&d_mapped_ffn_in_, h_ffn_in_, 0));
     INK_CUDA_CHECK(cudaHostAlloc(&h_split_pkt_,     sizeof(MoESplitPacket), cudaHostAllocMapped));
+    std::memset(h_split_pkt_, 0, sizeof(MoESplitPacket));
+    split_pkt_seq_ = 0;
     INK_CUDA_CHECK(cudaHostGetDevicePointer(&d_split_pkt_, h_split_pkt_, 0));
     INK_CUDA_CHECK(cudaHostAlloc(&h_zero_sync_ids_, (size_t)hp_.n_layer_logical * hp_.n_expert_used * sizeof(int32_t), cudaHostAllocDefault));
     INK_CUDA_CHECK(cudaHostAlloc(&h_moe_cpu_out_,   D * sizeof(float), cudaHostAllocDefault));
@@ -819,6 +824,42 @@ void InklingEngine::capture_cuda_graphs() {
 
 static std::vector<float>* g_l0_attn_capture = nullptr;
 
+// R19: Spin-poll zero-copy mapped MoESplitPacket::seq written after __threadfence_system()
+// Avoids WDDM cudaEventRecord + cudaEventSynchronize driver overhead (~15-40 us per hybrid layer!).
+void InklingEngine::wait_split_packet(uint32_t target_seq) {
+    cudaError_t q = cudaStreamQuery(stream_);
+    if (q != cudaSuccess && q != cudaErrorNotReady) INK_CUDA_CHECK(q);
+    const volatile uint32_t* pseq = &h_split_pkt_->seq;
+    uint32_t spins = 0;
+    while (*pseq != target_seq) {
+        _mm_pause();
+        ++spins;
+        if ((spins & 0xFFFFu) == 0) {
+            cudaError_t qe = cudaStreamQuery(stream_);
+            if (qe != cudaSuccess && qe != cudaErrorNotReady) INK_CUDA_CHECK(qe);
+            if (spins >= 0x100000u) std::this_thread::yield();
+        }
+    }
+    std::atomic_thread_fence(std::memory_order_acquire);
+}
+
+void InklingEngine::wait_batch_split_packet(uint32_t target_seq) {
+    cudaError_t q = cudaStreamQuery(stream_);
+    if (q != cudaSuccess && q != cudaErrorNotReady) INK_CUDA_CHECK(q);
+    const volatile uint32_t* pseq = &h_b_split_pkt_->seq;
+    uint32_t spins = 0;
+    while (*pseq != target_seq) {
+        _mm_pause();
+        ++spins;
+        if ((spins & 0xFFFFu) == 0) {
+            cudaError_t qe = cudaStreamQuery(stream_);
+            if (qe != cudaSuccess && qe != cudaErrorNotReady) INK_CUDA_CHECK(qe);
+            if (spins >= 0x100000u) std::this_thread::yield();
+        }
+    }
+    std::atomic_thread_fence(std::memory_order_acquire);
+}
+
 int32_t InklingEngine::forward_token(int32_t token_id, int pos, bool need_logits, bool enable_profile,
                                      bool is_answer, bool capture_pred_hidden) {
     double t0 = 0, t_step = 0;
@@ -939,20 +980,19 @@ int32_t InklingEngine::forward_token(int32_t token_id, int pos, bool need_logits
             }
             experts_.record_pinned_layer_hits(ip, hp_.n_expert_used);
         } else {
-            // GPU-FIRST ZERO-BUBBLE HYBRID PATH!
+            // GPU-FIRST ZERO-BUBBLE HYBRID PATH (R19: zero-copy spin-poll, no WDDM event wait!)
+            uint32_t seq = (++split_pkt_seq_ == 0) ? ++split_pkt_seq_ : split_pkt_seq_;
             ink_cuda_moe_split_hits(tbl, d_top_ids_, d_top_weights_, hp_.n_expert_used,
                                     d_ffn_normed_, D,
                                     d_n_gpu_, d_gpu_hit_ids_, d_gpu_hit_weights_,
-                                    d_split_pkt_, d_mapped_ffn_in_, stream_);
-            INK_CUDA_CHECK(cudaEventRecord(ev_split_, stream_));
+                                    d_split_pkt_, d_mapped_ffn_in_, seq, stream_);
 
             ink_cuda_moe_dynamic_indirect(lm.gate_up_type, lm.down_type, tbl,
                                           d_n_gpu_, d_gpu_hit_ids_, d_gpu_hit_weights_, hp_.n_expert_used,
                                           d_ffn_normed_, d_moe_h_, d_moe_out_,
                                           D, hp_.n_ff_exp, hp_.situ_beta, hp_.situ_linear_beta, stream_);
 
-            cudaStreamQuery(stream_);
-            INK_CUDA_CHECK(cudaEventSynchronize(ev_split_));
+            wait_split_packet(seq);
 
             CPUExpertTask cpu_tasks[8];
             int n_cpu = 0;
@@ -1079,7 +1119,7 @@ int32_t InklingEngine::forward_token_1loop_draft(int32_t token_id, int pos) {
             ink_cuda_moe_split_hits(tbl, d_top_ids_, d_top_weights_, hp_.n_expert_used,
                                     d_ffn_normed_, D,
                                     d_n_gpu_, d_gpu_hit_ids_, d_gpu_hit_weights_,
-                                    nullptr, nullptr, stream_);
+                                    nullptr, nullptr, 0, stream_);
             ink_cuda_moe_dynamic_indirect(lm.gate_up_type, lm.down_type, tbl,
                                           d_n_gpu_, d_gpu_hit_ids_, d_gpu_hit_weights_, hp_.n_expert_used,
                                           d_ffn_normed_, d_moe_h_, d_moe_out_,
@@ -1153,6 +1193,19 @@ void InklingEngine::alloc_batch_buffers() {
     ah(h_grp_tok_w_, B * (size_t)hp_.n_expert_used);
     ah(h_b_argmax_, (size_t)HybridPagedKV::SPEC_MAX_B);
 
+    // R13: Zero-Sync & Spin-Poll Batch Split buffers for Speculative Verification (<100 KB total!)
+    const size_t SB = (size_t)HybridPagedKV::SPEC_MAX_B;
+    ad(d_b_n_gpu_, SB);
+    ad(d_b_hit_ids_, SB * (size_t)hp_.n_expert_used);
+    ad(d_b_hit_weights_, SB * (size_t)hp_.n_expert_used);
+    INK_CUDA_CHECK(cudaHostAlloc(&h_b_mapped_ffn_in_, SB * D * sizeof(float), cudaHostAllocMapped));
+    INK_CUDA_CHECK(cudaHostGetDevicePointer(&d_b_mapped_ffn_in_, h_b_mapped_ffn_in_, 0));
+    INK_CUDA_CHECK(cudaHostAlloc(&h_b_split_pkt_, sizeof(MoEBatchSplitPacket), cudaHostAllocMapped));
+    std::memset(h_b_split_pkt_, 0, sizeof(MoEBatchSplitPacket));
+    batch_split_seq_ = 0;
+    INK_CUDA_CHECK(cudaHostGetDevicePointer(&d_b_split_pkt_, h_b_split_pkt_, 0));
+    ah(h_b_zero_sync_ids_, (size_t)hp_.n_layer_logical * SB * (size_t)hp_.n_expert_used);
+
     // Double-buffered PCIe staging ring for Layer-Wise Tensor-Core Prefill (28 MiB VRAM + 28 MiB pinned RAM)
     int32_t seq_ids[STAGE_EXPS];
     for (int i = 0; i < STAGE_EXPS; ++i) seq_ids[i] = i;
@@ -1218,6 +1271,10 @@ void InklingEngine::free_batch_buffers() {
     fh(h_b_top_ids_); fh(h_b_top_weights_);
     fh(h_grp_exp_ids_); fh(h_grp_tok_off_); fh(h_grp_tok_ids_); fh(h_grp_tok_w_);
     fh(h_b_argmax_);
+    fd(d_b_n_gpu_); fd(d_b_hit_ids_); fd(d_b_hit_weights_);
+    fh(h_b_mapped_ffn_in_); d_b_mapped_ffn_in_ = nullptr;
+    fh(h_b_split_pkt_);     d_b_split_pkt_ = nullptr;
+    fh(h_b_zero_sync_ids_);
     batch_ready_ = false;
 }
 
@@ -1280,6 +1337,7 @@ int32_t InklingEngine::forward_batch(
     CPUExpertGroupTask cpu_groups[128];
     int32_t cpu_tok_ids[BATCH_MAX * 8];
     float   cpu_tok_w[BATCH_MAX * 8];
+    bool    zero_sync_route_mask[48] = {};
 
     for (int il = 0; il < hp_.n_layer_logical; ++il) {
         const int ip = hp_.loop_layer(il);
@@ -1449,7 +1507,120 @@ int32_t InklingEngine::forward_batch(
         const auto& tbl = experts_.layer_device_table(ip);
         const bool all_vram = experts_.is_layer_all_vram(ip);
         const bool may_stream_pcie = (B >= 16 && lm.combined_bytes <= STAGE_SLOT_BYTES && d_prefill_stage_[0] != nullptr);
+        const bool use_spec_indirect = (B <= HybridPagedKV::SPEC_MAX_B && !may_stream_pcie && d_b_split_pkt_ != nullptr);
 
+        if (use_spec_indirect) {
+            // R13: Zero-Sync (all_vram) & Spin-Poll Zero-Bubble (hybrid) Indirect Batch MoE for Speculative Verify!
+            // Eliminates 48x cudaStreamSynchronize stalls, CPU bucketing of VRAM hits, H2D group uploads, and atomicAdd!
+            if (all_vram) {
+                ink_cuda_moe_pinned_indirect_batch(lm.gate_up_type, lm.down_type, tbl,
+                                                   d_b_top_ids_, d_b_top_weights_, B, K_exp,
+                                                   d_b_ffn_normed_, d_b_moe_h_, d_b_moe_out_,
+                                                   D, hp_.n_ff_exp, hp_.situ_beta, hp_.situ_linear_beta, stream_);
+                experts_.record_batch_hit_stats(ip, B * K_exp, 0);
+                if (record_batch_routes && h_b_zero_sync_ids_) {
+                    INK_CUDA_CHECK(cudaMemcpyAsync(
+                        h_b_zero_sync_ids_ + (size_t)il * (size_t)B * (size_t)K_exp,
+                        d_b_top_ids_, (size_t)B * (size_t)K_exp * sizeof(int32_t),
+                        cudaMemcpyDeviceToHost, stream_));
+                    zero_sync_route_mask[il] = true;
+                }
+            } else {
+                uint32_t seq = (++batch_split_seq_ == 0) ? ++batch_split_seq_ : batch_split_seq_;
+                ink_cuda_moe_split_hits_batch(tbl, d_b_top_ids_, d_b_top_weights_, B, K_exp,
+                                              d_b_ffn_normed_, D,
+                                              d_b_n_gpu_, d_b_hit_ids_, d_b_hit_weights_,
+                                              d_b_split_pkt_, d_b_mapped_ffn_in_, seq, stream_);
+                ink_cuda_moe_dynamic_indirect_batch(lm.gate_up_type, lm.down_type, tbl,
+                                                    d_b_n_gpu_, d_b_hit_ids_, d_b_hit_weights_, B, K_exp,
+                                                    d_b_ffn_normed_, d_b_moe_h_, d_b_moe_out_,
+                                                    D, hp_.n_ff_exp, hp_.situ_beta, hp_.situ_linear_beta, stream_);
+
+                wait_batch_split_packet(seq);
+
+                if (record_batch_routes) {
+                    std::memcpy(batch_pred_ids_.data() + (size_t)il * (size_t)B * (size_t)K_exp,
+                                h_b_split_pkt_->all_ids, (size_t)B * (size_t)K_exp * sizeof(int32_t));
+                }
+                const int nc_tot = h_b_split_pkt_->n_cpu_tot;
+                experts_.record_batch_hit_stats(ip, h_b_split_pkt_->n_gpu_tot, nc_tot);
+
+                if (nc_tot > 0) {
+                    std::memset(bucket_cnt, 0, sizeof(bucket_cnt));
+                    for (int m = 0; m < nc_tot; ++m) {
+                        int e = (int)h_b_split_pkt_->miss_exp[m];
+                        int c = bucket_cnt[e]++;
+                        bucket_tok[e][c] = (int)h_b_split_pkt_->miss_tok[m];
+                        bucket_w[e][c]   = h_b_split_pkt_->miss_w[m];
+                    }
+                    int n_cpu_grp = 0, cpu_pairs = 0;
+                    int cpu_uids[128];
+                    for (int e = 0; e < hp_.n_expert; ++e) {
+                        int cnt = bucket_cnt[e];
+                        if (cnt == 0) continue;
+                        cpu_uids[n_cpu_grp] = ip * hp_.n_expert + e;
+                        CPUExpertGroupTask& cg = cpu_groups[n_cpu_grp++];
+                        cg.gate_up_data  = nullptr;
+                        cg.down_data     = nullptr;
+                        cg.gate_up_type  = lm.gate_up_type;
+                        cg.down_type     = lm.down_type;
+                        cg.gate_up_scale = lm.gate_up_scales[e];
+                        cg.down_scale    = lm.down_scales[e];
+                        cg.tok_offset    = cpu_pairs;
+                        cg.tok_count     = cnt;
+                        for (int t = 0; t < cnt; ++t) {
+                            cpu_tok_ids[cpu_pairs] = bucket_tok[e][t];
+                            cpu_tok_w[cpu_pairs]   = bucket_w[e][t];
+                            cpu_pairs++;
+                        }
+                    }
+
+                    int pin_slots[128];
+                    std::vector<float> split_acc;
+                    bool used_split = false;
+                    int base_g = 0;
+                    while (base_g < n_cpu_grp) {
+                        int cnt_g = 0;
+                        for (int k = base_g; k < n_cpu_grp; ++k) {
+                            int rslot = -1;
+                            const uint8_t* rptr = experts_.pin_ram_expert(cpu_uids[k], &rslot);
+                            if (!rptr && cnt_g == 0) {
+                                experts_.finish_phased_swaps(stream_);
+                                rptr = experts_.pin_ram_expert(cpu_uids[k], &rslot);
+                            }
+                            if (!rptr) break;
+                            cpu_groups[k].gate_up_data = rptr;
+                            cpu_groups[k].down_data    = rptr + lm.down_aligned_off;
+                            pin_slots[cnt_g++] = rslot;
+                        }
+                        if (cnt_g <= 0) {
+                            record_io_error(experts_.has_io_error()
+                                ? experts_.last_error()
+                                : ("Unable to pin cold expert uid=" + std::to_string(cpu_uids[base_g]) + " for spec CPU MoE"));
+                            INK_CUDA_CHECK(cudaStreamSynchronize(stream_));
+                            return -1;
+                        }
+                        cpu_pool_->run_moe_experts_grouped(h_b_mapped_ffn_in_, h_b_moe_cpu_out_, B,
+                                                           cpu_groups + base_g, cnt_g, cpu_tok_ids, cpu_tok_w, cpu_pairs,
+                                                           D, hp_.n_ff_exp, hp_.situ_beta, hp_.situ_linear_beta);
+                        experts_.unpin_ram_slots(pin_slots, cnt_g);
+
+                        if (base_g == 0 && cnt_g == n_cpu_grp) break;
+                        if (!used_split) {
+                            split_acc.assign((size_t)B * D, 0.0f);
+                            used_split = true;
+                        }
+                        for (size_t idx = 0; idx < (size_t)B * D; ++idx) split_acc[idx] += h_b_moe_cpu_out_[idx];
+                        base_g += cnt_g;
+                    }
+                    if (used_split) {
+                        std::memcpy(h_b_moe_cpu_out_, split_acc.data(), (size_t)B * D * sizeof(float));
+                    }
+                    INK_CUDA_CHECK(cudaMemcpyAsync(d_b_moe_cpu_out_, h_b_moe_cpu_out_, (size_t)B * D * sizeof(float), cudaMemcpyHostToDevice, stream_));
+                    ink_cuda_add_inplace(d_b_moe_out_, d_b_moe_cpu_out_, B * D, stream_);
+                }
+            }
+        } else {
         INK_CUDA_CHECK(cudaMemcpyAsync(h_b_top_ids_,     d_b_top_ids_,     (size_t)B * K_exp * sizeof(int32_t), cudaMemcpyDeviceToHost, stream_));
         INK_CUDA_CHECK(cudaMemcpyAsync(h_b_top_weights_, d_b_top_weights_, (size_t)B * K_exp * sizeof(float),   cudaMemcpyDeviceToHost, stream_));
         if (!all_vram && !may_stream_pcie) {
@@ -1531,25 +1702,41 @@ int32_t InklingEngine::forward_batch(
                                  /*zero_out=*/true, /*preconvert_x=*/true, stream_);
 
         if (n_cpu_grp > 0 && use_pcie_stream) {
-            // Double-Buffered Layer-Wise PCIe Streaming -> 100% RTX 4060 Tensor Core MoE (ZERO CPU bottleneck!)
+            // Double-Buffered Layer-Wise PCIe Streaming -> 100% RTX 4060 Tensor Core MoE (R15 Direct Pinned DMA!)
             cudaStream_t s_dma = experts_.dma_stream();
             const size_t exp_bytes = lm.combined_bytes;
             bool x_ready = (n_gpu_grp > 0);
+            int buf_pin_slots[STAGE_BUFS][STAGE_EXPS];
+            int buf_pin_cnt[STAGE_BUFS] = {0, 0};
+            auto release_buf_pins = [&](int b) {
+                if (buf_pin_cnt[b] > 0) {
+                    experts_.unpin_ram_slots(buf_pin_slots[b], buf_pin_cnt[b]);
+                    buf_pin_cnt[b] = 0;
+                }
+            };
             int batch_idx = 0;
             for (int base_g = 0; base_g < n_cpu_grp; ++batch_idx) {
                 int buf = batch_idx & 1;
                 int want_g = std::min(STAGE_EXPS, n_cpu_grp - base_g);
                 if (batch_idx >= STAGE_BUFS) {
                     INK_CUDA_CHECK(cudaEventSynchronize(ev_stage_gpu_[buf]));
+                    release_buf_pins(buf);
                 }
 
-                // Pin ONLY this micro-batch (<= 4 experts) in RAM until memcpy into pinned staging buffer completes!
+                // Pin ONLY this micro-batch (<= 4 experts) in RAM until DMA (direct) or bounce memcpy completes!
                 int pin_slots[STAGE_EXPS];
                 int cnt_g = 0;
                 for (int k = 0; k < want_g; ++k) {
                     int rslot = -1;
                     const uint8_t* rptr = experts_.pin_ram_expert(cpu_uids[base_g + k], &rslot);
                     if (!rptr && cnt_g == 0) {
+                        // Drain any in-flight direct-DMA buffers first under ultra-tight RAM!
+                        for (int b = 0; b < STAGE_BUFS; ++b) {
+                            if (buf_pin_cnt[b] > 0) {
+                                INK_CUDA_CHECK(cudaEventSynchronize(ev_stage_dma_[b]));
+                                release_buf_pins(b);
+                            }
+                        }
                         experts_.finish_phased_swaps(stream_);
                         rptr = experts_.pin_ram_expert(cpu_uids[base_g + k], &rslot);
                     }
@@ -1560,30 +1747,47 @@ int32_t InklingEngine::forward_batch(
                 }
                 if (cnt_g <= 0) {
                     int used_bufs = std::min(batch_idx, STAGE_BUFS);
-                    for (int b = 0; b < used_bufs; ++b) INK_CUDA_CHECK(cudaEventSynchronize(ev_stage_gpu_[b]));
+                    for (int b = 0; b < used_bufs; ++b) {
+                        INK_CUDA_CHECK(cudaEventSynchronize(ev_stage_gpu_[b]));
+                        release_buf_pins(b);
+                    }
                     record_io_error(experts_.has_io_error()
                         ? experts_.last_error()
                         : ("Unable to pin cold expert uid=" + std::to_string(cpu_uids[base_g]) + " in RAM"));
                     return -1;
                 }
 
-                // Parallel DDR4 memcpy of 1..4 pinned cold experts into pinned WC bounce buffer (~0.35 ms!)
-                cpu_pool_->parallel_for_threads([&](int tid, int nth) {
-                    size_t total_b = (size_t)cnt_g * exp_bytes;
-                    size_t chunk_b = (total_b + (size_t)nth - 1) / (size_t)nth;
-                    size_t lo = (size_t)tid * chunk_b;
-                    size_t hi = std::min(total_b, lo + chunk_b);
-                    while (lo < hi) {
-                        int k = (int)(lo / exp_bytes);
-                        size_t off_in_e = lo - (size_t)k * exp_bytes;
-                        size_t take = std::min(hi - lo, exp_bytes - off_in_e);
-                        std::memcpy(h_prefill_stage_[buf] + (size_t)k * exp_bytes + off_in_e,
-                                    (const uint8_t*)cpu_groups[base_g + k].gate_up_data + off_in_e, take);
-                        lo += take;
+                // R15: Check if all experts in this micro-batch reside in cudaHostRegister'd Tier-1 RAM!
+                bool direct_dma = true;
+                for (int k = 0; k < cnt_g; ++k) {
+                    if (!experts_.is_ram_ptr_pinned_dma((const uint8_t*)cpu_groups[base_g + k].gate_up_data, exp_bytes)) {
+                        direct_dma = false;
+                        break;
                     }
-                });
-                // Staging copy into h_prefill_stage_[buf] is done -> immediately release RAM pins!
-                experts_.unpin_ram_slots(pin_slots, cnt_g);
+                }
+
+                if (direct_dma) {
+                    // ZERO-COPY FAST PATH: keep RAM slots pinned until ev_stage_dma_/ev_stage_gpu_ finishes!
+                    for (int k = 0; k < cnt_g; ++k) buf_pin_slots[buf][k] = pin_slots[k];
+                    buf_pin_cnt[buf] = cnt_g;
+                } else {
+                    // Fallback bounce memcpy into pinned staging buffer for unregistered RAM slots
+                    cpu_pool_->parallel_for_threads([&](int tid, int nth) {
+                        size_t total_b = (size_t)cnt_g * exp_bytes;
+                        size_t chunk_b = (total_b + (size_t)nth - 1) / (size_t)nth;
+                        size_t lo = (size_t)tid * chunk_b;
+                        size_t hi = std::min(total_b, lo + chunk_b);
+                        while (lo < hi) {
+                            int k = (int)(lo / exp_bytes);
+                            size_t off_in_e = lo - (size_t)k * exp_bytes;
+                            size_t take = std::min(hi - lo, exp_bytes - off_in_e);
+                            std::memcpy(h_prefill_stage_[buf] + (size_t)k * exp_bytes + off_in_e,
+                                        (const uint8_t*)cpu_groups[base_g + k].gate_up_data + off_in_e, take);
+                            lo += take;
+                        }
+                    });
+                    experts_.unpin_ram_slots(pin_slots, cnt_g);
+                }
 
                 int st_pairs = 0;
                 h_stage_tok_off_[buf][0] = 0;
@@ -1603,7 +1807,16 @@ int32_t InklingEngine::forward_batch(
                 }
 
                 // Async PCIe Gen4 H2D DMA overlapped with previous micro-batch's Tensor Core MoE!
-                INK_CUDA_CHECK(cudaMemcpyAsync(d_prefill_stage_[buf], h_prefill_stage_[buf], (size_t)cnt_g * exp_bytes, cudaMemcpyHostToDevice, s_dma));
+                if (direct_dma) {
+                    for (int k = 0; k < cnt_g; ++k) {
+                        INK_CUDA_CHECK(cudaMemcpyAsync(
+                            d_prefill_stage_[buf] + (size_t)k * exp_bytes,
+                            cpu_groups[base_g + k].gate_up_data,
+                            exp_bytes, cudaMemcpyHostToDevice, s_dma));
+                    }
+                } else {
+                    INK_CUDA_CHECK(cudaMemcpyAsync(d_prefill_stage_[buf], h_prefill_stage_[buf], (size_t)cnt_g * exp_bytes, cudaMemcpyHostToDevice, s_dma));
+                }
                 INK_CUDA_CHECK(cudaMemcpyAsync(stage_tbl_[buf].d_gu_ptrs,   h_stage_gu_ptrs_[buf], (size_t)cnt_g * sizeof(uint64_t), cudaMemcpyHostToDevice, s_dma));
                 INK_CUDA_CHECK(cudaMemcpyAsync(stage_tbl_[buf].d_dn_ptrs,   h_stage_dn_ptrs_[buf], (size_t)cnt_g * sizeof(uint64_t), cudaMemcpyHostToDevice, s_dma));
                 INK_CUDA_CHECK(cudaMemcpyAsync(stage_tbl_[buf].d_gu_scales, h_stage_gu_sc_[buf],   (size_t)cnt_g * sizeof(float),    cudaMemcpyHostToDevice, s_dma));
@@ -1625,10 +1838,11 @@ int32_t InklingEngine::forward_batch(
                 cudaStreamQuery(stream_);
                 base_g += cnt_g;
             }
-            // Ensure staging buffers are done on GPU before next layer reuses them
+            // Ensure staging buffers & direct-DMA RAM pins are done before next layer reuses them
             int used_bufs = std::min(batch_idx, STAGE_BUFS);
             for (int b = 0; b < used_bufs; ++b) {
                 INK_CUDA_CHECK(cudaEventSynchronize(ev_stage_gpu_[b]));
+                release_buf_pins(b);
             }
         } else if (n_cpu_grp > 0) {
             // Ultra-low-latency CPU AVX2 overlap for tiny batches (e.g. Speculative Verification B <= 7!)
@@ -1680,6 +1894,7 @@ int32_t InklingEngine::forward_batch(
             INK_CUDA_CHECK(cudaMemcpyAsync(d_b_moe_cpu_out_, h_b_moe_cpu_out_, (size_t)B * D * sizeof(float), cudaMemcpyHostToDevice, stream_));
             ink_cuda_add_inplace(d_b_moe_out_, d_b_moe_cpu_out_, B * D, stream_);
         }
+        } // end else (!use_spec_indirect)
 
         ink_cuda_shortconv_add_batch(d_b_moe_out_, kv_.conv_state_ptr(il, 2 * KVdim + D),
                                      (const float*)L.ffn_post_conv.ptr, d_b_ffn_inp_, d_b_cur_, B, D,
@@ -1720,6 +1935,15 @@ int32_t InklingEngine::forward_batch(
 
     // R10 (SR3-05): Replay batched routes in exact scalar token order (decay -> record per token!)
     if (record_batch_routes) {
+        if (h_b_zero_sync_ids_) {
+            for (int il = 0; il < hp_.n_layer_logical; ++il) {
+                if (zero_sync_route_mask[il]) {
+                    std::memcpy(batch_pred_ids_.data() + (size_t)il * (size_t)B * (size_t)K_exp,
+                                h_b_zero_sync_ids_ + (size_t)il * (size_t)B * (size_t)K_exp,
+                                (size_t)B * (size_t)K_exp * sizeof(int32_t));
+                }
+            }
+        }
         batch_pred_B_ = B;
         if (track_pred) {
             for (int b = 0; b < B; ++b) {
@@ -2331,7 +2555,13 @@ InklingEngine::GenResult InklingEngine::generate(
     };
     if (cfg_.use_speculative) sync_ngram_index();
 
-    auto draft_ngram = [&](int32_t cur_tok, int max_draft, int32_t* out_draft) -> int {
+    // R16: Per-match-length (3/4/5-gram) adaptive draft length tracker (100% lossless!)
+    float ngram_ema[3] = {1.5f, 3.0f, 5.0f};
+    int   ngram_3_cooldown = 0;
+    int   ngram_3_consec_rejects = 0;
+
+    auto draft_ngram = [&](int32_t cur_tok, int max_draft, int32_t* out_draft, int& out_match_len) -> int {
+        out_match_len = 0;
         sync_ngram_index();
         const int H = (int)kv_tokens_.size();
         if (H < 6 || max_draft <= 0) return 0;
@@ -2360,9 +2590,23 @@ InklingEngine::GenResult InklingEngine::generate(
             }
         }
         if (best_idx < 0) return 0;
+        out_match_len = best_len;
+
+        // R16: Scale draft length K adaptively by match length + acceptance EMA!
+        int k_cap = max_draft;
+        if (best_len == 3) {
+            if (ngram_3_cooldown > 0 || ngram_ema[0] < 0.35f) {
+                if (ngram_3_cooldown > 0) ngram_3_cooldown--;
+                ngram_ema[0] = std::min(1.0f, ngram_ema[0] + 0.04f); // gradual recovery when switching back to code
+                return 0;
+            }
+            k_cap = std::clamp((int)std::lround(ngram_ema[0] + 1.0f), 1, std::min(4, max_draft));
+        } else if (best_len == 4) {
+            k_cap = std::clamp((int)std::lround(ngram_ema[1] + 1.5f), 2, max_draft);
+        }
 
         int k = 0;
-        for (; k < max_draft && (best_idx + 1 + k) < H; ++k) {
+        for (; k < k_cap && (best_idx + 1 + k) < H; ++k) {
             int32_t cand = kv_tokens_[best_idx + 1 + k];
             if (tok_.is_eog(cand)) break;
             out_draft[k] = cand;
@@ -2385,13 +2629,14 @@ InklingEngine::GenResult InklingEngine::generate(
 
         bool need_pred_now = pred_main_.loaded() && (res.gen_tokens >= next_pred_at);
 
-        // Stage 5 / v3.0: Zero-VRAM Lossless Speculative Decoding!
-        //  1) O(1) Rolling 3-Gram Suffix Hash Drafter (K <= 6, <1 us, instant on code/JSON/edits!)
-        //  2) 1-Loop (24L) GPU-Only Self-Speculative Fallback (zero extra VRAM, 79% Top-1 agreement on general prose!)
+        // Stage 5 / v4.0: Zero-VRAM Lossless Adaptive Speculative Decoding (R13 + R16)!
+        //  1) O(1) Rolling 3-Gram Suffix Hash Drafter (adaptive K <= 6 by match_len + EMA, <1 us!)
+        //  2) 1-Loop (24L) GPU-Only Self-Speculative Fallback (zero extra VRAM)
         int32_t draft_toks[HybridPagedKV::SPEC_MAX_B];
         int max_d = std::min(HybridPagedKV::SPEC_MAX_B - 2, std::min(sp.max_tokens - res.gen_tokens, cfg_.max_ctx - 2 - pos));
+        int ngram_match_len = 0;
         int K_draft = (cfg_.use_speculative && !enable_profile && !need_pred_now && max_d >= 2)
-            ? draft_ngram(next_tok, max_d, draft_toks)
+            ? draft_ngram(next_tok, max_d, draft_toks, ngram_match_len)
             : 0;
 
         if (K_draft == 0 && cfg_.use_speculative && cfg_.self_draft_k > 0 && !enable_profile && !need_pred_now && max_d >= 2) {
@@ -2488,6 +2733,19 @@ InklingEngine::GenResult InklingEngine::generate(
             res.spec_drafted += K_draft;
             res.spec_steps++;
 
+            // R16: Update adaptive n-gram acceptance EMA + cold-prose 3-gram cooldown
+            if (ngram_match_len >= 3) {
+                int n_acc = accepted - 1;
+                int bi = std::clamp(ngram_match_len - 3, 0, 2);
+                ngram_ema[bi] = 0.70f * ngram_ema[bi] + 0.30f * (float)n_acc;
+                if (bi == 0 && n_acc == 0) {
+                    if (++ngram_3_consec_rejects >= 2) ngram_3_cooldown = 3;
+                } else if (n_acc > 0) {
+                    ngram_3_consec_rejects = 0;
+                    ngram_3_cooldown = 0;
+                }
+            }
+
             if (pos >= cfg_.max_ctx - 1) { res.hit_max_ctx = true; break; }
             if (stopped || res.gen_tokens >= sp.max_tokens) break;
             next_tok = bonus_tok;
@@ -2550,15 +2808,15 @@ void InklingEngine::probe_early_exit(const std::string& prompt_text, int n_token
                                              d_ffn_normed_, d_moe_h_, d_moe_out_,
                                              D, hp_.n_ff_exp, hp_.situ_beta, hp_.situ_linear_beta, stream_);
             } else {
+                uint32_t seq = (++split_pkt_seq_ == 0) ? ++split_pkt_seq_ : split_pkt_seq_;
                 ink_cuda_moe_split_hits(tbl, d_top_ids_, d_top_weights_, hp_.n_expert_used,
                                         d_ffn_normed_, D, d_n_gpu_, d_gpu_hit_ids_, d_gpu_hit_weights_,
-                                        d_split_pkt_, d_mapped_ffn_in_, stream_);
-                INK_CUDA_CHECK(cudaEventRecord(ev_split_, stream_));
+                                        d_split_pkt_, d_mapped_ffn_in_, seq, stream_);
                 ink_cuda_moe_dynamic_indirect(lm.gate_up_type, lm.down_type, tbl,
                                               d_n_gpu_, d_gpu_hit_ids_, d_gpu_hit_weights_, hp_.n_expert_used,
                                               d_ffn_normed_, d_moe_h_, d_moe_out_,
                                               D, hp_.n_ff_exp, hp_.situ_beta, hp_.situ_linear_beta, stream_);
-                INK_CUDA_CHECK(cudaEventSynchronize(ev_split_));
+                wait_split_packet(seq);
                 CPUExpertTask cpu_tasks[8];
                 int n_cpu = 0;
                 experts_.resolve_gpu_split(ip, *h_split_pkt_, cpu_tasks, n_cpu);
@@ -3262,7 +3520,7 @@ bool InklingEngine::run_parity_suite() {
     cfg_.use_batched_prefill = orig_batch;
     cfg_.use_speculative = orig_spec;
     std::printf("================================================================\n");
-    std::printf("  [PARITY SUITE R0/v3.4] OVERALL: %s\n", all_ok ? "ALL GATES PASSED!" : "FAILED!");
+    std::printf("  [PARITY SUITE R0/v4.0] OVERALL: %s\n", all_ok ? "ALL GATES PASSED!" : "FAILED!");
     std::printf("================================================================\n");
     std::fflush(stdout);
     return all_ok;
