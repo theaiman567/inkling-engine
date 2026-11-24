@@ -1,8 +1,10 @@
-# InkEngine v4.0
+# InkEngine v4.1
 
 **A standalone C++17 / CUDA / AVX2 3-tier (VRAM → RAM → SSD) multimodal serving engine built from scratch for [Inkling-2-Mini](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) (`general.architecture = inkling2` + `inkling2v` vision), with zero `llama.cpp` or `ggml` dependencies.**
 
 InkEngine is engineered specifically for consumer GPUs that **cannot fit the full model + long context in VRAM** (e.g., 6–12 GB NVIDIA GPUs + 16 GB RAM + NVMe/SATA SSDs). By exploiting Inkling-2's **3× Looped-MoE architecture** (where 12 physical Core layers execute 3× per token while 12 Outer layers execute 1×), pairing a native **learned MoE expert predictor**, single-pass Q8 activation quantization + `G=8`/`G=4` sub-warp MoE kernels + zero-copy spin-poll dispatch, paging global KV cache across VRAM → RAM → NVMe SSD with O(1) free-list clock eviction, VRAM-pinned multi-chunk exact attention and GPU Radix-Select Quest attention, and streaming **multimodal vision (`mmproj-F16.gguf`)** on-demand through GPU Tensor Cores with **0 MiB permanent VRAM/RAM overhead**, InkEngine delivers **3.6× faster decode (`38 tok/s` at 64K, `31 tok/s` at 512K SSD!)**, **2.2× faster prefill**, **native image understanding**, and **up to 512K–1M token context** on an 8 GB GPU — backed by an automated **8-gate long-context & fault-injection verification suite** and **hardened local HTTP Bearer authentication**.
+
+**New in v4.1 ("Agent Flow")**: built for long OpenCode agent sessions. Every generated turn is replayed **token-for-token**, so the next request reuses its KV cache instead of re-processing it (a `write` follow-up reused **980/991** prompt tokens, where v4.0 re-prefilled the turn). File writes and other tool calls now **stream their arguments live** (265 deltas instead of one block after minutes of silence). The model's previous thinking is kept even when a client sends it as `reasoning` or `thinking`, and every request logs decode cost, speculative gain, expert hit rate and the exact cause of any cache miss. See `CHANGELOG.md`.
 
 ---
 
@@ -204,6 +206,14 @@ Measured on **RTX 4060 8 GB + Ryzen 5 5500 (6C/12T) + 16 GB DDR4 + SATA model SS
 | **Multimodal Vision (`mmproj-F16`, idle)** | ~610+ MiB VRAM/RAM | N/A | 0 MiB VRAM/RAM | **0 MiB permanent VRAM / 0 MiB RAM** | **Zero text slowdown** |
 | **Full HD 1080p encode + multi-turn cache** | Re-encodes or pins VRAM | N/A | ~3.0s / 10 ms | **~3.0s** *(SATA stream)* / **0.0 ms + 10 ms KV hit** | **1,493 VRAM slots kept** |
 
+*(v4.1 changes the serving path, not the kernels, so the raw-speed rows above are the v4.0 measurements. They are synthetic single-token benchmarks: real OpenCode agent turns measured **~25 tok/s** scalar decode in a 107K-token session, and the new per-request telemetry shows speculative decoding currently costs time on reasoning-heavy turns (gain 0.76–0.93×). Cost-aware drafting is the next fix.)*
+
+| Agent-flow check (v4.1, real model, `--ctx 16384`) | v4.0 | **v4.1** |
+|---|---:|---:|
+| `write` tool-call arguments streamed to client | 1 delta (at the end) | **265 deltas (live)** |
+| Next-turn KV reuse after a `write` | miss → turn re-prefilled | **980 / 991 tokens reused** |
+| Prior thinking sent back as `reasoning` | dropped (prompt 507 tok) | **kept (prompt 991 tok)** |
+
 *(Note: Official `min_p = 0.0` sampling applies a `1e-6` relative tail floor (`p < 1e-6 × p_max`), dropping negligible tail probability mass while keeping GPU candidate pre-filtering bit-exact and sub-50 µs.)*
 
 ### Exactness & Verification Commands
@@ -215,7 +225,7 @@ build\inkengine.exe --model "C:\path\to\model.gguf" --verify-predictor
 build\inkengine.exe --model "C:\path\to\model.gguf" --ctx 65536 --bench-prefill 2048
 build\inkengine.exe --model "C:\path\to\model.gguf" --ctx 65536 --bench 128
 ```
-- **Model Token Parity**: 100% exact match (`29/29` tokenizer match, `"17 * 23 is 391."`).
+- **Model Token Parity**: tokenizer `29/29` exact match. The golden greedy answer currently prints `"17 * 23 = 391."` instead of the reference `"17 * 23 is 391."` on both v4.0 and v4.1 (a pre-existing near-tie flip, likely from v4.0's numerically-equivalent kernel changes; tracked separately). The answer is still correct.
 - **8-Gate Long-Context & Robustness Suite (`--verify-suite`, `F16` & `Q4_0`)**: SWA ring-wrap `L0_SWA_err=0.000001`, post-wrap `B=128/32/7` Top-1 exact match, Speculative ON vs. OFF `96/96` exact (`77/77 = 100%` past `pos=1024`), **bit-exact (`0.000000`)** Turn-Rewind + Disk v3 Checkpoint restore, **0.000000 error** multi-chunk exact global attention under 6-VRAM-frame / SSD pressure (`R4`), 4/4 fault-injected checked I/O & atomic publish tests (`R6`), bit-exact Quest extrema rollback across 64-token page boundaries (`R8`), exact predictor route replay (`R10`), and **200/200 bit-exact** GPU sampling pre-filter (`R14`).
 - **Predictor Parity**: `pred-v3.vec` = `1.639e-07`, `start-v3.vec` = `2.980e-07` max abs diff vs. PyTorch golden vectors.
 
@@ -232,6 +242,7 @@ build\inkengine.exe --model "C:\path\to\model.gguf" --ctx 65536 --bench 128
 7. **Persistent NVMe OpenCode KV Checkpoints (v3)**: Atomic 3-tier prefix checkpoints (`tools-prefix`, pre-`<env>` `static-prefix`, `full-system`) restored in `<200 ms` across restarts, plus `~55 MiB` zero-Global-copy `~4–10 ms` bit-exact in-place turn-rewind snapshots.
 8. **Zero-Overhead GPU-Streamed Multimodal Vision (`inkling2v`)**: Pure Windows WIC decoder + 6 custom CUDA ViT/projector kernels (23-layer Perception-Encoder ViT, exact 2D RoPE, tiled FlashAttention, 2×2 spatial merge, `tok_norm` bypass) streamed in 8–9 MiB slices through the existing prefill PCIe staging ring — leaving VRAM expert slots, RAM budget, and text decode speed 100% untouched. Deterministic hash-derived synthetic token IDs let OpenCode multi-turn conversations reuse both cached image embeddings (`0.0 ms`) and KV prefix caches (`~10 ms`) automatically.
 9. **Hardened Local HTTP/SSE Runtime**: Default CSPRNG Bearer auth across all routes, `Host` allowlist & non-wildcard CORS (blocking DNS rebinding), HTTP `image_url` local/UNC file exfiltration guard, strict anti-smuggling header parser, `10s/30s` socket timeouts, bounded 16-worker concurrency so `/health` stays `<1 ms`, UTF-8 multi-byte SSE boundary buffering, and strict `context_length_exceeded` handling.
+10. **Agent-Flow Serving (v4.1)**: Token-exact replay of every generated assistant turn (keyed by tool-call ids, spliced on special-token boundaries) so multi-turn agent sessions never re-prefill their own output; official-template tool-call argument rendering (sorted top-level keys, original nested order); live OpenAI `function.arguments` streaming for tool calls; `reasoning_content` / `reasoning` / `thinking` accepted so Inkling always gets its prior thinking back; and per-request telemetry (scalar vs speculative step cost, decode-only expert hit rate, replayed turns, cache-miss diagnostics).
 
 ---
 

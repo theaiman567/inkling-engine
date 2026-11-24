@@ -1033,7 +1033,7 @@ bool OpenAIServer::run() {
     }
     listen(srv, 16);
 
-    std::printf("[Server] OpenAI-compatible InkEngine v3.3 listening on http://%s:%d (effort=%s, vision=%s, auth=%s, cors=%s)\n",
+    std::printf("[Server] OpenAI-compatible InkEngine v4.1 listening on http://%s:%d (effort=%s, vision=%s, auth=%s, cors=%s)\n",
                 cfg_.host.c_str(), cfg_.port, cfg_.default_effort.c_str(),
                 engine_.has_vision() ? "ON" : "OFF",
                 cfg_.require_auth ? "Bearer" : "OFF",
