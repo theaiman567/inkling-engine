@@ -206,6 +206,7 @@ void ink_cuda_rel_table(
     cudaStream_t stream);
 
 // Fused KV quantize + store + optional INT8 Quest min/max summary + optional pos_slot write
+// Optional `save_act_min_dst` / `save_act_max_dst` snapshot the post-token FP32 extrema for R8 exact Quest rollback!
 void ink_cuda_kv_store(
     const float* K,
     const float* V,
@@ -221,6 +222,22 @@ void ink_cuda_kv_store(
     int32_t  pos_val,
     int n_head_kv, int head_dim,
     KVQuantMode kv_mode,
+    cudaStream_t stream,
+    float* save_act_min_dst = nullptr,
+    float* save_act_max_dst = nullptr);
+
+// Re-quantize restored FP32 active page extrema into INT8 Quest summary (R8 speculative rollback!)
+void ink_cuda_quest_quantize_summary(
+    const float* active_k_min, // [n_glob_layers, n_head_kv * head_dim]
+    const float* active_k_max, // [n_glob_layers, n_head_kv * head_dim]
+    int8_t* k_mins_q8,         // [n_glob_layers, max_pages_per_layer, n_head_kv * head_dim]
+    int8_t* k_maxs_q8,         // [n_glob_layers, max_pages_per_layer, n_head_kv * head_dim]
+    float*  k_scales,          // [n_glob_layers, max_pages_per_layer, n_head_kv]
+    int n_glob_layers,
+    int max_pages_per_layer,
+    int page_idx,
+    int n_head_kv,
+    int head_dim,
     cudaStream_t stream);
 
 void ink_cuda_attn_swa(
@@ -459,6 +476,47 @@ void ink_cuda_attn_global_paged_batch(
     float* split_out, float* split_ml, float* out,
     int B, int n_head, int n_head_kv, int head_dim,
     int pos0, int rel_extent, KVQuantMode kv_mode, cudaStream_t stream);
+
+// R4 (SR3-02): Chunked online-softmax exact global attention (single-sink finalize, zero frame reuse!)
+void ink_cuda_attn_global_paged_chunk(
+    const float* Q,
+    const uint64_t* page_k_ptrs, const uint64_t* page_v_ptrs,
+    const int32_t* page_pos0, const int32_t* page_lens, int n_pages,
+    const float* rel_table,
+    float* split_out, float* split_ml,
+    float* acc_out, float* acc_ml,
+    int B, int n_head, int n_head_kv, int head_dim,
+    int pos0, int rel_extent, KVQuantMode kv_mode,
+    bool is_first_chunk, cudaStream_t stream);
+
+void ink_cuda_attn_global_finalize(
+    const float* acc_out, const float* acc_ml,
+    const float* sinks, float* out,
+    int B, int n_head, int head_dim, cudaStream_t stream);
+
+// R14 (SR1-03): Bit-exact GPU superset candidate pre-filter for sampling (eliminates 800 KB D2H copy!)
+constexpr int INK_SAMPLE_INLINE_CAP   = 512;
+constexpr int INK_SAMPLE_OVERFLOW_CAP = 8192;
+
+struct alignas(64) SamplePrefilterPacket {
+    int32_t count;
+    int32_t overflow;
+    float   raw_max;
+    int32_t _pad;
+    int32_t ids[INK_SAMPLE_INLINE_CAP];
+    float   vals[INK_SAMPLE_INLINE_CAP];
+};
+
+void ink_cuda_sample_prefilter(
+    const float* logits,
+    int n_vocab,
+    int32_t argmax_val,
+    float inv_t,
+    float log_min_p,
+    SamplePrefilterPacket* d_pkt,
+    int32_t* d_ext_ids,
+    float* d_ext_vals,
+    cudaStream_t stream);
 
 void ink_cuda_moe_router_batch(
     const float* gate_inp, const float* bias, const float* x,

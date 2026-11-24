@@ -40,6 +40,8 @@ struct KVCheckpoint {
     std::vector<int8_t>  k_mins_q8;  // [n_glob_layers, glob_n_pages, n_head_kv * head_dim]
     std::vector<int8_t>  k_maxs_q8;  // [n_glob_layers, glob_n_pages, n_head_kv * head_dim]
     std::vector<float>   k_scales;   // [n_glob_layers, glob_n_pages, n_head_kv]
+    std::vector<float>   active_k_min; // [n_glob_layers, n_head_kv * head_dim] FP32 active-page extrema
+    std::vector<float>   active_k_max;
     std::vector<int32_t> tokens;
 };
 
@@ -77,10 +79,26 @@ public:
         size_t vram_global_kv_bytes,
         size_t ram_global_kv_bytes,
         const std::string& ssd_swap_path,
-        int quest_top_pages = 128);
+        int quest_top_pages = 128,
+        bool allow_tiny_vram_for_test = false);
 
     void shutdown();
     void reset(); // Clear all tokens & recurrent conv states for a fresh conversation
+
+    // R6 (SR3-03): Explicit I/O error inspection & deterministic test fault-injection hooks
+    bool has_io_error() const { return io_error_; }
+    const std::string& last_error() const { return last_error_; }
+    void clear_io_error() { io_error_ = false; last_error_.clear(); }
+    void set_test_io_fault(int fail_write_after, int fail_read_after, bool short_read_once = false) {
+        test_fail_write_after_ = fail_write_after;
+        test_fail_read_after_  = fail_read_after;
+        test_short_read_once_  = short_read_once;
+    }
+
+    // R8 (SR3-07): Test inspection helper to copy Quest summaries for parity verification
+    bool copy_quest_page_summary(int g, int p, std::vector<int8_t>& kmin, std::vector<int8_t>& kmax,
+                                 std::vector<float>& ksc, std::vector<float>& act_min, std::vector<float>& act_max,
+                                 cudaStream_t stream) const;
 
     // Fast realistic synthetic population up to target_pos tokens across VRAM -> RAM -> NVMe SSD
     // (enables instant 32K/64K/128K/256K/512K real paged-attention & NVMe-swap benchmarks!)
@@ -109,7 +127,8 @@ public:
     size_t conv_spec_stride() const { return (size_t)n_layers_ * conv_layer_floats_; }
 
     // Append current token's K & V at position `pos` for logical layer `il`, and run attention!
-    void append_and_attend(
+    // Returns false if a tier transfer / I/O error occurred (R6 / SR3-03).
+    bool append_and_attend(
         int il,
         int pos,
         const float* d_Q,         // [n_head, head_dim]
@@ -122,7 +141,8 @@ public:
         cudaStream_t stream);
 
     // Batched append & causal attention for B tokens [pos0 .. pos0 + B - 1] (Stage 4 Prefill & Stage 5 Verify!)
-    void append_and_attend_batch(
+    // Returns false if a tier transfer / I/O error occurred (R6 / SR3-03).
+    bool append_and_attend_batch(
         int il,
         int pos0,
         int B,
@@ -160,17 +180,24 @@ private:
         uint64_t last_use = 0;
     };
 
-    // Ensure logical page (g, p) is resident in VRAM (evicting LRU VRAM page to RAM/SSD if needed).
-    // `protected_min_p`..`protected_max_p` and sink pages [0..1] are never evicted.
+    // Ensure logical page (g, p) is resident in VRAM (evicting LRU unpinned VRAM page to RAM/SSD if needed).
+    // Returns -1 on unrecoverable eviction/I/O failure (sets io_error_).
     int ensure_page_in_vram(int g, int p, int protect_recent_start, cudaStream_t stream);
-    void fetch_ssd_pages_batch(int g, const std::vector<int>& ssd_pids, int protect_recent_start, cudaStream_t stream);
+    bool fetch_ssd_pages_batch(int g, const std::vector<int>& ssd_pids, int protect_recent_start,
+                               std::vector<int>& out_pinned_slots, cudaStream_t stream);
+    bool attend_global_pages(int g, int B, int pos0, const std::vector<int>& page_ids, int recent_start,
+                             const float* d_Q, const float* d_rel_table, const float* d_sinks,
+                             float* d_out, int rel_extent, cudaStream_t stream);
+    bool ensure_chunk_accum(int B);
+    void unpin_vram_slots(const std::vector<int>& slots);
     int alloc_vram_page_slot(int protect_g, int protect_recent_start, cudaStream_t stream);
     int alloc_ram_page_slot(int& evicted_g, int& evicted_p);
-    void spill_ram_to_ssd(int g, int p, int rslot);
-    void read_ssd_to_ram(int g, int p, int rslot);
+    bool spill_ram_to_ssd(int g, int p, int rslot);
+    bool read_ssd_to_ram(int g, int p, int rslot);
     bool ssd_pwrite_sync(uint64_t offset, const void* src, size_t nbytes);
     bool ssd_pread_sync(uint64_t offset, void* dst, size_t nbytes);
     bool ensure_ssd_file();
+    void set_io_error(const char* msg);
 
     int n_layers_ = 0;
     int n_head_ = 24;
@@ -209,6 +236,12 @@ private:
     uint8_t* d_vram_pages_ = nullptr;
     int vram_page_cap_ = 0;
     std::vector<std::pair<int, int>> vram_owner_; // [slot] -> (g, page_id)
+    std::vector<uint8_t> vram_pin_;               // [slot] > 0 means pinned for in-flight attention/append (R4!)
+
+    // R4 lazy online-softmax chunk accumulators (0 bytes VRAM when single-chunk suffices!)
+    float* d_chunk_out_ = nullptr;
+    float* d_chunk_ml_  = nullptr;
+    int    chunk_acc_cap_b_ = 0;
 
     uint8_t* h_ram_pages_ = nullptr;
     int ram_page_cap_ = 0;
@@ -239,11 +272,20 @@ private:
     float*    d_quest_scores_ = nullptr;
     int32_t*  d_quest_topk_ids_ = nullptr; // [max_pages_per_layer] GPU Radix-Select Top-K output!
 
-    // Speculative verification rollback buffers (exact ShortConv + SWA slot backup in VRAM)
+    // Speculative verification rollback buffers (exact ShortConv + SWA + R8 Quest extrema in VRAM)
     float*    d_conv_spec_ = nullptr;     // [SPEC_MAX_B, n_layers, conv_layer_floats]
     uint8_t*  d_swa_bak_k_ = nullptr;     // [n_swa_layers, SPEC_MAX_B, tok_k_bytes]
     uint8_t*  d_swa_bak_v_ = nullptr;
     int32_t*  d_swa_bak_pos_ = nullptr;   // [n_swa_layers, SPEC_MAX_B]
+    float*    d_quest_spec_min_ = nullptr; // [SPEC_MAX_B, n_glob_layers, kd] FP32 post-token extrema (R8!)
+    float*    d_quest_spec_max_ = nullptr; // [SPEC_MAX_B, n_glob_layers, kd]
+    float*    d_quest_draft_min_ = nullptr;// [n_glob_layers, kd] pre-draft FP32 extrema (R8!)
+    float*    d_quest_draft_max_ = nullptr;
+    int8_t*   d_quest_draft_q8_min_ = nullptr; // [n_glob_layers, kd] pre-draft page Q8 summary (R8!)
+    int8_t*   d_quest_draft_q8_max_ = nullptr;
+    float*    d_quest_draft_sc_ = nullptr;     // [n_glob_layers, n_head_kv]
+    int       draft_saved_page_ = -1;
+    bool      spec_recording_ = false;
     int       spec_pos0_ = 0;
     int       spec_B_ = 0;
 
@@ -266,4 +308,10 @@ private:
     uint64_t stat_ram_hits_ = 0;
     uint64_t stat_ssd_reads_ = 0;
     uint64_t stat_ssd_writes_ = 0;
+
+    bool        io_error_ = false;
+    std::string last_error_;
+    int         test_fail_write_after_ = -1;
+    int         test_fail_read_after_  = -1;
+    bool        test_short_read_once_  = false;
 };

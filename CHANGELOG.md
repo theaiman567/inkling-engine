@@ -1,3 +1,91 @@
+# Changelog / PR Notes — InkEngine v3.4 ("Robust" — Memory-Pressure Exactness, Checked I/O, Quest & Predictor Fixes, and Bit-Exact GPU Sampling Pre-Filter)
+
+> **Suggested PR Title:** `v3.4: Fix multi-chunk exact global attention (R4), checked I/O & atomic publish (R6), Quest rollback extrema (R8), predictor route bookkeeping (R10), GPU sampling pre-filter (R14), and bounds guards (R21)`
+
+This release implements **Milestone 2 ("Robust")** of the senior-agent architecture audit (`R4`, `R6`, `R8`, `R10`, `R14`, `R21`, `R24`), hardening 128K–512K memory-pressure paging, eliminating silent I/O corruption, making Quest rollbacks and MoE predictor tracking bit-exact, accelerating sampling **~6.7×** with zero output change, and expanding `--verify-suite` from 3 gates to **8 automated parity & fault-injection gates**.
+
+---
+
+## Summary of Fixes & Improvements (v3.4)
+
+### 1. Multi-Chunk Exact Global Attention with VRAM Frame Pinning & Single-Sink Finalize (`R4 / SR3-02` — `src/paged_kv.h`, `src/paged_kv.cpp`, `src/cuda_kernels.cuh`, `src/cuda_kernels.cu`)
+- **Root Cause**: When exact global attention (`--kv-mode exact`) ran with more pages than free VRAM frames, gathering all page pointers up front allowed later page fetches in the same attention call to evict earlier pages' VRAM frames before the GPU kernel read them.
+- **Fix**:
+  - Added per-slot VRAM frame pinning (`vram_pin_`) to `HybridPagedKV` (`alloc_vram_page_slot` strictly skips pinned frames and adds a safe Pass-2 fallback over unpinned frames instead of blindly stomping slot 0).
+  - Added unified `attend_global_pages()` with zero-overhead fast path when 100% of pages are already in VRAM, and VRAM-safe bounded chunking (`chunk_cap = vram_page_cap_`) whenever pages spill to RAM/SSD.
+  - Added `k_attn_global_merge_chunk` and `k_attn_global_finalize` CUDA kernels (with lazily allocated accumulators — `0 B` VRAM when single-chunk suffices) that merge online-softmax partials `(out, m, l)` across chunks and apply the attention sink **exactly once**.
+
+### 2. Checked Full-Byte I/O, Atomic Publish & Clean Error Propagation (`R6 / SR3-03` — `src/paged_kv.*`, `src/expert_cache.*`, `src/model.*`, `src/server.cpp`)
+- **Root Cause**: Partial or failed Win32 `ReadFile`/`WriteFile` calls (including QD-16 overlapped NVMe fetches) could publish incomplete bytes into VRAM/RAM, destroy the last valid copy on a failed spill, or crash with a negative slot index (`ram_slot_ptr_[-1]`) on SSD expert read failures.
+- **Fix**:
+  - Checked `written == 0` in `ssd_pwrite_sync()`, verified every spill write in `spill_ram_to_ssd()`, `alloc_ram_page_slot()`, and `alloc_vram_page_slot()`, and preserved the last valid RAM/VRAM copy intact whenever a spill fails.
+  - Completed partial/short reads in `fetch_ssd_pages_batch()` via synchronous remainder loops, kept `vram_owner_ = {-1, -1}` while I/O is in flight, and atomically published pages/expert slots **only after** full-byte read + DMA succeed.
+  - Propagated `bool` failures from `HybridPagedKV::append_and_attend[_batch]()` and `ExpertCache::resolve_gpu_split()` / `pin_ram_expert()` cleanly through `InklingEngine::generate()` (`GenResult::io_error`) to HTTP `500` (`storage_io_error`) instead of silently corrupting outputs or crashing.
+
+### 3. Bit-Exact Quest Extrema Restoration on Speculative & Draft Rollback (`R8 / SR3-07` — `src/paged_kv.*`, `src/cuda_kernels.*`)
+- **Root Cause**: Partial speculative rejections and 1-loop self-draft rollbacks truncated Global KV page lengths, but left rejected draft keys' min/max extrema inside `d_active_k_min_` / `d_active_k_max_` and the page's INT8 Quest summaries (and wiped `d_active_k_min_/max_` if rejected tokens crossed a 64-token page boundary).
+- **Fix**:
+  - Added optional post-token FP32 extrema snapshotting inside `k_kv_store` (`~600 KB` VRAM rollback buffer) and `ink_cuda_quest_quantize_summary` to restore exact FP32 extrema and re-quantize the boundary page on `commit_spec_verify()`.
+  - Added pre-draft FP32 + boundary Q8 summary snapshot/restore in `begin_draft_snapshot()` / `rollback_draft_snapshot()`, plus `active_k_min`/`active_k_max` preservation in RAM `KVCheckpoint`.
+
+### 4. Exact Token-Order MoE Predictor Route Bookkeeping (`R10 / SR3-05` — `src/model.h`, `src/model.cpp`, `src/moe_predictor.h`)
+- **Root Cause**: `forward_batch()` previously decayed predictor usage maps `B` times *before* adding all `B` tokens with weight `1.0` (skewing `MP_LIVE64` by ~84% at `B=128`), and speculative commit incremented `answer_pos` without recording any accepted tokens' routed experts!
+- **Fix**: Captured per-layer routed expert IDs into `batch_pred_ids_` (`48 × B × 8`) and replayed `step_*_token() -> record_selections()` in exact scalar token order at batch end and for every accepted token on speculative commit.
+
+### 5. Bit-Exact GPU Sampling Candidate Pre-Filter & Bounds Guards (`R14 / SR1-03`, `R21 / SR2-05`, `R24 / SR1-08` — `src/cuda_kernels.*`, `src/model.*`, `src/cpu_kernels.cpp`)
+- **R14**: Added `k_sample_prefilter` (`SamplePrefilterPacket`, `~64 KB` VRAM + `~64 KB` pinned RAM) that evaluates a conservative ULP-padded superset threshold on GPU, copies only `4 KB` (`≤512` inline candidates, with `8,192` overflow buffer and exact full-vocab fallback), re-applies the exact CPU predicate in ascending token-ID order, and shares `finish_sampling_candidates()` with the CPU reference — cutting sampling latency **~6.7×** (`312 µs → 46 µs`) while remaining **100% bit-exact** (identical tokens, RNG states, and speculative acceptance).
+- **R21**: Added bounds-safe stack fast paths + automatic heap fallbacks in `CPUThreadPool::vec_dot_row` / `run_moe_experts`, chunked `run_moe_experts_grouped` in 128-token slices (fixing a latent `cnt > 64` stack overflow at `B = 128`!), and guarded `best_e >= 0` in GPU `k_router_topk` / `k_router_topk_batch`.
+- **R24**: Documented the `1e-6` tail floor applied when `min_p = 0.0`.
+
+### 6. Expanded 8-Gate `--verify-suite` (`src/model.cpp`, `src/main.cpp`)
+Extended `--verify-suite` with 5 new automated gates alongside Gates 1–3:
+- **Gate 4 (`R4`)**: Multi-chunk exact global attention under 6-VRAM-frame / 8-RAM-frame / SSD pressure (`B=1` & `B=7` vs. 100%-VRAM reference).
+- **Gate 5 (`R6`)**: Deterministic fault-injection testing spill write failure, SSD read failure, partial/short QD-16 read recovery, and ExpertCache SSD read failure.
+- **Gate 6 (`R8`)**: Bit-exact Quest extrema rollback parity across a 64-token page boundary with `±50.0` outlier rejected keys (both speculative partial accept and full draft rollback).
+- **Gate 7 (`R10`)**: Closed-form geometric-series verification of `MP_LIVE64` / `MP_TURN` on `B=128` prefill and `MP_ANSWER` / `MP_ANSWER8` on speculative commit.
+- **Gate 8 (`R14`)**: 200-trial bit-exact GPU vs. CPU sampling parity across 4 temperature/top-p/top-k/speculative regimes + latency comparison.
+
+---
+
+## Files Changed (v3.4)
+
+| File | Changes |
+|---|---|
+| `src/cuda_kernels.cuh`, `src/cuda_kernels.cu` | Added `k_attn_global_merge_chunk` / `k_attn_global_finalize` (R4), `k_kv_store` extrema snapshot + `k_quest_quantize_summary` (R8), `k_sample_prefilter` + `SamplePrefilterPacket` (R14), `k_router_topk[_batch]` `best_e >= 0` guard (R21) |
+| `src/paged_kv.h`, `src/paged_kv.cpp` | Per-slot `vram_pin_` + `attend_global_pages()` multi-chunk exact streaming (R4); checked SSD/RAM/VRAM I/O, atomic publish, error propagation & test fault hooks (R6); speculative & draft Quest extrema rollback + checkpoint `active_k_min/max` (R8) |
+| `src/expert_cache.h`, `src/expert_cache.cpp` | Checked SSD read error state (`io_error_`, `last_error_`), `bool` returns on `resolve_gpu_split` / `resolve_layer_experts` (no `ram_slot_ptr_[-1]` crash), test fault hooks (R6) |
+| `src/moe_predictor.h` | Added read-only `map()` / `total_experts()` accessors for Gate 7 verification (R10) |
+| `src/model.h`, `src/model.cpp` | Exact token-order `batch_pred_ids_` replay for batched prefill & speculative commit (R10), `sample_from_logits` GPU pre-filter + `sample_from_logits_cpu_ref` (R14), I/O error propagation into `GenResult::io_error` (R6), Gates 4–8 in `run_parity_suite()`, v3.4 banner |
+| `src/cpu_kernels.cpp` | Bounds-safe stack/heap fallback for `qx`, `qh`, `g_tmp`, and 128-element chunking in `run_moe_experts_grouped` (R21) |
+| `src/server.cpp` | Returns HTTP `500` (`storage_io_error`) or SSE error event cleanly on `res.io_error` (R6) |
+| `src/main.cpp` | Updated `--verify-suite` help description for Gates 1–8 |
+| `README.md`, `CHANGELOG.md`, `INKENGINE_OVERVIEW.txt` | Updated all documentation for v3.4 |
+
+---
+
+## Verification (v3.4)
+
+- **Build**: Clean compile with `build.bat sm_89` (CUDA 12.8 + MSVC x64 AVX2, zero warnings/errors).
+- **Test 1 — Full `F16` Golden `--verify` + All 8 Gates (`--ctx 4096 --kv-quant f16 --no-fp16-loop --verify --verify-suite`) — `exit 0` (ALL 8 GATES PASSED)**:
+  - Golden `--verify`: `29/29` tokenizer match, `"17 * 23 is 391."` (**100% EXACT MATCH**).
+  - Gate 1A & 1B: `L0_SWA_err=0.000001`, `B=128/32/7 cos=0.9988–0.9991`, all `top1=152914 MATCH`.
+  - Gate 2 (Speculative ON vs. OFF past `pos=1024`): **`96/96` exact (`77/77 = 100%`)**.
+  - Gate 3 (Turn-Rewind & Disk v3 Ckpt): both **`max|dlogit|=0.000000` (BIT-EXACT)**.
+  - Gate 4 (`R4` Multi-Chunk Exact, 6 VRAM / 8 RAM / SSD, `857` SSD reads, `84` SSD writes): **`B=1 err=0.000000 | B=7 err=0.000000`**.
+  - Gate 5 (`R6` Fault-Injected Checked I/O): **`spill_fail=PASS | read_fail=PASS | short_read=PASS | exp_ssd_fail=PASS`**.
+  - Gate 6 (`R8` Quest Rollback across 64-tok boundary): **`Spec partial rollback: BIT-EXACT | Draft full rollback: BIT-EXACT`**.
+  - Gate 7 (`R10` Predictor Bookkeeping): **`LIVE64=26736.01 (exp=26736.01)`, `TURN=49152 (exp=49152)`, `ANS=24576 (exp=24576)`, `ANS8=4608.66 (exp=4608.66)`**.
+  - Gate 8 (`R14` GPU Sampling Pre-Filter): **`200/200 BIT-EXACT`**, **`46.7 µs vs 312.3 µs = 6.69× faster`**.
+- **Test 2 — Production `Q4_0` All 8 Gates (`--ctx 4096 --kv-quant q4 --verify-suite`) — `exit 0` (ALL 8 GATES PASSED)**:
+  - Gate 1A/1B PASS, Gate 2 **`96/96` exact (`77/77 = 100%`)**, Gate 3 **`0.000000` BIT-EXACT**, Gate 4 **`B=1 err=0.000000 | B=7 err=0.000000`**, Gate 5 4/4 PASS, Gate 6 BIT-EXACT, Gate 7 EXACT, Gate 8 **`200/200 BIT-EXACT` (`46.3 µs vs 316.1 µs = 6.83× faster`)**.
+- **Test 3 — Tight-RAM 96 MiB R5 Stress (`--ram-mb 96 --no-preload-ram --verify`)**: `29` RAM slots, `"17 * 23 is 391."` (**100% EXACT MATCH**).
+- **Test 4 — Live HTTP Server Security/Timeout/Overflow/UTF-8/Vision Suite**: **15/15 PASS**.
+- **Test 5 — `inkcode.ps1` End-to-End + 64K Decode Speed Sanity (`--ctx 65536 --bench 128`)**:
+  - `inkcode start` ready in `19.7s`, `Vision=ON (0 MiB idle)`, `SWA 50.6 MiB`, clean stop.
+  - 64K decode benchmark: **`34.44 tok/s (29.03 ms/tok)`**, `93.1%` VRAM hit (`Core=98.0%, Outer=78.6%`), `18.02s` cold boot!
+
+---
+
 # Changelog / PR Notes — InkEngine v3.3 ("Correct & Safe" — Long-Context Parity, Security Hardening & Async Race Fixes)
 
 > **Suggested PR Title:** `v3.3: Fix SWA ring wrap, RAM pinning, silent global-KV page-table race, harden local HTTP API auth/timeouts/overflow/UTF-8, and add --verify-suite long-context parity gate`

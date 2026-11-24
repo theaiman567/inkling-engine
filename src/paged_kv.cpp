@@ -34,6 +34,16 @@ void HybridPagedKV::shutdown() {
     if (d_swa_bak_k_)      { cudaFree(d_swa_bak_k_);      d_swa_bak_k_ = nullptr; }
     if (d_swa_bak_v_)      { cudaFree(d_swa_bak_v_);      d_swa_bak_v_ = nullptr; }
     if (d_swa_bak_pos_)    { cudaFree(d_swa_bak_pos_);    d_swa_bak_pos_ = nullptr; }
+    if (d_quest_spec_min_) { cudaFree(d_quest_spec_min_); d_quest_spec_min_ = nullptr; }
+    if (d_quest_spec_max_) { cudaFree(d_quest_spec_max_); d_quest_spec_max_ = nullptr; }
+    if (d_quest_draft_min_)    { cudaFree(d_quest_draft_min_);    d_quest_draft_min_ = nullptr; }
+    if (d_quest_draft_max_)    { cudaFree(d_quest_draft_max_);    d_quest_draft_max_ = nullptr; }
+    if (d_quest_draft_q8_min_) { cudaFree(d_quest_draft_q8_min_); d_quest_draft_q8_min_ = nullptr; }
+    if (d_quest_draft_q8_max_) { cudaFree(d_quest_draft_q8_max_); d_quest_draft_q8_max_ = nullptr; }
+    if (d_quest_draft_sc_)     { cudaFree(d_quest_draft_sc_);     d_quest_draft_sc_ = nullptr; }
+    if (d_chunk_out_)      { cudaFree(d_chunk_out_);      d_chunk_out_ = nullptr; }
+    if (d_chunk_ml_)       { cudaFree(d_chunk_ml_);       d_chunk_ml_ = nullptr; }
+    chunk_acc_cap_b_ = 0;
 
     if (h_page_k_ptrs_)    { cudaFreeHost(h_page_k_ptrs_);    h_page_k_ptrs_ = nullptr; }
     if (h_page_v_ptrs_)    { cudaFreeHost(h_page_v_ptrs_);    h_page_v_ptrs_ = nullptr; }
@@ -72,7 +82,8 @@ bool HybridPagedKV::init(
     size_t vram_global_kv_bytes,
     size_t ram_global_kv_bytes,
     const std::string& ssd_swap_path,
-    int quest_top_pages)
+    int quest_top_pages,
+    bool allow_tiny_vram_for_test)
 {
     shutdown();
     n_layers_ = n_logical_layers;
@@ -110,9 +121,11 @@ bool HybridPagedKV::init(
 
     // 2. Fixed-size SWA ring buffers in VRAM (swa_window + 128 physical slots so batched prefill/verify NEVER overwrites live keys!)
     size_t swa_layer_bytes = (size_t)swa_ring_cap_ * tok_k_bytes_;
-    INK_CUDA_CHECK(cudaMalloc(&d_swa_k_, (size_t)n_swa_layers_ * swa_layer_bytes));
-    INK_CUDA_CHECK(cudaMalloc(&d_swa_v_, (size_t)n_swa_layers_ * swa_layer_bytes));
-    INK_CUDA_CHECK(cudaMalloc(&d_swa_pos_, (size_t)n_swa_layers_ * swa_ring_cap_ * sizeof(int32_t)));
+    if (n_swa_layers_ > 0) {
+        INK_CUDA_CHECK(cudaMalloc(&d_swa_k_, (size_t)n_swa_layers_ * swa_layer_bytes));
+        INK_CUDA_CHECK(cudaMalloc(&d_swa_v_, (size_t)n_swa_layers_ * swa_layer_bytes));
+        INK_CUDA_CHECK(cudaMalloc(&d_swa_pos_, (size_t)n_swa_layers_ * swa_ring_cap_ * sizeof(int32_t)));
+    }
     swa_counts_.assign(n_swa_layers_, 0);
 
     // 3. Global Paged KV pools
@@ -121,20 +134,25 @@ bool HybridPagedKV::init(
 
     // Cap VRAM pages at total_max_pages so we never waste VRAM when max_ctx is small!
     int want_vram_pages = (int)(vram_global_kv_bytes / page_full_bytes_);
-    int min_vram_pages = n_glob_layers_ * (quest_top_pages_ + 24);
-    if (want_vram_pages < std::min(total_max_pages, min_vram_pages)) {
-        want_vram_pages = std::min(total_max_pages, min_vram_pages);
+    if (allow_tiny_vram_for_test) {
+        vram_page_cap_ = std::max(1, std::min(total_max_pages, want_vram_pages));
+    } else {
+        int min_vram_pages = n_glob_layers_ * (quest_top_pages_ + 24);
+        if (want_vram_pages < std::min(total_max_pages, min_vram_pages)) {
+            want_vram_pages = std::min(total_max_pages, min_vram_pages);
+        }
+        vram_page_cap_ = std::min(total_max_pages, std::max(want_vram_pages, n_glob_layers_ * 32));
     }
-    vram_page_cap_ = std::min(total_max_pages, std::max(want_vram_pages, n_glob_layers_ * 32));
 
     INK_CUDA_CHECK(cudaMalloc(&d_vram_pages_, (size_t)vram_page_cap_ * page_full_bytes_));
     vram_owner_.assign(vram_page_cap_, {-1, -1});
+    vram_pin_.assign(vram_page_cap_, 0);
 
     // Only allocate RAM KV pool if max_ctx exceeds VRAM page capacity!
     int overflow_pages = std::max(0, total_max_pages - vram_page_cap_);
     if (overflow_pages > 0 && ram_global_kv_bytes >= page_full_bytes_) {
         ram_page_cap_ = std::min(overflow_pages, (int)(ram_global_kv_bytes / page_full_bytes_));
-        if (ram_page_cap_ < 64) ram_page_cap_ = std::min(overflow_pages, 64);
+        if (!allow_tiny_vram_for_test && ram_page_cap_ < 64) ram_page_cap_ = std::min(overflow_pages, 64);
         h_ram_pages_ = (uint8_t*)VirtualAlloc(nullptr, (size_t)ram_page_cap_ * page_full_bytes_,
                                               MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         if (!h_ram_pages_) ram_page_cap_ = 0;
@@ -159,6 +177,14 @@ bool HybridPagedKV::init(
         INK_CUDA_CHECK(cudaMalloc(&d_quest_topk_ids_, (size_t)max_pages_per_layer_ * sizeof(int32_t)));
         INK_CUDA_CHECK(cudaHostAlloc(&h_quest_scores_,   (size_t)max_pages_per_layer_ * sizeof(float), cudaHostAllocDefault));
         INK_CUDA_CHECK(cudaHostAlloc(&h_quest_topk_ids_, (size_t)max_pages_per_layer_ * sizeof(int32_t), cudaHostAllocDefault));
+        // R8 (SR3-07): Speculative & draft Quest extrema rollback buffers (~600 KB VRAM)
+        INK_CUDA_CHECK(cudaMalloc(&d_quest_spec_min_,     (size_t)SPEC_MAX_B * act_elems * sizeof(float)));
+        INK_CUDA_CHECK(cudaMalloc(&d_quest_spec_max_,     (size_t)SPEC_MAX_B * act_elems * sizeof(float)));
+        INK_CUDA_CHECK(cudaMalloc(&d_quest_draft_min_,    act_elems * sizeof(float)));
+        INK_CUDA_CHECK(cudaMalloc(&d_quest_draft_max_,    act_elems * sizeof(float)));
+        INK_CUDA_CHECK(cudaMalloc(&d_quest_draft_q8_min_, act_elems * sizeof(int8_t)));
+        INK_CUDA_CHECK(cudaMalloc(&d_quest_draft_q8_max_, act_elems * sizeof(int8_t)));
+        INK_CUDA_CHECK(cudaMalloc(&d_quest_draft_sc_,     (size_t)n_glob_layers_ * n_head_kv_ * sizeof(float)));
     }
 
     pages_.assign(n_glob_layers_, std::vector<PageMeta>(max_pages_per_layer_));
@@ -176,9 +202,11 @@ bool HybridPagedKV::init(
 
     // Speculative verification rollback buffers (23 MiB ShortConv history + 0.27 MiB SWA slot backup)
     INK_CUDA_CHECK(cudaMalloc(&d_conv_spec_,   (size_t)SPEC_MAX_B * (size_t)n_layers_ * conv_layer_floats_ * sizeof(float)));
-    INK_CUDA_CHECK(cudaMalloc(&d_swa_bak_k_,   (size_t)n_swa_layers_ * (size_t)SPEC_MAX_B * tok_k_bytes_));
-    INK_CUDA_CHECK(cudaMalloc(&d_swa_bak_v_,   (size_t)n_swa_layers_ * (size_t)SPEC_MAX_B * tok_k_bytes_));
-    INK_CUDA_CHECK(cudaMalloc(&d_swa_bak_pos_, (size_t)n_swa_layers_ * (size_t)SPEC_MAX_B * sizeof(int32_t)));
+    if (n_swa_layers_ > 0) {
+        INK_CUDA_CHECK(cudaMalloc(&d_swa_bak_k_,   (size_t)n_swa_layers_ * (size_t)SPEC_MAX_B * tok_k_bytes_));
+        INK_CUDA_CHECK(cudaMalloc(&d_swa_bak_v_,   (size_t)n_swa_layers_ * (size_t)SPEC_MAX_B * tok_k_bytes_));
+        INK_CUDA_CHECK(cudaMalloc(&d_swa_bak_pos_, (size_t)n_swa_layers_ * (size_t)SPEC_MAX_B * sizeof(int32_t)));
+    }
 
     INK_CUDA_CHECK(cudaHostAlloc(&h_page_k_ptrs_, (size_t)total_max_pages * sizeof(uint64_t), cudaHostAllocDefault));
     INK_CUDA_CHECK(cudaHostAlloc(&h_page_v_ptrs_, (size_t)total_max_pages * sizeof(uint64_t), cudaHostAllocDefault));
@@ -214,6 +242,7 @@ void HybridPagedKV::reset() {
     }
     std::fill(swa_counts_.begin(), swa_counts_.end(), 0);
     std::fill(vram_owner_.begin(), vram_owner_.end(), std::make_pair(-1, -1));
+    std::fill(vram_pin_.begin(), vram_pin_.end(), (uint8_t)0);
     std::fill(ram_owner_.begin(), ram_owner_.end(), std::make_pair(-1, -1));
     std::fill(ram_lru_.begin(), ram_lru_.end(), 0);
     for (int g = 0; g < n_glob_layers_; ++g) {
@@ -223,6 +252,10 @@ void HybridPagedKV::reset() {
     next_ssd_slot_ = 0;
     cur_pos_ = 0;
     clock_ = 0;
+    spec_recording_ = false;
+    draft_saved_page_ = -1;
+    io_error_ = false;
+    last_error_.clear();
     reset_epoch_++;
 }
 
@@ -295,10 +328,17 @@ void HybridPagedKV::save_checkpoint(KVCheckpoint& ckpt, int pos, cudaStream_t st
             size_t s_dst = (size_t)g * n_pages * n_head_kv_;
             INK_CUDA_CHECK(cudaMemcpy(ckpt.k_scales.data() + s_dst, d_k_scales_ + s_src, (size_t)n_pages * n_head_kv_ * sizeof(float), cudaMemcpyDeviceToHost));
         }
+        size_t act_elems = (size_t)n_glob_layers_ * kd;
+        ckpt.active_k_min.resize(act_elems);
+        ckpt.active_k_max.resize(act_elems);
+        INK_CUDA_CHECK(cudaMemcpy(ckpt.active_k_min.data(), d_active_k_min_, act_elems * sizeof(float), cudaMemcpyDeviceToHost));
+        INK_CUDA_CHECK(cudaMemcpy(ckpt.active_k_max.data(), d_active_k_max_, act_elems * sizeof(float), cudaMemcpyDeviceToHost));
     } else {
         ckpt.k_mins_q8.clear();
         ckpt.k_maxs_q8.clear();
         ckpt.k_scales.clear();
+        ckpt.active_k_min.clear();
+        ckpt.active_k_max.clear();
     }
 }
 
@@ -354,6 +394,10 @@ bool HybridPagedKV::restore_checkpoint(const KVCheckpoint& ckpt, cudaStream_t st
             size_t s_src = (size_t)g * n_pages * n_head_kv_;
             INK_CUDA_CHECK(cudaMemcpyAsync(d_k_scales_ + s_dst, ckpt.k_scales.data() + s_src, (size_t)n_pages * n_head_kv_ * sizeof(float), cudaMemcpyHostToDevice, stream));
         }
+    }
+    if (d_active_k_min_ && d_active_k_max_ && !ckpt.active_k_min.empty() && ckpt.active_k_min.size() == ckpt.active_k_max.size()) {
+        INK_CUDA_CHECK(cudaMemcpyAsync(d_active_k_min_, ckpt.active_k_min.data(), ckpt.active_k_min.size() * sizeof(float), cudaMemcpyHostToDevice, stream));
+        INK_CUDA_CHECK(cudaMemcpyAsync(d_active_k_max_, ckpt.active_k_max.data(), ckpt.active_k_max.size() * sizeof(float), cudaMemcpyHostToDevice, stream));
     }
     cur_pos_ = ckpt.pos;
     INK_CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -755,16 +799,76 @@ float* HybridPagedKV::conv_spec_ptr(int il, int channel_offset) const {
     return d_conv_spec_ + (size_t)il * conv_layer_floats_ + (size_t)channel_offset * 3;
 }
 
+void HybridPagedKV::set_io_error(const char* msg) {
+    io_error_ = true;
+    last_error_ = msg ? msg : "PagedKV I/O error";
+    std::fprintf(stderr, "[PagedKV] I/O ERROR: %s\n", last_error_.c_str());
+}
+
+bool HybridPagedKV::ensure_chunk_accum(int B) {
+    if (B <= chunk_acc_cap_b_ && d_chunk_out_ && d_chunk_ml_) return true;
+    if (d_chunk_out_) { cudaFree(d_chunk_out_); d_chunk_out_ = nullptr; }
+    if (d_chunk_ml_)  { cudaFree(d_chunk_ml_);  d_chunk_ml_  = nullptr; }
+    chunk_acc_cap_b_ = 0;
+    int cap_b = std::max(B, 16);
+    if (cudaMalloc(&d_chunk_out_, (size_t)cap_b * (size_t)n_head_ * (size_t)head_dim_ * sizeof(float)) != cudaSuccess) {
+        return false;
+    }
+    if (cudaMalloc(&d_chunk_ml_, (size_t)cap_b * (size_t)n_head_ * 2 * sizeof(float)) != cudaSuccess) {
+        cudaFree(d_chunk_out_);
+        d_chunk_out_ = nullptr;
+        return false;
+    }
+    chunk_acc_cap_b_ = cap_b;
+    return true;
+}
+
+void HybridPagedKV::unpin_vram_slots(const std::vector<int>& slots) {
+    for (int s : slots) {
+        if (s >= 0 && s < vram_page_cap_ && vram_pin_[s] > 0) {
+            vram_pin_[s]--;
+        }
+    }
+}
+
+bool HybridPagedKV::copy_quest_page_summary(
+    int g, int p, std::vector<int8_t>& kmin, std::vector<int8_t>& kmax,
+    std::vector<float>& ksc, std::vector<float>& act_min, std::vector<float>& act_max,
+    cudaStream_t stream) const
+{
+    if (!d_k_mins_q8_ || !d_k_maxs_q8_ || !d_k_scales_ || !d_active_k_min_ || !d_active_k_max_) return false;
+    if (g < 0 || g >= n_glob_layers_ || p < 0 || p >= max_pages_per_layer_) return false;
+    INK_CUDA_CHECK(cudaStreamSynchronize(stream));
+    size_t kd = (size_t)n_head_kv_ * (size_t)head_dim_;
+    size_t sum_off = ((size_t)g * (size_t)max_pages_per_layer_ + (size_t)p) * kd;
+    size_t sc_off  = ((size_t)g * (size_t)max_pages_per_layer_ + (size_t)p) * (size_t)n_head_kv_;
+    kmin.resize(kd);
+    kmax.resize(kd);
+    ksc.resize(n_head_kv_);
+    act_min.resize(kd);
+    act_max.resize(kd);
+    INK_CUDA_CHECK(cudaMemcpy(kmin.data(),    d_k_mins_q8_ + sum_off, kd * sizeof(int8_t), cudaMemcpyDeviceToHost));
+    INK_CUDA_CHECK(cudaMemcpy(kmax.data(),    d_k_maxs_q8_ + sum_off, kd * sizeof(int8_t), cudaMemcpyDeviceToHost));
+    INK_CUDA_CHECK(cudaMemcpy(ksc.data(),     d_k_scales_  + sc_off,  (size_t)n_head_kv_ * sizeof(float), cudaMemcpyDeviceToHost));
+    INK_CUDA_CHECK(cudaMemcpy(act_min.data(), d_active_k_min_ + (size_t)g * kd, kd * sizeof(float), cudaMemcpyDeviceToHost));
+    INK_CUDA_CHECK(cudaMemcpy(act_max.data(), d_active_k_max_ + (size_t)g * kd, kd * sizeof(float), cudaMemcpyDeviceToHost));
+    return true;
+}
+
 void HybridPagedKV::begin_spec_verify(int pos0, int B, cudaStream_t stream) {
     spec_pos0_ = pos0;
     spec_B_    = B;
-    ink_cuda_swa_spec_backup_restore(
-        d_swa_k_, d_swa_v_, d_swa_pos_,
-        d_swa_bak_k_, d_swa_bak_v_, d_swa_bak_pos_,
-        n_swa_layers_, swa_ring_cap_, pos0, 0, B, SPEC_MAX_B, tok_k_bytes_, /*is_restore=*/false, stream);
+    spec_recording_ = true;
+    if (n_swa_layers_ > 0) {
+        ink_cuda_swa_spec_backup_restore(
+            d_swa_k_, d_swa_v_, d_swa_pos_,
+            d_swa_bak_k_, d_swa_bak_v_, d_swa_bak_pos_,
+            n_swa_layers_, swa_ring_cap_, pos0, 0, B, SPEC_MAX_B, tok_k_bytes_, /*is_restore=*/false, stream);
+    }
 }
 
 void HybridPagedKV::commit_spec_verify(int accepted, cudaStream_t stream) {
+    spec_recording_ = false;
     if (accepted <= 0 || accepted > spec_B_) return;
     int new_pos = spec_pos0_ + accepted;
 
@@ -778,13 +882,15 @@ void HybridPagedKV::commit_spec_verify(int accepted, cudaStream_t stream) {
             cudaMemcpyDeviceToDevice, stream));
 
         // 2. Restore rejected SWA ring slots [accepted .. spec_B_ - 1] cleanly (0.002 ms!)
-        ink_cuda_swa_spec_backup_restore(
-            d_swa_k_, d_swa_v_, d_swa_pos_,
-            d_swa_bak_k_, d_swa_bak_v_, d_swa_bak_pos_,
-            n_swa_layers_, swa_ring_cap_, spec_pos0_, accepted, spec_B_, SPEC_MAX_B,
-            tok_k_bytes_, /*is_restore=*/true, stream);
-        for (int si = 0; si < n_swa_layers_; ++si) {
-            swa_counts_[si] = std::min(swa_ring_cap_, new_pos);
+        if (n_swa_layers_ > 0) {
+            ink_cuda_swa_spec_backup_restore(
+                d_swa_k_, d_swa_v_, d_swa_pos_,
+                d_swa_bak_k_, d_swa_bak_v_, d_swa_bak_pos_,
+                n_swa_layers_, swa_ring_cap_, spec_pos0_, accepted, spec_B_, SPEC_MAX_B,
+                tok_k_bytes_, /*is_restore=*/true, stream);
+            for (int si = 0; si < n_swa_layers_; ++si) {
+                swa_counts_[si] = std::min(swa_ring_cap_, new_pos);
+            }
         }
 
         // 3. Truncate Global KV pages back to exact `new_pos`
@@ -810,6 +916,23 @@ void HybridPagedKV::commit_spec_verify(int accepted, cudaStream_t stream) {
             }
             glob_num_pages_[g] = std::min(cur_np, last_p + 1);
         }
+
+        // 4. R8 (SR3-07): Restore exact FP32 Quest extrema at post-token-(accepted-1) & re-quantize `last_p`!
+        if (d_k_mins_q8_ && d_quest_spec_min_ && d_quest_spec_max_ && (accepted - 1) < SPEC_MAX_B) {
+            size_t act_elems = (size_t)n_glob_layers_ * (size_t)n_head_kv_ * (size_t)head_dim_;
+            size_t t_acc = (size_t)(accepted - 1);
+            INK_CUDA_CHECK(cudaMemcpyAsync(
+                d_active_k_min_, d_quest_spec_min_ + t_acc * act_elems,
+                act_elems * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+            INK_CUDA_CHECK(cudaMemcpyAsync(
+                d_active_k_max_, d_quest_spec_max_ + t_acc * act_elems,
+                act_elems * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+            ink_cuda_quest_quantize_summary(
+                d_active_k_min_, d_active_k_max_,
+                d_k_mins_q8_, d_k_maxs_q8_, d_k_scales_,
+                n_glob_layers_, max_pages_per_layer_, last_p,
+                n_head_kv_, head_dim_, stream);
+        }
     }
     cur_pos_ = new_pos;
 }
@@ -823,10 +946,29 @@ void HybridPagedKV::begin_draft_snapshot(int pos0, int max_k, cudaStream_t strea
         total_conv * sizeof(float),
         cudaMemcpyDeviceToDevice, stream));
     // Backup SWA slots [pos0 .. pos0 + max_k - 1]
-    ink_cuda_swa_spec_backup_restore(
-        d_swa_k_, d_swa_v_, d_swa_pos_,
-        d_swa_bak_k_, d_swa_bak_v_, d_swa_bak_pos_,
-        n_swa_layers_, swa_ring_cap_, pos0, 0, max_k, SPEC_MAX_B, tok_k_bytes_, /*is_restore=*/false, stream);
+    if (n_swa_layers_ > 0) {
+        ink_cuda_swa_spec_backup_restore(
+            d_swa_k_, d_swa_v_, d_swa_pos_,
+            d_swa_bak_k_, d_swa_bak_v_, d_swa_bak_pos_,
+            n_swa_layers_, swa_ring_cap_, pos0, 0, max_k, SPEC_MAX_B, tok_k_bytes_, /*is_restore=*/false, stream);
+    }
+    // R8 (SR3-07): Snapshot pre-draft Quest FP32 active extrema & boundary page Q8 summary!
+    draft_saved_page_ = -1;
+    if (d_k_mins_q8_ && d_quest_draft_min_ && pos0 > 0) {
+        int p_prev = (pos0 - 1) / INK_PAGE_TOKENS;
+        draft_saved_page_ = p_prev;
+        size_t kd = (size_t)n_head_kv_ * (size_t)head_dim_;
+        size_t act_elems = (size_t)n_glob_layers_ * kd;
+        INK_CUDA_CHECK(cudaMemcpyAsync(d_quest_draft_min_, d_active_k_min_, act_elems * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+        INK_CUDA_CHECK(cudaMemcpyAsync(d_quest_draft_max_, d_active_k_max_, act_elems * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+        for (int g = 0; g < n_glob_layers_; ++g) {
+            size_t sum_off = ((size_t)g * (size_t)max_pages_per_layer_ + (size_t)p_prev) * kd;
+            size_t sc_off  = ((size_t)g * (size_t)max_pages_per_layer_ + (size_t)p_prev) * (size_t)n_head_kv_;
+            INK_CUDA_CHECK(cudaMemcpyAsync(d_quest_draft_q8_min_ + (size_t)g * kd, d_k_mins_q8_ + sum_off, kd * sizeof(int8_t), cudaMemcpyDeviceToDevice, stream));
+            INK_CUDA_CHECK(cudaMemcpyAsync(d_quest_draft_q8_max_ + (size_t)g * kd, d_k_maxs_q8_ + sum_off, kd * sizeof(int8_t), cudaMemcpyDeviceToDevice, stream));
+            INK_CUDA_CHECK(cudaMemcpyAsync(d_quest_draft_sc_ + (size_t)g * n_head_kv_, d_k_scales_ + sc_off, (size_t)n_head_kv_ * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+        }
+    }
 }
 
 void HybridPagedKV::rollback_draft_snapshot(int pos0, int drafted, cudaStream_t stream) {
@@ -837,12 +979,14 @@ void HybridPagedKV::rollback_draft_snapshot(int pos0, int drafted, cudaStream_t 
         d_conv_spec_ + (size_t)(SPEC_MAX_B - 1) * total_conv,
         total_conv * sizeof(float),
         cudaMemcpyDeviceToDevice, stream));
-    ink_cuda_swa_spec_backup_restore(
-        d_swa_k_, d_swa_v_, d_swa_pos_,
-        d_swa_bak_k_, d_swa_bak_v_, d_swa_bak_pos_,
-        n_swa_layers_, swa_ring_cap_, pos0, 0, drafted, SPEC_MAX_B, tok_k_bytes_, /*is_restore=*/true, stream);
-    for (int si = 0; si < n_swa_layers_; ++si) {
-        swa_counts_[si] = std::min(swa_ring_cap_, pos0);
+    if (n_swa_layers_ > 0) {
+        ink_cuda_swa_spec_backup_restore(
+            d_swa_k_, d_swa_v_, d_swa_pos_,
+            d_swa_bak_k_, d_swa_bak_v_, d_swa_bak_pos_,
+            n_swa_layers_, swa_ring_cap_, pos0, 0, drafted, SPEC_MAX_B, tok_k_bytes_, /*is_restore=*/true, stream);
+        for (int si = 0; si < n_swa_layers_; ++si) {
+            swa_counts_[si] = std::min(swa_ring_cap_, pos0);
+        }
     }
     if (pos0 > 0) {
         int last_p = (pos0 - 1) / INK_PAGE_TOKENS;
@@ -867,7 +1011,22 @@ void HybridPagedKV::rollback_draft_snapshot(int pos0, int drafted, cudaStream_t 
             }
             glob_num_pages_[g] = std::min(cur_np, last_p + 1);
         }
+        // R8 (SR3-07): Restore pre-draft Quest FP32 active extrema & boundary page Q8 summary!
+        if (d_k_mins_q8_ && d_quest_draft_min_ && draft_saved_page_ == last_p) {
+            size_t kd = (size_t)n_head_kv_ * (size_t)head_dim_;
+            size_t act_elems = (size_t)n_glob_layers_ * kd;
+            INK_CUDA_CHECK(cudaMemcpyAsync(d_active_k_min_, d_quest_draft_min_, act_elems * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+            INK_CUDA_CHECK(cudaMemcpyAsync(d_active_k_max_, d_quest_draft_max_, act_elems * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+            for (int g = 0; g < n_glob_layers_; ++g) {
+                size_t sum_off = ((size_t)g * (size_t)max_pages_per_layer_ + (size_t)last_p) * kd;
+                size_t sc_off  = ((size_t)g * (size_t)max_pages_per_layer_ + (size_t)last_p) * (size_t)n_head_kv_;
+                INK_CUDA_CHECK(cudaMemcpyAsync(d_k_mins_q8_ + sum_off, d_quest_draft_q8_min_ + (size_t)g * kd, kd * sizeof(int8_t), cudaMemcpyDeviceToDevice, stream));
+                INK_CUDA_CHECK(cudaMemcpyAsync(d_k_maxs_q8_ + sum_off, d_quest_draft_q8_max_ + (size_t)g * kd, kd * sizeof(int8_t), cudaMemcpyDeviceToDevice, stream));
+                INK_CUDA_CHECK(cudaMemcpyAsync(d_k_scales_  + sc_off,  d_quest_draft_sc_ + (size_t)g * n_head_kv_, (size_t)n_head_kv_ * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+            }
+        }
     }
+    draft_saved_page_ = -1;
     cur_pos_ = pos0;
 }
 
@@ -889,6 +1048,11 @@ bool HybridPagedKV::ensure_ssd_file() {
 }
 
 bool HybridPagedKV::ssd_pwrite_sync(uint64_t offset, const void* src, size_t nbytes) {
+    if (test_fail_write_after_ == 0) {
+        test_fail_write_after_ = -1;
+        return false;
+    }
+    if (test_fail_write_after_ > 0) test_fail_write_after_--;
     if (!ensure_ssd_file()) return false;
     HANDLE h = (HANDLE)h_ssd_file_;
     HANDLE ev = (HANDLE)ssd_sync_event_;
@@ -905,6 +1069,7 @@ bool HybridPagedKV::ssd_pwrite_sync(uint64_t offset, const void* src, size_t nby
             if (GetLastError() != ERROR_IO_PENDING) return false;
             if (!GetOverlappedResult(h, &ov, &written, TRUE)) return false;
         }
+        if (written == 0) return false;
         ptr += written;
         offset += written;
         nbytes -= written;
@@ -913,12 +1078,21 @@ bool HybridPagedKV::ssd_pwrite_sync(uint64_t offset, const void* src, size_t nby
 }
 
 bool HybridPagedKV::ssd_pread_sync(uint64_t offset, void* dst, size_t nbytes) {
+    if (test_fail_read_after_ == 0) {
+        test_fail_read_after_ = -1;
+        return false;
+    }
+    if (test_fail_read_after_ > 0) test_fail_read_after_--;
     if (!h_ssd_file_ || h_ssd_file_ == INVALID_HANDLE_VALUE) return false;
     HANDLE h = (HANDLE)h_ssd_file_;
     HANDLE ev = (HANDLE)ssd_sync_event_;
     uint8_t* ptr = (uint8_t*)dst;
     while (nbytes > 0) {
         DWORD chunk = (DWORD)std::min<size_t>(nbytes, 64ull * 1024 * 1024);
+        if (test_short_read_once_ && chunk > 64) {
+            chunk /= 2;
+            test_short_read_once_ = false;
+        }
         OVERLAPPED ov{};
         ov.Offset     = (DWORD)(offset & 0xFFFFFFFFull);
         ov.OffsetHigh = (DWORD)(offset >> 32);
@@ -937,27 +1111,46 @@ bool HybridPagedKV::ssd_pread_sync(uint64_t offset, void* dst, size_t nbytes) {
     return true;
 }
 
-void HybridPagedKV::spill_ram_to_ssd(int g, int p, int rslot) {
-    if (!ensure_ssd_file()) return;
+bool HybridPagedKV::spill_ram_to_ssd(int g, int p, int rslot) {
     PageMeta& pm = pages_[g][p];
-    if (pm.ssd_slot < 0) pm.ssd_slot = next_ssd_slot_++;
-    if (!pm.dirty) return;
-
-    uint64_t off = (uint64_t)pm.ssd_slot * page_full_bytes_;
-    ssd_pwrite_sync(off, h_ram_pages_ + (size_t)rslot * page_full_bytes_, page_full_bytes_);
+    if (!pm.dirty && pm.ssd_slot >= 0) return true;
+    if (!ensure_ssd_file()) {
+        set_io_error("Failed to open/create NVMe KV swap file for RAM spill");
+        return false;
+    }
+    int target_ssd = (pm.ssd_slot >= 0) ? pm.ssd_slot : next_ssd_slot_;
+    uint64_t off = (uint64_t)target_ssd * page_full_bytes_;
+    if (!ssd_pwrite_sync(off, h_ram_pages_ + (size_t)rslot * page_full_bytes_, page_full_bytes_)) {
+        set_io_error("Short or failed NVMe KV swap write while spilling RAM page (keeping RAM copy intact)");
+        return false;
+    }
+    if (pm.ssd_slot < 0) {
+        pm.ssd_slot = target_ssd;
+        next_ssd_slot_ = target_ssd + 1;
+    }
     pm.dirty = false;
     stat_ssd_writes_++;
+    return true;
 }
 
-void HybridPagedKV::read_ssd_to_ram(int g, int p, int rslot) {
+bool HybridPagedKV::read_ssd_to_ram(int g, int p, int rslot) {
     PageMeta& pm = pages_[g][p];
+    if (pm.ssd_slot < 0) {
+        set_io_error("Attempted SSD KV read on page without valid ssd_slot");
+        return false;
+    }
     uint64_t off = (uint64_t)pm.ssd_slot * page_full_bytes_;
-    ssd_pread_sync(off, h_ram_pages_ + (size_t)rslot * page_full_bytes_, page_full_bytes_);
+    if (!ssd_pread_sync(off, h_ram_pages_ + (size_t)rslot * page_full_bytes_, page_full_bytes_)) {
+        set_io_error("Short or failed NVMe KV swap read into RAM");
+        return false;
+    }
     stat_ssd_reads_++;
+    return true;
 }
 
 int HybridPagedKV::alloc_ram_page_slot(int& evicted_g, int& evicted_p) {
     evicted_g = -1; evicted_p = -1;
+    if (ram_page_cap_ <= 0 || !h_ram_pages_) return -1;
     int best = 0;
     uint64_t oldest = UINT64_MAX;
     for (int s = 0; s < ram_page_cap_; ++s) {
@@ -966,7 +1159,12 @@ int HybridPagedKV::alloc_ram_page_slot(int& evicted_g, int& evicted_p) {
     }
     evicted_g = ram_owner_[best].first;
     evicted_p = ram_owner_[best].second;
-    spill_ram_to_ssd(evicted_g, evicted_p, best);
+    // R6 (SR3-03): Keep the last valid RAM copy intact if SSD spill fails!
+    if (!spill_ram_to_ssd(evicted_g, evicted_p, best)) {
+        evicted_g = -1;
+        evicted_p = -1;
+        return -1;
+    }
     pages_[evicted_g][evicted_p].tier = TIER_SSD;
     pages_[evicted_g][evicted_p].slot = pages_[evicted_g][evicted_p].ssd_slot;
     ram_owner_[best] = {-1, -1};
@@ -976,47 +1174,90 @@ int HybridPagedKV::alloc_ram_page_slot(int& evicted_g, int& evicted_p) {
 int HybridPagedKV::alloc_vram_page_slot(int protect_g, int protect_recent_start, cudaStream_t stream) {
     int best = -1;
     uint64_t oldest = UINT64_MAX;
+    // Pass 1: Prefer unpinned, non-sink, non-recent, non-active-append frames
     for (int s = 0; s < vram_page_cap_; ++s) {
+        if (vram_pin_[s] > 0) continue;
         auto [og, op] = vram_owner_[s];
         if (og == -1) return s;
-        // Never evict sink pages [0..1] or recent relative-bias window of current layer
         if (op < 2) continue;
         if (og == protect_g && op >= protect_recent_start) continue;
-        // Also avoid evicting the active append page of any layer
         if (op >= glob_num_pages_[og] - 2) continue;
         uint64_t lu = pages_[og][op].last_use;
         if (lu < oldest) { oldest = lu; best = s; }
     }
-    if (best < 0) best = 0;
+    // Pass 2 (R4): Under tight VRAM pressure, pick oldest UNPINNED frame (preferring other layers first)
+    if (best < 0) {
+        uint64_t oldest_other = UINT64_MAX;
+        int best_other = -1;
+        for (int s = 0; s < vram_page_cap_; ++s) {
+            if (vram_pin_[s] > 0) continue;
+            auto [og, op] = vram_owner_[s];
+            if (og == -1) return s;
+            uint64_t lu = pages_[og][op].last_use;
+            if (og != protect_g) {
+                if (lu < oldest_other) { oldest_other = lu; best_other = s; }
+            }
+            if (lu < oldest) { oldest = lu; best = s; }
+        }
+        if (best_other >= 0) best = best_other;
+    }
+    if (best < 0) {
+        set_io_error("All VRAM KV page frames are pinned; cannot allocate frame");
+        return -1;
+    }
 
     auto [og, op] = vram_owner_[best];
     PageMeta& old_pm = pages_[og][op];
 
-    // Copy evicted VRAM page down to Tier-1 RAM (or directly to Tier-2 SSD if RAM cap == 0)
+    // Copy evicted VRAM page down to Tier-1 RAM (or directly to Tier-2 SSD if RAM cap == 0).
+    // R6 (SR3-03): Never discard or overwrite the VRAM victim until destination spill succeeds!
     if (ram_page_cap_ > 0) {
         int eg, ep;
         int rslot = alloc_ram_page_slot(eg, ep);
-        INK_CUDA_CHECK(cudaMemcpyAsync(h_page_bounce_, d_vram_pages_ + (size_t)best * page_full_bytes_,
-                                       page_full_bytes_, cudaMemcpyDeviceToHost, stream));
-        INK_CUDA_CHECK(cudaStreamSynchronize(stream));
+        if (rslot < 0) {
+            return -1; // RAM spill failed -> leave VRAM victim intact!
+        }
+        if (cudaMemcpyAsync(h_page_bounce_, d_vram_pages_ + (size_t)best * page_full_bytes_,
+                            page_full_bytes_, cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
+            cudaStreamSynchronize(stream) != cudaSuccess) {
+            set_io_error("CUDA D2H copy failed while spilling VRAM KV page to RAM");
+            return -1;
+        }
         std::memcpy(h_ram_pages_ + (size_t)rslot * page_full_bytes_, h_page_bounce_, page_full_bytes_);
         ram_owner_[rslot] = {og, op};
         ram_lru_[rslot] = ++clock_;
         old_pm.tier = TIER_RAM;
         old_pm.slot = rslot;
-    } else if (ensure_ssd_file()) {
-        INK_CUDA_CHECK(cudaMemcpyAsync(h_page_bounce_, d_vram_pages_ + (size_t)best * page_full_bytes_,
-                                       page_full_bytes_, cudaMemcpyDeviceToHost, stream));
-        INK_CUDA_CHECK(cudaStreamSynchronize(stream));
-        if (old_pm.ssd_slot < 0) old_pm.ssd_slot = next_ssd_slot_++;
-        if (old_pm.dirty) {
-            uint64_t off = (uint64_t)old_pm.ssd_slot * page_full_bytes_;
-            ssd_pwrite_sync(off, h_page_bounce_, page_full_bytes_);
+    } else {
+        if (!old_pm.dirty && old_pm.ssd_slot >= 0) {
+            old_pm.tier = TIER_SSD;
+            old_pm.slot = old_pm.ssd_slot;
+        } else {
+            if (!ensure_ssd_file()) {
+                set_io_error("Failed to open/create NVMe KV swap file for direct VRAM spill");
+                return -1;
+            }
+            if (cudaMemcpyAsync(h_page_bounce_, d_vram_pages_ + (size_t)best * page_full_bytes_,
+                                page_full_bytes_, cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
+                cudaStreamSynchronize(stream) != cudaSuccess) {
+                set_io_error("CUDA D2H copy failed while spilling VRAM KV page to SSD");
+                return -1;
+            }
+            int target_ssd = (old_pm.ssd_slot >= 0) ? old_pm.ssd_slot : next_ssd_slot_;
+            uint64_t off = (uint64_t)target_ssd * page_full_bytes_;
+            if (!ssd_pwrite_sync(off, h_page_bounce_, page_full_bytes_)) {
+                set_io_error("Short or failed NVMe KV swap write during direct VRAM spill (keeping VRAM copy intact)");
+                return -1;
+            }
+            if (old_pm.ssd_slot < 0) {
+                old_pm.ssd_slot = target_ssd;
+                next_ssd_slot_ = target_ssd + 1;
+            }
             old_pm.dirty = false;
             stat_ssd_writes_++;
+            old_pm.tier = TIER_SSD;
+            old_pm.slot = old_pm.ssd_slot;
         }
-        old_pm.tier = TIER_SSD;
-        old_pm.slot = old_pm.ssd_slot;
     }
 
     vram_owner_[best] = {-1, -1};
@@ -1032,22 +1273,40 @@ int HybridPagedKV::ensure_page_in_vram(int g, int p, int protect_recent_start, c
     }
 
     int vslot = alloc_vram_page_slot(g, protect_recent_start, stream);
+    if (vslot < 0) return -1;
     uint8_t* vdst = d_vram_pages_ + (size_t)vslot * page_full_bytes_;
 
     if (pm.tier == TIER_RAM) {
         int rslot = pm.slot;
         std::memcpy(h_page_bounce_, h_ram_pages_ + (size_t)rslot * page_full_bytes_, page_full_bytes_);
-        INK_CUDA_CHECK(cudaMemcpyAsync(vdst, h_page_bounce_, page_full_bytes_, cudaMemcpyHostToDevice, stream));
+        if (cudaMemcpyAsync(vdst, h_page_bounce_, page_full_bytes_, cudaMemcpyHostToDevice, stream) != cudaSuccess ||
+            cudaStreamSynchronize(stream) != cudaSuccess) {
+            set_io_error("CUDA H2D copy failed loading KV page from RAM (keeping RAM copy intact)");
+            return -1;
+        }
         ram_owner_[rslot] = {-1, -1};
         stat_ram_hits_++;
     } else if (pm.tier == TIER_SSD) {
+        if (pm.ssd_slot < 0) {
+            set_io_error("SSD KV page missing valid ssd_slot");
+            return -1;
+        }
         uint64_t off = (uint64_t)pm.ssd_slot * page_full_bytes_;
-        ssd_pread_sync(off, h_page_bounce_, page_full_bytes_);
-        INK_CUDA_CHECK(cudaMemcpyAsync(vdst, h_page_bounce_, page_full_bytes_, cudaMemcpyHostToDevice, stream));
+        // R6 (SR3-03): Verify complete SSD read BEFORE DMA and BEFORE publishing to VRAM!
+        if (!ssd_pread_sync(off, h_page_bounce_, page_full_bytes_)) {
+            set_io_error("Short or failed NVMe KV swap read (keeping SSD page unpublished)");
+            return -1;
+        }
+        if (cudaMemcpyAsync(vdst, h_page_bounce_, page_full_bytes_, cudaMemcpyHostToDevice, stream) != cudaSuccess ||
+            cudaStreamSynchronize(stream) != cudaSuccess) {
+            set_io_error("CUDA H2D copy failed loading KV page from SSD");
+            return -1;
+        }
         stat_ssd_reads_++;
     }
     // Note: TIER_NONE means freshly allocated empty page (no copy needed!)
 
+    // Atomic publish ONLY after full read/copy succeeds!
     pm.tier = TIER_VRAM;
     pm.slot = vslot;
     pm.last_use = ++clock_;
@@ -1056,24 +1315,61 @@ int HybridPagedKV::ensure_page_in_vram(int g, int p, int protect_recent_start, c
 }
 
 // Async Queue-Depth-16 Overlapped NVMe Batch Fetch (hits full NVMe parallel IOPS at 256K-512K!)
-void HybridPagedKV::fetch_ssd_pages_batch(int g, const std::vector<int>& ssd_pids, int protect_recent_start, cudaStream_t stream) {
-    if (ssd_pids.empty() || !h_ssd_file_ || h_ssd_file_ == INVALID_HANDLE_VALUE) return;
+// R4 + R6: Pins each allocated VRAM slot (without premature publish!), completes partial reads,
+// and publishes ONLY after verified full-byte I/O + DMA succeed.
+bool HybridPagedKV::fetch_ssd_pages_batch(
+    int g, const std::vector<int>& ssd_pids, int protect_recent_start,
+    std::vector<int>& out_pinned_slots, cudaStream_t stream)
+{
+    if (ssd_pids.empty()) return true;
+    if (!h_ssd_file_ || h_ssd_file_ == INVALID_HANDLE_VALUE) {
+        set_io_error("NVMe KV swap file not open during batch fetch");
+        return false;
+    }
     HANDLE h = (HANDLE)h_ssd_file_;
     int total = (int)ssd_pids.size();
+    bool all_ok = true;
 
     for (int base = 0; base < total; base += SSD_ASYNC_QD) {
         int cnt = std::min(SSD_ASYNC_QD, total - base);
         int vslots[SSD_ASYNC_QD];
         OVERLAPPED ovs[SSD_ASYNC_QD];
         bool pending[SSD_ASYNC_QD];
+        bool req_ok[SSD_ASYNC_QD];
+        DWORD got_arr[SSD_ASYNC_QD];
+        int issued = 0;
 
-        // 1. Allocate VRAM slots & kick off up to 16 concurrent NVMe ReadFile I/Os in parallel!
+        for (int i = 0; i < cnt; ++i) {
+            vslots[i] = -1;
+            pending[i] = false;
+            req_ok[i] = false;
+            got_arr[i] = 0;
+        }
+
+        // 1. Allocate & pin VRAM slots (keeping vram_owner_ = {-1,-1} until read succeeds!) & kick off QD-16 ReadFile!
         for (int i = 0; i < cnt; ++i) {
             int pid = ssd_pids[base + i];
-            vslots[i] = alloc_vram_page_slot(g, protect_recent_start, stream);
-            // Temporarily reserve slot so subsequent allocs in this batch cannot evict it!
-            vram_owner_[vslots[i]] = {g, pid};
-            pages_[g][pid].last_use = ++clock_;
+            int vs = alloc_vram_page_slot(g, protect_recent_start, stream);
+            if (vs < 0) {
+                all_ok = false;
+                break;
+            }
+            vslots[i] = vs;
+            vram_pin_[vs]++;
+            issued++;
+
+            if (pages_[g][pid].ssd_slot < 0) {
+                set_io_error("Batch SSD fetch encountered invalid ssd_slot");
+                all_ok = false;
+                continue;
+            }
+            if (test_fail_read_after_ == 0) {
+                test_fail_read_after_ = -1;
+                set_io_error("Injected NVMe batch read failure");
+                all_ok = false;
+                continue;
+            }
+            if (test_fail_read_after_ > 0) test_fail_read_after_--;
 
             uint64_t off = (uint64_t)pages_[g][pid].ssd_slot * page_full_bytes_;
             std::memset(&ovs[i], 0, sizeof(OVERLAPPED));
@@ -1083,42 +1379,247 @@ void HybridPagedKV::fetch_ssd_pages_batch(int g, const std::vector<int>& ssd_pid
             ResetEvent(ovs[i].hEvent);
 
             uint8_t* dst = h_ssd_async_buf_ + (size_t)i * page_full_bytes_;
+            DWORD want = (DWORD)page_full_bytes_;
+            if (test_short_read_once_ && want > 64) {
+                want /= 2;
+                test_short_read_once_ = false;
+            }
             DWORD got = 0;
-            BOOL ok = ReadFile(h, dst, (DWORD)page_full_bytes_, &got, &ovs[i]);
-            pending[i] = (!ok && GetLastError() == ERROR_IO_PENDING);
+            BOOL ok = ReadFile(h, dst, want, &got, &ovs[i]);
+            if (ok) {
+                req_ok[i] = true;
+                got_arr[i] = got;
+            } else if (GetLastError() == ERROR_IO_PENDING) {
+                pending[i] = true;
+                req_ok[i] = true;
+            } else {
+                set_io_error("ReadFile failed during QD-16 NVMe KV batch fetch");
+                all_ok = false;
+            }
         }
 
-        // 2. Complete overlapped NVMe reads and immediately DMA each completed page into VRAM!
-        for (int i = 0; i < cnt; ++i) {
+        // 2. Complete overlapped NVMe reads, finish any short reads, verify full bytes, THEN DMA & publish!
+        for (int i = 0; i < issued; ++i) {
+            int pid = ssd_pids[base + i];
+            uint8_t* src = h_ssd_async_buf_ + (size_t)i * page_full_bytes_;
+            uint64_t off = (uint64_t)pages_[g][pid].ssd_slot * page_full_bytes_;
+
             if (pending[i]) {
                 DWORD got = 0;
-                GetOverlappedResult(h, &ovs[i], &got, TRUE);
+                if (!GetOverlappedResult(h, &ovs[i], &got, TRUE)) {
+                    req_ok[i] = false;
+                    set_io_error("GetOverlappedResult failed during QD-16 NVMe KV batch fetch");
+                    all_ok = false;
+                } else {
+                    got_arr[i] = got;
+                }
             }
-            int pid = ssd_pids[base + i];
-            uint8_t* src  = h_ssd_async_buf_ + (size_t)i * page_full_bytes_;
-            uint8_t* vdst = d_vram_pages_ + (size_t)vslots[i] * page_full_bytes_;
-            INK_CUDA_CHECK(cudaMemcpyAsync(vdst, src, page_full_bytes_, cudaMemcpyHostToDevice, stream));
-            pages_[g][pid].tier = TIER_VRAM;
-            pages_[g][pid].slot = vslots[i];
-            pages_[g][pid].last_use = ++clock_;
-            stat_ssd_reads_++;
+
+            if (req_ok[i]) {
+                if (got_arr[i] == 0) {
+                    req_ok[i] = false;
+                    set_io_error("Zero-byte EOF read during QD-16 NVMe KV batch fetch");
+                    all_ok = false;
+                } else if ((size_t)got_arr[i] < page_full_bytes_) {
+                    // Complete partial/short read synchronously before publishing!
+                    size_t rem = page_full_bytes_ - (size_t)got_arr[i];
+                    if (!ssd_pread_sync(off + (uint64_t)got_arr[i], src + (size_t)got_arr[i], rem)) {
+                        req_ok[i] = false;
+                        set_io_error("Failed completing short read during QD-16 NVMe KV batch fetch");
+                        all_ok = false;
+                    }
+                }
+            }
+
+            if (req_ok[i]) {
+                uint8_t* vdst = d_vram_pages_ + (size_t)vslots[i] * page_full_bytes_;
+                if (cudaMemcpyAsync(vdst, src, page_full_bytes_, cudaMemcpyHostToDevice, stream) != cudaSuccess) {
+                    req_ok[i] = false;
+                    set_io_error("CUDA H2D copy failed during QD-16 NVMe KV batch fetch");
+                    all_ok = false;
+                }
+            }
+
+            if (req_ok[i]) {
+                // Atomic publish after verified full-byte read + H2D enqueue!
+                vram_owner_[vslots[i]] = {g, pid};
+                pages_[g][pid].tier = TIER_VRAM;
+                pages_[g][pid].slot = vslots[i];
+                pages_[g][pid].last_use = ++clock_;
+                stat_ssd_reads_++;
+                out_pinned_slots.push_back(vslots[i]);
+            } else {
+                // Leave failed page intact at TIER_SSD and unpin its unused VRAM slot!
+                if (vslots[i] >= 0) {
+                    vram_owner_[vslots[i]] = {-1, -1};
+                    if (vram_pin_[vslots[i]] > 0) vram_pin_[vslots[i]]--;
+                }
+            }
         }
-        // Sync DMA before reusing h_ssd_async_buf_ for the next QD-16 batch (only if more batches remain)
-        if (base + cnt < total) {
+
+        // Sync DMA before reusing h_ssd_async_buf_ (or before exiting on error)
+        if (issued > 0 && (base + cnt < total || !all_ok)) {
             INK_CUDA_CHECK(cudaStreamSynchronize(stream));
         }
+        if (!all_ok) return false;
     }
+    return true;
 }
 
-void HybridPagedKV::append_and_attend(
+// R4 (SR3-02): Unified Global Attention Executor with VRAM-Safe Bounded Chunking & Frame Pinning!
+bool HybridPagedKV::attend_global_pages(
+    int g, int B, int pos0, const std::vector<int>& page_ids, int recent_start,
+    const float* d_Q, const float* d_rel_table, const float* d_sinks,
+    float* d_out, int rel_extent, cudaStream_t stream)
+{
+    if (page_ids.empty()) return true;
+
+    const size_t pt_off = (size_t)g * (size_t)max_pages_per_layer_;
+    uint64_t* h_pk = h_page_k_ptrs_ + pt_off;
+    uint64_t* h_pv = h_page_v_ptrs_ + pt_off;
+    int32_t*  h_p0 = h_page_pos0_   + pt_off;
+    int32_t*  h_pl = h_page_lens_   + pt_off;
+    uint64_t* d_pk = d_page_k_ptrs_ + pt_off;
+    uint64_t* d_pv = d_page_v_ptrs_ + pt_off;
+    int32_t*  d_p0 = d_page_pos0_   + pt_off;
+    int32_t*  d_pl = d_page_lens_   + pt_off;
+
+    // Fast path: 100% of requested pages already resident in VRAM (ZERO syncs, ZERO extra kernels!)
+    bool all_already_vram = true;
+    for (int pid : page_ids) {
+        if (pages_[g][pid].tier != TIER_VRAM) { all_already_vram = false; break; }
+    }
+    if (all_already_vram) {
+        int n_sel = 0;
+        for (int pid : page_ids) {
+            PageMeta& pm = pages_[g][pid];
+            pm.last_use = ++clock_;
+            stat_vram_hits_++;
+            uint8_t* pb = d_vram_pages_ + (size_t)pm.slot * page_full_bytes_;
+            h_pk[n_sel] = (uint64_t)(uintptr_t)pb;
+            h_pv[n_sel] = (uint64_t)(uintptr_t)(pb + page_half_bytes_);
+            h_p0[n_sel] = pm.pos0;
+            h_pl[n_sel] = pm.len;
+            n_sel++;
+        }
+        INK_CUDA_CHECK(cudaMemcpyAsync(d_pk, h_pk, (size_t)n_sel * sizeof(uint64_t), cudaMemcpyHostToDevice, stream));
+        INK_CUDA_CHECK(cudaMemcpyAsync(d_pv, h_pv, (size_t)n_sel * sizeof(uint64_t), cudaMemcpyHostToDevice, stream));
+        INK_CUDA_CHECK(cudaMemcpyAsync(d_p0, h_p0, (size_t)n_sel * sizeof(int32_t),  cudaMemcpyHostToDevice, stream));
+        INK_CUDA_CHECK(cudaMemcpyAsync(d_pl, h_pl, (size_t)n_sel * sizeof(int32_t),  cudaMemcpyHostToDevice, stream));
+        if (B == 1) {
+            ink_cuda_attn_global_paged(d_Q, d_pk, d_pv, d_p0, d_pl, n_sel,
+                                       d_rel_table, d_sinks, d_split_out_, d_split_ml_, d_out,
+                                       n_head_, n_head_kv_, head_dim_, pos0, rel_extent, kv_mode_, stream);
+        } else {
+            ink_cuda_attn_global_paged_batch(d_Q, d_pk, d_pv, d_p0, d_pl, n_sel,
+                                             d_rel_table, d_sinks, d_split_out_, d_split_ml_, d_out, B,
+                                             n_head_, n_head_kv_, head_dim_, pos0, rel_extent, kv_mode_, stream);
+        }
+        return true;
+    }
+
+    // Bounded-chunk VRAM-pinned execution: NEVER evicts a frame while a live pointer in this chunk references it!
+    const int chunk_cap = std::max(1, vram_page_cap_);
+    const bool multi_chunk = ((int)page_ids.size() > chunk_cap);
+    if (multi_chunk && !ensure_chunk_accum(B)) {
+        set_io_error("Failed allocating GPU online-softmax accumulators for chunked exact global attention");
+        return false;
+    }
+
+    for (size_t base = 0; base < page_ids.size(); base += (size_t)chunk_cap) {
+        size_t end = std::min(page_ids.size(), base + (size_t)chunk_cap);
+        int cnt = (int)(end - base);
+        std::vector<int> pinned_slots;
+        pinned_slots.reserve(cnt);
+        std::vector<int> ssd_misses;
+
+        // Pass A: Pin pages in this chunk that are ALREADY in VRAM first so later fetches cannot evict them!
+        for (int k = 0; k < cnt; ++k) {
+            int pid = page_ids[base + k];
+            PageMeta& pm = pages_[g][pid];
+            if (pm.tier == TIER_VRAM) {
+                pm.last_use = ++clock_;
+                if (vram_pin_[pm.slot] == 0) {
+                    vram_pin_[pm.slot] = 1;
+                    pinned_slots.push_back(pm.slot);
+                }
+            } else if (pm.tier == TIER_SSD) {
+                ssd_misses.push_back(pid);
+            }
+        }
+
+        // Pass B: Batch-fetch SSD misses in this chunk at Queue Depth 16 (each fetched slot stays pinned!)
+        if (ssd_misses.size() > 1) {
+            if (!fetch_ssd_pages_batch(g, ssd_misses, recent_start, pinned_slots, stream)) {
+                unpin_vram_slots(pinned_slots);
+                return false;
+            }
+        }
+
+        // Pass C: Ensure all remaining (RAM or single SSD) pages in this chunk are in VRAM and pinned!
+        int n_sel = 0;
+        for (int k = 0; k < cnt; ++k) {
+            int pid = page_ids[base + k];
+            int vs = ensure_page_in_vram(g, pid, recent_start, stream);
+            if (vs < 0) {
+                unpin_vram_slots(pinned_slots);
+                return false;
+            }
+            if (vram_pin_[vs] == 0) {
+                vram_pin_[vs] = 1;
+                pinned_slots.push_back(vs);
+            }
+            uint8_t* pb = d_vram_pages_ + (size_t)vs * page_full_bytes_;
+            h_pk[n_sel] = (uint64_t)(uintptr_t)pb;
+            h_pv[n_sel] = (uint64_t)(uintptr_t)(pb + page_half_bytes_);
+            h_p0[n_sel] = pages_[g][pid].pos0;
+            h_pl[n_sel] = pages_[g][pid].len;
+            n_sel++;
+        }
+
+        INK_CUDA_CHECK(cudaMemcpyAsync(d_pk, h_pk, (size_t)n_sel * sizeof(uint64_t), cudaMemcpyHostToDevice, stream));
+        INK_CUDA_CHECK(cudaMemcpyAsync(d_pv, h_pv, (size_t)n_sel * sizeof(uint64_t), cudaMemcpyHostToDevice, stream));
+        INK_CUDA_CHECK(cudaMemcpyAsync(d_p0, h_p0, (size_t)n_sel * sizeof(int32_t),  cudaMemcpyHostToDevice, stream));
+        INK_CUDA_CHECK(cudaMemcpyAsync(d_pl, h_pl, (size_t)n_sel * sizeof(int32_t),  cudaMemcpyHostToDevice, stream));
+
+        if (!multi_chunk) {
+            if (B == 1) {
+                ink_cuda_attn_global_paged(d_Q, d_pk, d_pv, d_p0, d_pl, n_sel,
+                                           d_rel_table, d_sinks, d_split_out_, d_split_ml_, d_out,
+                                           n_head_, n_head_kv_, head_dim_, pos0, rel_extent, kv_mode_, stream);
+            } else {
+                ink_cuda_attn_global_paged_batch(d_Q, d_pk, d_pv, d_p0, d_pl, n_sel,
+                                                 d_rel_table, d_sinks, d_split_out_, d_split_ml_, d_out, B,
+                                                 n_head_, n_head_kv_, head_dim_, pos0, rel_extent, kv_mode_, stream);
+            }
+        } else {
+            ink_cuda_attn_global_paged_chunk(d_Q, d_pk, d_pv, d_p0, d_pl, n_sel,
+                                             d_rel_table, d_split_out_, d_split_ml_,
+                                             d_chunk_out_, d_chunk_ml_, B,
+                                             n_head_, n_head_kv_, head_dim_, pos0, rel_extent, kv_mode_,
+                                             /*is_first_chunk=*/(base == 0), stream);
+        }
+
+        // Hold pinned VRAM frames strictly until GPU finishes consuming this chunk!
+        INK_CUDA_CHECK(cudaStreamSynchronize(stream));
+        unpin_vram_slots(pinned_slots);
+    }
+
+    if (multi_chunk) {
+        // Apply attention sink EXACTLY ONCE and divide by combined online-softmax denominator!
+        ink_cuda_attn_global_finalize(d_chunk_out_, d_chunk_ml_, d_sinks, d_out, B, n_head_, head_dim_, stream);
+    }
+    return true;
+}
+
+bool HybridPagedKV::append_and_attend(
     int il, int pos,
     const float* d_Q, const float* d_K, const float* d_V,
     const float* d_rel_table, const float* d_sinks, float* d_out,
     int rel_extent, cudaStream_t stream)
 {
-    cur_pos_ = pos + 1;
-
     if (is_swa_[il]) {
+        cur_pos_ = pos + 1;
         int si = layer_to_swa_idx_[il];
         size_t swa_layer_bytes = (size_t)swa_ring_cap_ * tok_k_bytes_;
         uint8_t* k_ring = d_swa_k_ + (size_t)si * swa_layer_bytes;
@@ -1136,7 +1637,7 @@ void HybridPagedKV::append_and_attend(
         if (swa_counts_[si] < swa_ring_cap_) swa_counts_[si] = std::min(swa_ring_cap_, pos + 1);
         ink_cuda_attn_swa(d_Q, k_ring, v_ring, pos_ring, d_rel_table, d_sinks, d_split_out_, d_split_ml_, d_out,
                           n_head_, n_head_kv_, head_dim_, swa_counts_[si], pos, rel_extent, kv_mode_, stream);
-        return;
+        return true;
     }
 
     // Global attention layer!
@@ -1144,14 +1645,16 @@ void HybridPagedKV::append_and_attend(
     int p = pos / INK_PAGE_TOKENS;
     int t_in_p = pos % INK_PAGE_TOKENS;
     if (p >= max_pages_per_layer_) {
-        std::fprintf(stderr, "[PagedKV] Position %d exceeds max_ctx %d!\n", pos, max_ctx_);
-        std::abort();
+        set_io_error("Global KV position exceeds max_ctx");
+        return false;
     }
 
     int recent_start = std::max(0, p - 17); // protects last 17 pages (>= 1024 rel_extent tokens!)
-    if (p >= glob_num_pages_[g]) glob_num_pages_[g] = p + 1;
-
     int vslot = ensure_page_in_vram(g, p, recent_start, stream);
+    if (vslot < 0) return false;
+    if (p >= glob_num_pages_[g]) glob_num_pages_[g] = p + 1;
+    cur_pos_ = pos + 1;
+
     PageMeta& cur_pm = pages_[g][p];
     cur_pm.pos0 = p * INK_PAGE_TOKENS;
     cur_pm.len  = std::max(cur_pm.len, t_in_p + 1);
@@ -1166,6 +1669,8 @@ void HybridPagedKV::append_and_attend(
     int8_t* k_min_q8 = nullptr;
     int8_t* k_max_q8 = nullptr;
     float*  k_sc_ptr = nullptr;
+    float*  save_min_ptr = nullptr;
+    float*  save_max_ptr = nullptr;
     if (d_k_mins_q8_) {
         size_t kd = (size_t)n_head_kv_ * head_dim_;
         size_t sum_off = ((size_t)g * max_pages_per_layer_ + (size_t)p) * kd;
@@ -1175,13 +1680,17 @@ void HybridPagedKV::append_and_attend(
         k_min_q8 = d_k_mins_q8_ + sum_off;
         k_max_q8 = d_k_maxs_q8_ + sum_off;
         k_sc_ptr = d_k_scales_  + sc_off;
+        if (spec_recording_ && d_quest_spec_min_ && d_quest_spec_max_) {
+            save_min_ptr = d_quest_spec_min_ + (size_t)g * kd;
+            save_max_ptr = d_quest_spec_max_ + (size_t)g * kd;
+        }
     }
 
     ink_cuda_kv_store(d_K, d_V, k_dst, v_dst,
                       act_min_ptr, act_max_ptr, k_min_q8, k_max_q8, k_sc_ptr,
                       t_in_p == 0,
                       nullptr, 0,
-                      n_head_kv_, head_dim_, kv_mode_, stream);
+                      n_head_kv_, head_dim_, kv_mode_, stream, save_min_ptr, save_max_ptr);
 
     int n_pages = glob_num_pages_[g];
     bool all_in_vram = true;
@@ -1192,34 +1701,13 @@ void HybridPagedKV::append_and_attend(
     bool use_quest = (!all_in_vram && attn_mode_ != KV_ATTN_EXACT_STREAM) ||
                      (attn_mode_ == KV_ATTN_QUEST && n_pages > quest_top_pages_ + 20);
 
-    const size_t pt_off = (size_t)g * (size_t)max_pages_per_layer_;
-    uint64_t* h_pk = h_page_k_ptrs_ + pt_off;
-    uint64_t* h_pv = h_page_v_ptrs_ + pt_off;
-    int32_t*  h_p0 = h_page_pos0_   + pt_off;
-    int32_t*  h_pl = h_page_lens_   + pt_off;
-    uint64_t* d_pk = d_page_k_ptrs_ + pt_off;
-    uint64_t* d_pv = d_page_v_ptrs_ + pt_off;
-    int32_t*  d_p0 = d_page_pos0_   + pt_off;
-    int32_t*  d_pl = d_page_lens_   + pt_off;
-
-    int n_sel = 0;
+    std::vector<int> chosen;
     if (!use_quest) {
-        // 100% EXACT FULL ATTENTION over all n_pages!
-        for (int i = 0; i < n_pages; ++i) {
-            int vs = ensure_page_in_vram(g, i, recent_start, stream);
-            uint8_t* pb = d_vram_pages_ + (size_t)vs * page_full_bytes_;
-            h_pk[n_sel] = (uint64_t)(uintptr_t)pb;
-            h_pv[n_sel] = (uint64_t)(uintptr_t)(pb + page_half_bytes_);
-            h_p0[n_sel] = pages_[g][i].pos0;
-            h_pl[n_sel] = pages_[g][i].len;
-            n_sel++;
-        }
+        chosen.resize(n_pages);
+        for (int i = 0; i < n_pages; ++i) chosen[i] = i;
     } else {
-        // Quest Exact Upper-Bound Page Selection (for 128K - 1M SSD-backed context!)
-        // Always pin sink pages [0..1] + recent window [recent_start .. n_pages-1]
         int hist_start = 2;
         int hist_end = std::max(hist_start, recent_start);
-        std::vector<int> chosen;
         chosen.reserve(quest_top_pages_ + 24);
         for (int i = 0; i < std::min(2, n_pages); ++i) chosen.push_back(i);
 
@@ -1232,7 +1720,6 @@ void HybridPagedKV::append_and_attend(
                                        d_k_scales_ + sc_off,
                                        d_quest_scores_, hist_end, n_head_, n_head_kv_, head_dim_, stream);
             if (take < hist_n && d_quest_topk_ids_) {
-                // Exact O(N) GPU Radix-Select Top-K (~3 us, copies only K int32s = 512 B D2H!)
                 ink_cuda_quest_topk(d_quest_scores_, hist_start, hist_end, take, d_quest_topk_ids_, stream);
                 INK_CUDA_CHECK(cudaMemcpyAsync(h_quest_topk_ids_, d_quest_topk_ids_,
                                                (size_t)take * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
@@ -1244,54 +1731,24 @@ void HybridPagedKV::append_and_attend(
         }
         for (int i = std::max(2, recent_start); i < n_pages; ++i) chosen.push_back(i);
         std::sort(chosen.begin(), chosen.end());
-
-        // Pin timestamp on already-VRAM chosen pages & batch-fetch ALL SSD misses at Queue Depth 16!
-        std::vector<int> ssd_misses;
-        for (int pid : chosen) {
-            if (pages_[g][pid].tier == TIER_VRAM) {
-                pages_[g][pid].last_use = ++clock_;
-            } else if (pages_[g][pid].tier == TIER_SSD) {
-                ssd_misses.push_back(pid);
-            }
-        }
-        if (ssd_misses.size() > 1) {
-            fetch_ssd_pages_batch(g, ssd_misses, recent_start, stream);
-        }
-
-        for (int pid : chosen) {
-            int vs = ensure_page_in_vram(g, pid, recent_start, stream);
-            uint8_t* pb = d_vram_pages_ + (size_t)vs * page_full_bytes_;
-            h_pk[n_sel] = (uint64_t)(uintptr_t)pb;
-            h_pv[n_sel] = (uint64_t)(uintptr_t)(pb + page_half_bytes_);
-            h_p0[n_sel] = pages_[g][pid].pos0;
-            h_pl[n_sel] = pages_[g][pid].len;
-            n_sel++;
-        }
     }
 
-    INK_CUDA_CHECK(cudaMemcpyAsync(d_pk, h_pk, (size_t)n_sel * sizeof(uint64_t), cudaMemcpyHostToDevice, stream));
-    INK_CUDA_CHECK(cudaMemcpyAsync(d_pv, h_pv, (size_t)n_sel * sizeof(uint64_t), cudaMemcpyHostToDevice, stream));
-    INK_CUDA_CHECK(cudaMemcpyAsync(d_p0, h_p0, (size_t)n_sel * sizeof(int32_t),  cudaMemcpyHostToDevice, stream));
-    INK_CUDA_CHECK(cudaMemcpyAsync(d_pl, h_pl, (size_t)n_sel * sizeof(int32_t),  cudaMemcpyHostToDevice, stream));
-
-    ink_cuda_attn_global_paged(d_Q, d_pk, d_pv, d_p0, d_pl, n_sel,
-                               d_rel_table, d_sinks, d_split_out_, d_split_ml_, d_out,
-                               n_head_, n_head_kv_, head_dim_, pos, rel_extent, kv_mode_, stream);
+    return attend_global_pages(g, /*B=*/1, pos, chosen, recent_start,
+                               d_Q, d_rel_table, d_sinks, d_out, rel_extent, stream);
 }
 
-void HybridPagedKV::append_and_attend_batch(
+bool HybridPagedKV::append_and_attend_batch(
     int il, int pos0, int B,
     const float* d_Q, const float* d_K, const float* d_V,
     const float* d_rel_table, const float* d_sinks, float* d_out,
     int rel_extent, cudaStream_t stream)
 {
     if (B == 1) {
-        append_and_attend(il, pos0, d_Q, d_K, d_V, d_rel_table, d_sinks, d_out, rel_extent, stream);
-        return;
+        return append_and_attend(il, pos0, d_Q, d_K, d_V, d_rel_table, d_sinks, d_out, rel_extent, stream);
     }
-    cur_pos_ = pos0 + B;
 
     if (is_swa_[il]) {
+        cur_pos_ = pos0 + B;
         int si = layer_to_swa_idx_[il];
         size_t swa_layer_bytes = (size_t)swa_ring_cap_ * tok_k_bytes_;
         uint8_t* k_ring = d_swa_k_ + (size_t)si * swa_layer_bytes;
@@ -1304,7 +1761,7 @@ void HybridPagedKV::append_and_attend_batch(
         ink_cuda_attn_swa_batch(d_Q, k_ring, v_ring, pos_ring, d_rel_table, d_sinks,
                                 d_split_out_, d_split_ml_, d_out, B,
                                 n_head_, n_head_kv_, head_dim_, swa_counts_[si], pos0, rel_extent, kv_mode_, stream);
-        return;
+        return true;
     }
 
     // Global attention layer (batch append + causal batched attention)
@@ -1312,19 +1769,22 @@ void HybridPagedKV::append_and_attend_batch(
     int last_pos = pos0 + B - 1;
     int last_p = last_pos / INK_PAGE_TOKENS;
     if (last_p >= max_pages_per_layer_) {
-        std::fprintf(stderr, "[PagedKV] Batch position %d exceeds max_ctx %d!\n", last_pos, max_ctx_);
-        std::abort();
+        set_io_error("Batched Global KV position exceeds max_ctx");
+        return false;
     }
     int recent_start = std::max(0, last_p - 18);
 
     const size_t kv_stride = (size_t)n_head_kv_ * head_dim_;
+    const bool save_spec_quest = (spec_recording_ && d_quest_spec_min_ && d_quest_spec_max_ && B <= SPEC_MAX_B);
     for (int t = 0; t < B; ++t) {
         int pos = pos0 + t;
         int p = pos / INK_PAGE_TOKENS;
         int t_in_p = pos % INK_PAGE_TOKENS;
-        if (p >= glob_num_pages_[g]) glob_num_pages_[g] = p + 1;
 
         int vslot = ensure_page_in_vram(g, p, recent_start, stream);
+        if (vslot < 0) return false;
+        if (p >= glob_num_pages_[g]) glob_num_pages_[g] = p + 1;
+
         PageMeta& cur_pm = pages_[g][p];
         cur_pm.pos0 = p * INK_PAGE_TOKENS;
         cur_pm.len  = std::max(cur_pm.len, t_in_p + 1);
@@ -1339,6 +1799,8 @@ void HybridPagedKV::append_and_attend_batch(
         int8_t* k_min_q8 = nullptr;
         int8_t* k_max_q8 = nullptr;
         float*  k_sc_ptr = nullptr;
+        float*  save_min_ptr = nullptr;
+        float*  save_max_ptr = nullptr;
         if (d_k_mins_q8_) {
             size_t sum_off = ((size_t)g * max_pages_per_layer_ + (size_t)p) * kv_stride;
             size_t sc_off  = ((size_t)g * max_pages_per_layer_ + (size_t)p) * n_head_kv_;
@@ -1347,11 +1809,18 @@ void HybridPagedKV::append_and_attend_batch(
             k_min_q8 = d_k_mins_q8_ + sum_off;
             k_max_q8 = d_k_maxs_q8_ + sum_off;
             k_sc_ptr = d_k_scales_  + sc_off;
+            if (save_spec_quest) {
+                size_t spec_off = ((size_t)t * (size_t)n_glob_layers_ + (size_t)g) * kv_stride;
+                save_min_ptr = d_quest_spec_min_ + spec_off;
+                save_max_ptr = d_quest_spec_max_ + spec_off;
+            }
         }
         ink_cuda_kv_store(d_K + (size_t)t * kv_stride, d_V + (size_t)t * kv_stride,
                           k_dst, v_dst, act_min_ptr, act_max_ptr, k_min_q8, k_max_q8, k_sc_ptr,
-                          t_in_p == 0, nullptr, 0, n_head_kv_, head_dim_, kv_mode_, stream);
+                          t_in_p == 0, nullptr, 0, n_head_kv_, head_dim_, kv_mode_, stream,
+                          save_min_ptr, save_max_ptr);
     }
+    cur_pos_ = pos0 + B;
 
     int n_pages = glob_num_pages_[g];
     bool all_in_vram = true;
@@ -1361,38 +1830,19 @@ void HybridPagedKV::append_and_attend_batch(
     bool use_quest = (!all_in_vram && attn_mode_ != KV_ATTN_EXACT_STREAM) ||
                      (attn_mode_ == KV_ATTN_QUEST && n_pages > quest_top_pages_ + 20);
 
-    const size_t pt_off = (size_t)g * (size_t)max_pages_per_layer_;
-    uint64_t* h_pk = h_page_k_ptrs_ + pt_off;
-    uint64_t* h_pv = h_page_v_ptrs_ + pt_off;
-    int32_t*  h_p0 = h_page_pos0_   + pt_off;
-    int32_t*  h_pl = h_page_lens_   + pt_off;
-    uint64_t* d_pk = d_page_k_ptrs_ + pt_off;
-    uint64_t* d_pv = d_page_v_ptrs_ + pt_off;
-    int32_t*  d_p0 = d_page_pos0_   + pt_off;
-    int32_t*  d_pl = d_page_lens_   + pt_off;
-
-    int n_sel = 0;
+    std::vector<int> chosen;
     if (!use_quest) {
-        for (int i = 0; i < n_pages; ++i) {
-            int vs = ensure_page_in_vram(g, i, recent_start, stream);
-            uint8_t* pb = d_vram_pages_ + (size_t)vs * page_full_bytes_;
-            h_pk[n_sel] = (uint64_t)(uintptr_t)pb;
-            h_pv[n_sel] = (uint64_t)(uintptr_t)(pb + page_half_bytes_);
-            h_p0[n_sel] = pages_[g][i].pos0;
-            h_pl[n_sel] = pages_[g][i].len;
-            n_sel++;
-        }
+        chosen.resize(n_pages);
+        for (int i = 0; i < n_pages; ++i) chosen[i] = i;
     } else {
         int hist_start = 2;
         int hist_end = std::max(hist_start, recent_start);
-        std::vector<int> chosen;
         chosen.reserve(quest_top_pages_ + 24);
         for (int i = 0; i < std::min(2, n_pages); ++i) chosen.push_back(i);
 
         if (hist_end > hist_start && d_k_mins_q8_) {
             size_t base_off = (size_t)g * max_pages_per_layer_ * kv_stride;
             size_t sc_off   = (size_t)g * max_pages_per_layer_ * n_head_kv_;
-            // Score with newest query in batch (and blend with first query if B > 1)
             const float* d_Q_last = d_Q + (size_t)(B - 1) * n_head_ * head_dim_;
             ink_cuda_quest_score_pages(d_Q_last, d_k_mins_q8_ + base_off, d_k_maxs_q8_ + base_off,
                                        d_k_scales_ + sc_off, d_quest_scores_, hist_end,
@@ -1411,26 +1861,10 @@ void HybridPagedKV::append_and_attend_batch(
         }
         for (int i = std::max(2, recent_start); i < n_pages; ++i) chosen.push_back(i);
         std::sort(chosen.begin(), chosen.end());
-
-        for (int pid : chosen) {
-            int vs = ensure_page_in_vram(g, pid, recent_start, stream);
-            uint8_t* pb = d_vram_pages_ + (size_t)vs * page_full_bytes_;
-            h_pk[n_sel] = (uint64_t)(uintptr_t)pb;
-            h_pv[n_sel] = (uint64_t)(uintptr_t)(pb + page_half_bytes_);
-            h_p0[n_sel] = pages_[g][pid].pos0;
-            h_pl[n_sel] = pages_[g][pid].len;
-            n_sel++;
-        }
     }
 
-    INK_CUDA_CHECK(cudaMemcpyAsync(d_pk, h_pk, (size_t)n_sel * sizeof(uint64_t), cudaMemcpyHostToDevice, stream));
-    INK_CUDA_CHECK(cudaMemcpyAsync(d_pv, h_pv, (size_t)n_sel * sizeof(uint64_t), cudaMemcpyHostToDevice, stream));
-    INK_CUDA_CHECK(cudaMemcpyAsync(d_p0, h_p0, (size_t)n_sel * sizeof(int32_t),  cudaMemcpyHostToDevice, stream));
-    INK_CUDA_CHECK(cudaMemcpyAsync(d_pl, h_pl, (size_t)n_sel * sizeof(int32_t),  cudaMemcpyHostToDevice, stream));
-
-    ink_cuda_attn_global_paged_batch(d_Q, d_pk, d_pv, d_p0, d_pl, n_sel,
-                                     d_rel_table, d_sinks, d_split_out_, d_split_ml_, d_out, B,
-                                     n_head_, n_head_kv_, head_dim_, pos0, rel_extent, kv_mode_, stream);
+    return attend_global_pages(g, B, pos0, chosen, recent_start,
+                               d_Q, d_rel_table, d_sinks, d_out, rel_extent, stream);
 }
 
 PagedKVStats HybridPagedKV::stats() const {

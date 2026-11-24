@@ -538,9 +538,16 @@ void CPUThreadPool::dispatch(TaskFn fn, void* ctx) {
 
 float CPUThreadPool::vec_dot_row(uint32_t type, const void* row_data, const float* x, int n) {
     init_avx_tables();
-    alignas(64) Q8Block32 qx[128];
-    quantize_f32_to_q8_32(x, qx, n);
-    return vec_dot_row_q8(type, row_data, qx, n);
+    // R21 (SR2-05): Guard stack scratch ceiling (128 blocks = 4,096 dims) with safe heap fallback
+    const int nb = n / 32;
+    if (nb <= 128) {
+        alignas(64) Q8Block32 qx[128];
+        quantize_f32_to_q8_32(x, qx, n);
+        return vec_dot_row_q8(type, row_data, qx, n);
+    }
+    std::vector<Q8Block32> qx_heap((size_t)nb);
+    quantize_f32_to_q8_32(x, qx_heap.data(), n);
+    return vec_dot_row_q8(type, row_data, qx_heap.data(), n);
 }
 
 void CPUThreadPool::dequantize_row(uint32_t type, const void* src, float* dst, int n) {
@@ -657,7 +664,16 @@ void CPUThreadPool::run_moe_experts(
         h_buf_.resize((size_t)n_tasks * n_ff);
     }
 
-    alignas(64) Q8Block32 qx[128];
+    // R21 (SR2-05): Bounds-safe quantization scratch (stack fast-path + automatic heap fallback for wider dims/tasks)
+    const int nb_embd = n_embd / 32;
+    const int nb_ff   = n_ff / 32;
+    alignas(64) Q8Block32 qx_stack[128];
+    std::vector<Q8Block32> qx_heap;
+    Q8Block32* qx = qx_stack;
+    if (nb_embd > 128) {
+        qx_heap.resize((size_t)nb_embd);
+        qx = qx_heap.data();
+    }
     quantize_f32_to_q8_32(x, qx, n_embd);
 
     size_t gu_rb = (size_t)(n_embd / ggml_type_block_size(tasks[0].gate_up_type)) * ggml_type_byte_size(tasks[0].gate_up_type);
@@ -669,7 +685,14 @@ void CPUThreadPool::run_moe_experts(
     parallel_for_threads([&](int tid, int nth) {
         int j0 = (n_ff * tid) / nth;
         int j1 = (n_ff * (tid + 1)) / nth;
-        float g_tmp[1152];
+        int span = j1 - j0;
+        float g_stack[1280];
+        std::vector<float> g_heap;
+        float* g_tmp = g_stack;
+        if (span > 1280) {
+            g_heap.resize((size_t)span);
+            g_tmp = g_heap.data();
+        }
         for (int t = 0; t < n_tasks; ++t) {
             const CPUExpertTask& tk = tasks[t];
             const uint8_t* base = (const uint8_t*)tk.gate_up_data;
@@ -685,9 +708,15 @@ void CPUThreadPool::run_moe_experts(
         }
     });
 
-    alignas(64) Q8Block32 qh[8][40];
+    alignas(64) Q8Block32 qh_stack[8][40];
+    std::vector<Q8Block32> qh_heap;
+    const bool qh_use_stack = (n_tasks <= 8 && nb_ff <= 40);
+    if (!qh_use_stack) qh_heap.resize((size_t)n_tasks * (size_t)nb_ff);
+    auto qh_ptr = [&](int t) -> Q8Block32* {
+        return qh_use_stack ? qh_stack[t] : (qh_heap.data() + (size_t)t * (size_t)nb_ff);
+    };
     for (int t = 0; t < n_tasks; ++t) {
-        quantize_f32_to_q8_32(h_buf_.data() + (size_t)t * n_ff, qh[t], n_ff);
+        quantize_f32_to_q8_32(h_buf_.data() + (size_t)t * n_ff, qh_ptr(t), n_ff);
     }
 
     // Pass 2: Expert-outer sequential streaming with 64-byte (16-float) cache-line aligned slices (zero false sharing!)
@@ -701,7 +730,7 @@ void CPUThreadPool::run_moe_experts(
             const CPUExpertTask& tk = tasks[t];
             const uint8_t* base = (const uint8_t*)tk.down_data;
             float sc = tk.down_scale * tk.router_weight;
-            const Q8Block32* qht = qh[t];
+            const Q8Block32* qht = qh_ptr(t);
             for (int r = r0; r < r1; ++r) {
                 out[r] += vec_dot_row_q8(dn_type, base + (size_t)r * dn_rb, qht, n_ff) * sc;
             }
@@ -746,25 +775,28 @@ void CPUThreadPool::run_moe_experts_grouped(
     const size_t gu_rb = (size_t)(n_embd / ggml_type_block_size(gu_type)) * ggml_type_byte_size(gu_type);
     const size_t dn_rb = (size_t)(n_ff   / ggml_type_block_size(dn_type)) * ggml_type_byte_size(dn_type);
 
-    // Pass 1: Weight-outer Gate + Up + SITU with UNPACK-ONCE-DOT-N AVX2!
+    // Pass 1: Weight-outer Gate + Up + SITU with UNPACK-ONCE-DOT-N AVX2 (chunked <=128 to prevent overflow at B=128!)
+    static constexpr int GRP_CHUNK = 128;
     parallel_for_threads([&](int tid, int nth) {
         int j0 = (n_ff * tid) / nth;
         int j1 = (n_ff * (tid + 1)) / nth;
-        float g_vals[64], u_vals[64];
-        const Q8Block32* ptrs[64];
+        float g_vals[GRP_CHUNK], u_vals[GRP_CHUNK];
+        const Q8Block32* ptrs[GRP_CHUNK];
         for (int g = 0; g < n_groups; ++g) {
             const auto& grp = groups[g];
             const uint8_t* base = (const uint8_t*)grp.gate_up_data;
             const float sc = grp.gate_up_scale;
             const int off = grp.tok_offset;
             const int cnt = grp.tok_count;
-            for (int t = 0; t < cnt; ++t) ptrs[t] = qx_all.data() + (size_t)tok_ids[off + t] * nb_embd;
-
-            for (int j = j0; j < j1; ++j) {
-                vec_dot_row_q8_multi(gu_type, base + (size_t)j * gu_rb,          ptrs, cnt, n_embd, g_vals);
-                vec_dot_row_q8_multi(gu_type, base + (size_t)(j + n_ff) * gu_rb, ptrs, cnt, n_embd, u_vals);
-                for (int t = 0; t < cnt; ++t) {
-                    h_buf_[(size_t)(off + t) * n_ff + j] = situ_act(g_vals[t] * sc, u_vals[t] * sc, situ_beta, situ_linear_beta);
+            for (int c0 = 0; c0 < cnt; c0 += GRP_CHUNK) {
+                int c_len = std::min(GRP_CHUNK, cnt - c0);
+                for (int t = 0; t < c_len; ++t) ptrs[t] = qx_all.data() + (size_t)tok_ids[off + c0 + t] * nb_embd;
+                for (int j = j0; j < j1; ++j) {
+                    vec_dot_row_q8_multi(gu_type, base + (size_t)j * gu_rb,          ptrs, c_len, n_embd, g_vals);
+                    vec_dot_row_q8_multi(gu_type, base + (size_t)(j + n_ff) * gu_rb, ptrs, c_len, n_embd, u_vals);
+                    for (int t = 0; t < c_len; ++t) {
+                        h_buf_[(size_t)(off + c0 + t) * n_ff + j] = situ_act(g_vals[t] * sc, u_vals[t] * sc, situ_beta, situ_linear_beta);
+                    }
                 }
             }
         }
@@ -787,21 +819,23 @@ void CPUThreadPool::run_moe_experts_grouped(
         for (int b = 0; b < B; ++b) {
             std::memset(out_batch + (size_t)b * n_embd + r0, 0, (size_t)(r1 - r0) * sizeof(float));
         }
-        float d_vals[64];
-        const Q8Block32* ptrs[64];
+        float d_vals[GRP_CHUNK];
+        const Q8Block32* ptrs[GRP_CHUNK];
         for (int g = 0; g < n_groups; ++g) {
             const auto& grp = groups[g];
             const uint8_t* base = (const uint8_t*)grp.down_data;
             const float dsc = grp.down_scale;
             const int off = grp.tok_offset;
             const int cnt = grp.tok_count;
-            for (int t = 0; t < cnt; ++t) ptrs[t] = qh_all.data() + (size_t)(off + t) * nb_ff;
-
-            for (int r = r0; r < r1; ++r) {
-                vec_dot_row_q8_multi(dn_type, base + (size_t)r * dn_rb, ptrs, cnt, n_ff, d_vals);
-                for (int t = 0; t < cnt; ++t) {
-                    int b = tok_ids[off + t];
-                    out_batch[(size_t)b * n_embd + r] += d_vals[t] * (dsc * tok_weights[off + t]);
+            for (int c0 = 0; c0 < cnt; c0 += GRP_CHUNK) {
+                int c_len = std::min(GRP_CHUNK, cnt - c0);
+                for (int t = 0; t < c_len; ++t) ptrs[t] = qh_all.data() + (size_t)(off + c0 + t) * nb_ff;
+                for (int r = r0; r < r1; ++r) {
+                    vec_dot_row_q8_multi(dn_type, base + (size_t)r * dn_rb, ptrs, c_len, n_ff, d_vals);
+                    for (int t = 0; t < c_len; ++t) {
+                        int b = tok_ids[off + c0 + t];
+                        out_batch[(size_t)b * n_embd + r] += d_vals[t] * (dsc * tok_weights[off + c0 + t]);
+                    }
                 }
             }
         }

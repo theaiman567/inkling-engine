@@ -201,6 +201,8 @@ public:
     int32_t sample_next(const SamplingParams& sp, uint64_t& rng_state);
     int32_t sample_from_logits(const float* d_logits_ptr, int32_t argmax_val, const SamplingParams& sp,
                                uint64_t& rng_state, int32_t draft_tok = -1, bool* out_accepted = nullptr);
+    int32_t sample_from_logits_cpu_ref(const float* d_logits_ptr, int32_t argmax_val, const SamplingParams& sp,
+                                       uint64_t& rng_state, int32_t draft_tok = -1, bool* out_accepted = nullptr);
 
     // Generate tokens with streaming callback: cb(token_id, piece_text) -> return false to stop early
     struct GenResult {
@@ -215,6 +217,8 @@ public:
         double prefill_ms = 0.0;
         double decode_ms = 0.0;
         bool hit_max_ctx = false;
+        bool io_error = false;
+        std::string error_msg;
     };
     GenResult generate(
         const std::vector<int32_t>& prompt_tokens,
@@ -348,6 +352,23 @@ private:
     MoePredictorTracker pred_tracker_;
     float* h_pred_hidden_ = nullptr; // pinned [4 * n_embd] for async D2H of pass-0 layer 8 & 16 states
     int    pred_hidden_slots_ = 0;
+    std::vector<int32_t> batch_pred_ids_; // R10: [n_layer_logical * B * K_exp] exact token-order route replay!
+    int    batch_pred_B_ = 0;
+
+    // R14 (SR1-03): Bit-exact GPU candidate pre-filter buffers (~64 KB VRAM + ~64 KB pinned RAM)
+    SamplePrefilterPacket* d_sample_pkt_ = nullptr;
+    int32_t* d_sample_ext_ids_  = nullptr;
+    float*   d_sample_ext_vals_ = nullptr;
+    SamplePrefilterPacket* h_sample_pkt_ = nullptr;
+    int32_t* h_sample_ext_ids_  = nullptr;
+    float*   h_sample_ext_vals_ = nullptr;
+    std::vector<std::pair<float, int32_t>> h_samp_cand_;
+
+    // R6 (SR3-03): Explicit engine I/O error state propagated cleanly to callers / HTTP 500
+    bool        io_error_ = false;
+    std::string last_error_;
+    void        clear_io_errors();
+    void        record_io_error(const std::string& msg);
 
     // CUDA Graphs for fixed layer preludes/postludes + LM Head (eliminates ~82% of WDDM launches!)
     float* d_tau_global_ = nullptr;
