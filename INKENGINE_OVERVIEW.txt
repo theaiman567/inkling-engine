@@ -1,8 +1,8 @@
 ================================================================================
-  INKENGINE — COMPLETE OVERVIEW, VERSION HISTORY (v1.0 -> v3.3) & BENCHMARKS
+  INKENGINE — COMPLETE OVERVIEW, VERSION HISTORY (v1.0 -> v3.4) & BENCHMARKS
 ================================================================================
 
-Last Updated : 2026-11-23
+Last Updated : 2026-11-24
 Project Home : C:\Users\User\Desktop\inkling-engine
 Repository   : https://github.com/theaiman567/inkling-engine
 Target Model : Inkling-2-Mini (26.4B total / ~5.4B active Looped-MoE + 318M Vision)
@@ -425,6 +425,62 @@ Key Verified Results (v3.2 -> v3.3):
     touching `cerebras` / `modal` / `tokenrouter`, `Vision=ON (0 MiB idle)`,
     `SWA 50.6 MiB`, clean stop.
 
+--------------------------------------------------------------------------------
+VERSION 3.4: "Robust" — Memory-Pressure Exactness, Checked I/O & GPU Sampling
+--------------------------------------------------------------------------------
+Implemented Milestone 2 (R4, R6, R8, R10, R14, R21, R24) from the senior-agent
+architecture review (`improvement paper.txt`) — eliminating memory-pressure
+paging bugs at 128K–512K, making Quest rollbacks and MoE predictor tracking
+bit-exact, cutting sampling latency 6.7x via a bit-exact GPU pre-filter, and
+expanding `--verify-suite` to 8 automated parity & fault-injection gates!
+
+What was added / fixed on top of v3.3:
+  1. Multi-Chunk Exact Global Attention with Frame Pinning (R4 / SR3-02):
+     - Added per-slot VRAM frame pinning (`vram_pin_`) and bounded-chunk
+       `attend_global_pages()` with online-softmax chunk merging
+       (`k_attn_global_merge_chunk` + single-sink `k_attn_global_finalize`).
+     - Zero extra overhead or VRAM when pages already fit in VRAM; guarantees
+       exact global attention can never evict an active frame at 128K–512K.
+  2. Checked Full-Byte I/O & Atomic Publish (R6 / SR3-03):
+     - Checked every SSD write/read (including QD-16 overlapped partial-read
+       completion) in `HybridPagedKV` and `ExpertCache`; keeps the last valid
+       copy intact on failed spills and publishes slots/pages ONLY after full
+       verified transfers succeed.
+     - Propagates storage errors cleanly through `GenResult::io_error` to HTTP
+       500 (`storage_io_error`) instead of silently serving garbage or crashing.
+  3. Bit-Exact Quest Extrema Rollback Across Page Boundaries (R8 / SR3-07):
+     - Snapshots post-token FP32 Quest extrema in `k_kv_store` (~600 KB VRAM)
+       and restores + re-quantizes boundary pages on `commit_spec_verify()` and
+       `rollback_draft_snapshot()`, plus saves `active_k_min/max` in RAM
+       checkpoints.
+  4. Exact Token-Order MoE Predictor Bookkeeping (R10 / SR3-05):
+     - Replays `step_*_token() -> record_selections()` in exact scalar token
+       order for batched prefill AND every accepted speculative token (fixing
+       both the B-step pre-decay skew and missing speculative routes).
+  5. Bit-Exact GPU Sampling Pre-Filter & Bounds Guards (R14, R21, R24):
+     - Replaced the per-token 800 KB synchronous logit D2H copy + heap alloc
+       with `k_sample_prefilter` (4 KB pinned copy, conservative ULP superset
+       filter, exact CPU predicate in ascending ID order -> 6.7x faster, 100%
+       bit-exact!).
+     - Added stack-ceiling heap fallbacks in `cpu_kernels.cpp` (including a
+       128-token chunk fix for `run_moe_experts_grouped` at `B = 128`) and
+       `best_e >= 0` guards in `k_router_topk[_batch]`.
+
+Key Verified Results (v3.3 -> v3.4):
+  - F16 Golden + 8-Gate Suite (`--verify --verify-suite`): ALL 8 GATES PASSED
+    (exit 0), Gate 4 R4 multi-chunk `B=1/B=7 err=0.000000` (857 SSD reads, 84
+    writes), Gate 5 R6 fault-injected I/O 4/4 PASS, Gate 6 R8 Quest rollback
+    BIT-EXACT, Gate 7 R10 predictor LIVE64/ANS/ANS8 exact to 0.00, Gate 8 R14
+    sampling 200/200 BIT-EXACT (`46.7 us` vs `312.3 us` = `6.69x` faster!).
+  - Production Q4_0 8-Gate Suite (`--kv-quant q4 --verify-suite`): ALL 8 GATES
+    PASSED (exit 0), Gate 2 `96/96` exact (`77/77 = 100%`), Gate 4 `0.000000`,
+    Gate 8 `46.3 us` vs `316.1 us` = `6.83x` faster!
+  - Tight-RAM 96 MiB Stress (`--ram-mb 96 --verify`): 100% EXACT MATCH.
+  - Live HTTP Security/Timeout/Overflow/UTF-8/Vision Suite: 15/15 PASS.
+  - 64K Decode Benchmark (`--ctx 65536 --bench 128`): **34.44 tok/s**
+    (`29.03 ms/tok`, `93.1%` VRAM hit: Core `98.0%`, Outer `78.6%`, `18.02s`
+    cold boot) — faster than v3.0–v3.3's `32.65 tok/s`!
+
 
 ================================================================================
 4. COMPLETE BENCHMARK & SPEED PROGRESSION SUMMARY
@@ -433,21 +489,22 @@ Key Verified Results (v3.2 -> v3.3):
 All speeds measured on RTX 4060 8 GB + Ryzen 5 5500 + 16 GB DDR4, Q4_0 KV,
 Inkling-2-Mini-UD-IQ3_XXS.gguf (10.86 GiB):
 
-Benchmark                     | llama.cpp  |   v1.0   |   v2.0   |   v3.0   | v3.3 (Latest)       | Total Gain vs llama.cpp
+Benchmark                     | llama.cpp  |   v1.0   |   v2.0   |   v3.0   | v3.4 (Latest)       | Total Gain vs llama.cpp
 ------------------------------+------------+----------+----------+----------+---------------------+------------------------
-64K steady decode             | 10.64 t/s* | 26.03    | 32.34    | 32.65    | ~32.65 t/s          | 3.07x faster
+64K steady decode             | 10.64 t/s* | 26.03    | 32.34    | 32.65    | **34.44 t/s**       | 3.24x faster
 128K full context (pos=130K)  | OOM        | 20.15    | 27.57    | 27.58    | ~27.58 t/s          | 2.59x (2.7x context)
 256K NVMe SSD (pos=260K)      | OOM        | 18.82    | 18.82    | 26.75    | ~26.75 t/s          | 2.51x (5.3x context)
 512K NVMe SSD (pos=520K)      | OOM        |  5.73    |  5.73    | 24.43    | ~24.43 t/s          | 2.30x (10.8x context)
 Code refactor (MetricsCalc)   | 10.64 t/s  | 26.28    | 33.81    | 35.18**  | ~35.18** t/s        | 3.31x - 3.56x faster
 Batched prefill (2K prompt)   | ~55 t/s    | ~24      | 71.80    | 120.69   | ~120.69 t/s         | ~2.19x faster (5x v1)
-Cold server boot (128K)       | ~40s       | ~34s     | 34.4s    | 18.6s    | 16.0s - 18.6s       | ~2.2x faster boot
+Cold server boot (128K)       | ~40s       | ~34s     | 34.4s    | 18.6s    | 18.0s - 19.7s       | ~2.1x faster boot
 OpenCode Turn 1 (10.5K, cold) | ~200s      | ~440s    | 163.3s   | 99.6s    | ~99.6s              | ~2.0x faster
 OpenCode Turn 1 (post-reboot) | ~200s      | ~440s    | 163.3s   | 29.1s    | ~29.1s (185ms load) | ~6.9x faster!
+Sampling (T=1.0, min_p=0.0)   | Host scan  | ~312 us  | ~312 us  | ~312 us  | **46.3 us (exact!)**| 6.8x faster sampling!
 Retry recovery (same turn)    | Re-prefill | Re-pref  | Re-pref  | Re-pref  | ~4 ms bit-exact!    | ~300s -> ~1s!
 Client disconnect abort       | N/A        | Blocks   | Blocks   | Blocks   | 842 ms (<1s!)       | Zero zombie hangs
 Q4_0 KV rounding accuracy     | Unbiased   | +0.5d    | +0.5d    | +0.5d    | Unbiased (0 bias)   | 2x lower max KV error
-Long-ctx (>1024) parity gate  | Reference  | Untested | Untested | Untested | ALL GATES PASS (v3.3)| Bit-exact restore!
+8-Gate parity & fault suite   | Reference  | Untested | Untested | Untested | 8/8 GATES PASS(v3.4)| 0.000000 exact!
 HTTP Security / Hardening     | Optional   | Open     | Open     | Open     | Bearer+Host+15/15   | DNS-rebind/LFI safe!
 Multimodal Vision (idle cost) | ~610M VRAM | N/A      | N/A      | N/A      | 0 MiB VRAM / 0 RAM  | Zero text regression!
 HD 1080p Vision + Cache Hit   | Pinned GPU | N/A      | N/A      | N/A      | 2.99s / 0ms+10ms KV | Full OpenCode vision!
@@ -467,8 +524,8 @@ Physics Perspective (RTX 4060 8 GB, 272 GB/s GDDR6):
     means InkEngine v3.x is operating near the physical hardware ceiling of an
     8 GB RTX 4060!
 
-System Resource Footprint (v2.0 vs v3.3 @ 128K Context):
-  - GPU VRAM Used           : ~7,680 MiB (v2.0) -> ~7,590 MiB (v3.3)
+System Resource Footprint (v2.0 vs v3.4 @ 128K Context):
+  - GPU VRAM Used           : ~7,680 MiB (v2.0) -> ~7,590 MiB (v3.4)
   - VRAM Expert Slots       : 1,445 slots       -> 1,493 slots (+48 hot experts!)
   - KV Cache VRAM (Q4_0)    : 718 MiB (45 SWA)  -> 723.2 MiB (50.6 SWA wrap-safe!)
   - Vision Idle Footprint   : N/A               -> 0 MiB VRAM / 0 MiB RAM (v3.2+)
@@ -529,26 +586,25 @@ Key Files in C:\Users\User\Desktop\inkling-engine:
   build\inkengine.exe          Compiled standalone engine binary
   inkcode.ps1                  Portable background server + OpenCode launcher
   README.md                    GitHub landing page, install & tuning guide
-  CHANGELOG.md                 Detailed v3.3 + v3.2 + v3.1 PR notes & commit summary
+  CHANGELOG.md                 Detailed v3.4 + v3.3 + v3.2 + v3.1 PR notes & commit summary
   INKENGINE_OVERVIEW.txt       This complete overview & version history
   models\                      Learned MoE expert predictors (pred-v3, start-v3)
   logs\server.log              Live HTTP, vision, prefill, decode & cache telemetry
-  src\cuda_kernels.cu/.cuh     Fused CUDA kernels, WMMA prefill, KV, 6 vision kernels
+  src\cuda_kernels.cu/.cuh     Fused CUDA kernels, WMMA, KV chunk-merge, GPU sampler, vision
   src\vision.cpp/.h            Standalone WIC + GPU-streamed inkling2v vision encoder
-  src\cpu_kernels.cpp/.h       AVX2 multi-threaded fallback (64B aligned slices)
-  src\expert_cache.cpp/.h      2-bucket 3-tier VRAM/RAM/SSD expert cache + RAM pinning
+  src\cpu_kernels.cpp/.h       AVX2 multi-threaded fallback (64B aligned, bounds-safe)
+  src\expert_cache.cpp/.h      2-bucket 3-tier VRAM/RAM/SSD cache, RAM pinning, checked I/O
   src\moe_predictor.cpp/.h     Native C++17/AVX2 .moepred predictor runtime
-  src\paged_kv.cpp/.h          3-tier HybridPagedKV, 1152-SWA, per-layer page tables, v3 ckpt
-  src\model.cpp/.h             Inkling-2 forward, multimodal prefill, spec, --verify-suite
+  src\paged_kv.cpp/.h          3-tier HybridPagedKV, 1152-SWA, R4 multi-chunk, R6/R8, v3 ckpt
+  src\model.cpp/.h             Inkling-2 forward, multimodal, spec, R10/R14, 8-gate verify
   src\server.cpp/.h            Hardened OpenAI HTTP/SSE server, Bearer auth, UTF-8, workers
   src\tokenizer.cpp/.h         Inkling-2 BPE tokenizer & multimodal chat formatter
   src\gguf.cpp/.h              Standalone GGUF v3 parser + Win32 overlapped I/O
   src\main.cpp                 CLI entry point (--verify-suite/--api-key/--image), bench
 
 Upcoming Roadmap (from Senior-Agent Review):
-  - Milestone 2 (v3.4 Hardening): Full Q4_0/Q8_0 KV parity, stricter GGUF/JSON
-    bounds & parser checks, SSE/socket edge-case tests, disk swap resilience.
-  - Milestone 3 (v4.0 Speedups): Faster prefill/decode kernels, deeper async
-    overlap, Q8_0 vs Q4_0 KV A/B tuning, Q4_K/Q5_K/Q6_K AVX2 CPU kernels.
+  - Milestone 3 (v4.0 Speedups): R11 quantize activations once per layer, R12
+    MoE G=8/G=4 lane efficiency, R13 GPU-grouped speculative verify + graphs,
+    R15-R20 prefill/decode trace-guided optimizations, Q4_K/Q5_K/Q6_K AVX2.
   - Cross-Platform: Linux POSIX / io_uring port for open-source contributors.
 ================================================================================

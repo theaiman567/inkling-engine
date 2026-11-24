@@ -74,7 +74,8 @@ public:
 
     // GPU-first split resolution: updates LFU scores & stats, resolves ONLY CPU-missed experts
     // from RAM/SSD, and queues hot misses for zero-stall phased / end-of-token exclusive swap!
-    void resolve_gpu_split(
+    // Returns false if a Tier-2 SSD expert read failed (R6 / SR3-03).
+    bool resolve_gpu_split(
         int ip,
         const MoESplitPacket& pkt,
         CPUExpertTask* cpu_tasks,
@@ -119,8 +120,8 @@ public:
     // Legacy decay hook (used if begin/finish aren't invoked)
     void on_token_end();
 
-    // Legacy host-resolved lookup (kept for compatibility)
-    void resolve_layer_experts(
+    // Legacy host-resolved lookup (kept for compatibility; returns false on SSD I/O error)
+    bool resolve_layer_experts(
         int ip,
         const int32_t* expert_ids,
         const float* router_weights,
@@ -152,6 +153,13 @@ public:
     void reset_stats();
     void set_swaps_frozen(bool frozen) { swaps_frozen_ = frozen; }
     bool swaps_frozen() const { return swaps_frozen_; }
+
+    // R6 (SR3-03): Explicit I/O error state & test fault-injection hooks
+    bool has_io_error() const { return io_error_; }
+    const std::string& last_error() const { return last_error_; }
+    void clear_io_error() { io_error_ = false; last_error_.clear(); }
+    void set_test_ssd_fail(bool on) { test_ssd_fail_ = on; }
+    bool evict_ram_expert_for_test(int uid);
 
 private:
     int ensure_in_ram_unlocked(int uid);
@@ -228,6 +236,9 @@ private:
     // Learned predictor state (overrides LFU ranking when active!)
     bool use_predictor_ = false;
     float pred_min_bg_gain_ = 1.5f;
+    bool io_error_ = false;
+    std::string last_error_;
+    bool test_ssd_fail_ = false;
     std::vector<float> pred_scores_;      // [total_experts]
     std::vector<int>   pred_queue_all_;   // descending all candidates (for LM-Head cross-tier swaps)
     std::vector<int>   pred_queue_outer_; // descending outer-only candidates (for Core-phase swaps!)

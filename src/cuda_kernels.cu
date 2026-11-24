@@ -1479,7 +1479,8 @@ __global__ void k_kv_store(const float* __restrict__ K, const float* __restrict_
                            int8_t* __restrict__ page_k_min_q8, int8_t* __restrict__ page_k_max_q8,
                            float* __restrict__ page_k_scale,
                            int is_first_in_page, int32_t* pos_slot_dst, int32_t pos_val,
-                           int n_head_kv, int head_dim, int kv_mode) {
+                           int n_head_kv, int head_dim, int kv_mode,
+                           float* __restrict__ save_act_min_dst, float* __restrict__ save_act_max_dst) {
     __shared__ float s_amax[4];
     int bid = blockIdx.x;
     int tid = threadIdx.x;
@@ -1500,6 +1501,8 @@ __global__ void k_kv_store(const float* __restrict__ K, const float* __restrict_
         float mx = is_first_in_page ? val : fmaxf(active_k_max[idx], val);
         active_k_min[idx] = mn;
         active_k_max[idx] = mx;
+        if (save_act_min_dst != nullptr) save_act_min_dst[idx] = mn;
+        if (save_act_max_dst != nullptr) save_act_max_dst[idx] = mx;
 
         // Per-page-head symmetric INT8 quantization with outward (floor/ceil) conservative rounding!
         float am = fmaxf(fabsf(mn), fabsf(mx));
@@ -1535,12 +1538,68 @@ void ink_cuda_kv_store(const float* K, const float* V, void* k_dst_token, void* 
                        int8_t* page_k_min_q8, int8_t* page_k_max_q8, float* page_k_scale,
                        bool is_first_in_page,
                        int32_t* pos_slot_dst, int32_t pos_val,
-                       int n_head_kv, int head_dim, KVQuantMode kv_mode, cudaStream_t stream) {
+                       int n_head_kv, int head_dim, KVQuantMode kv_mode, cudaStream_t stream,
+                       float* save_act_min_dst, float* save_act_max_dst) {
     k_kv_store<<<n_head_kv * 2, head_dim, 0, stream>>>(
         K, V, (uint8_t*)k_dst_token, (uint8_t*)v_dst_token,
         active_k_min, active_k_max, page_k_min_q8, page_k_max_q8, page_k_scale,
         is_first_in_page ? 1 : 0, pos_slot_dst, pos_val,
-        n_head_kv, head_dim, (int)kv_mode);
+        n_head_kv, head_dim, (int)kv_mode, save_act_min_dst, save_act_max_dst);
+}
+
+// R8 (SR3-07): Re-quantize restored FP32 active extrema into INT8 Quest summary with exact k_kv_store math!
+__global__ void k_quest_quantize_summary(
+    const float* __restrict__ active_k_min,
+    const float* __restrict__ active_k_max,
+    int8_t* __restrict__ k_mins_q8,
+    int8_t* __restrict__ k_maxs_q8,
+    float* __restrict__ k_scales,
+    int max_pages_per_layer, int page_idx, int n_head_kv, int head_dim)
+{
+    __shared__ float s_amax[4];
+    int h = blockIdx.x;
+    int g = blockIdx.y;
+    int tid = threadIdx.x;
+    int warp = tid >> 5;
+    int lane = tid & 31;
+
+    size_t kd = (size_t)n_head_kv * (size_t)head_dim;
+    size_t act_idx = (size_t)g * kd + (size_t)h * head_dim + tid;
+    float mn = active_k_min[act_idx];
+    float mx = active_k_max[act_idx];
+
+    float am = fmaxf(fabsf(mn), fabsf(mx));
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) am = fmaxf(am, __shfl_xor_sync(0xFFFFFFFFu, am, off));
+    if (lane == 0) s_amax[warp] = am;
+    __syncthreads();
+
+    size_t sum_off = ((size_t)g * (size_t)max_pages_per_layer + (size_t)page_idx) * kd;
+    size_t sc_off  = ((size_t)g * (size_t)max_pages_per_layer + (size_t)page_idx) * (size_t)n_head_kv;
+    if (tid == 0) {
+        float m4 = fmaxf(fmaxf(s_amax[0], s_amax[1]), fmaxf(s_amax[2], s_amax[3]));
+        float sc = fmaxf(m4, 1e-6f) * (1.0f / 127.0f);
+        s_amax[0] = sc;
+        k_scales[sc_off + h] = sc;
+    }
+    __syncthreads();
+    float inv_sc = 1.0f / s_amax[0];
+    int qmn = max(-127, min(127, (int)floorf(mn * inv_sc)));
+    int qmx = max(-127, min(127, (int)ceilf(mx * inv_sc)));
+    k_mins_q8[sum_off + (size_t)h * head_dim + tid] = (int8_t)qmn;
+    k_maxs_q8[sum_off + (size_t)h * head_dim + tid] = (int8_t)qmx;
+}
+
+void ink_cuda_quest_quantize_summary(
+    const float* active_k_min, const float* active_k_max,
+    int8_t* k_mins_q8, int8_t* k_maxs_q8, float* k_scales,
+    int n_glob_layers, int max_pages_per_layer, int page_idx,
+    int n_head_kv, int head_dim, cudaStream_t stream)
+{
+    dim3 grid(n_head_kv, n_glob_layers);
+    k_quest_quantize_summary<<<grid, head_dim, 0, stream>>>(
+        active_k_min, active_k_max, k_mins_q8, k_maxs_q8, k_scales,
+        max_pages_per_layer, page_idx, n_head_kv, head_dim);
 }
 
 // =========================================================================
@@ -2046,14 +2105,14 @@ __global__ void k_router_topk(const float* __restrict__ logits, const float* __r
             float os = __shfl_xor_sync(0xFFFFFFFFu, best_s, off);
             int   oe = __shfl_xor_sync(0xFFFFFFFFu, best_e, off);
             float op = __shfl_xor_sync(0xFFFFFFFFu, best_p, off);
-            if (os > best_s || (os == best_s && oe < best_e)) {
+            if (os > best_s || (os == best_s && oe >= 0 && (best_e < 0 || oe < best_e))) {
                 best_s = os; best_e = oe; best_p = op;
             }
         }
-        sel_i[j] = best_e;
-        sel_w[j] = best_p;
-        wsum += best_p;
-        if ((best_e & 31) == lane) used[best_e >> 5] = true;
+        sel_i[j] = (best_e >= 0) ? best_e : 0;
+        sel_w[j] = (best_e >= 0) ? best_p : 0.0f;
+        wsum += sel_w[j];
+        if (best_e >= 0 && (best_e >> 5) < 4 && (best_e & 31) == lane) used[best_e >> 5] = true;
     }
 
     if (lane == 0) {
@@ -3689,6 +3748,194 @@ void ink_cuda_attn_global_paged_batch(const float* Q, const uint64_t* page_k_ptr
         split_out, split_ml, sinks, out, n_splits, n_head, head_dim);
 }
 
+// =========================================================================
+// R4 (SR3-02): Chunked Online-Softmax Exact Global Attention Merge + Single-Sink Finalize
+// =========================================================================
+__global__ void k_attn_global_merge_chunk(
+    const float* __restrict__ split_out, const float* __restrict__ split_ml,
+    float* __restrict__ acc_out, float* __restrict__ acc_ml,
+    int n_splits, int n_head, int head_dim, int is_first_chunk)
+{
+    int h = blockIdx.x, tb = blockIdx.y, lane = threadIdx.x;
+    size_t aslot = (size_t)tb * (size_t)n_head + (size_t)h;
+
+    float m_all = is_first_chunk ? -FLT_MAX : acc_ml[aslot * 2 + 0];
+    for (int sp = 0; sp < n_splits; ++sp) {
+        size_t slot = ((size_t)tb * (size_t)n_splits + (size_t)sp) * (size_t)n_head + (size_t)h;
+        m_all = fmaxf(m_all, split_ml[slot * 2 + 0]);
+    }
+
+    float l_all = 0.0f, a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    if (!is_first_chunk) {
+        float ma = acc_ml[aslot * 2 + 0];
+        float la = acc_ml[aslot * 2 + 1];
+        if (ma > -FLT_MAX * 0.5f) {
+            float sc = expf(ma - m_all);
+            l_all += la * sc;
+            const float* ao = acc_out + aslot * (size_t)head_dim;
+            a0 = sc * ao[lane +  0];
+            a1 = sc * ao[lane + 32];
+            a2 = sc * ao[lane + 64];
+            a3 = sc * ao[lane + 96];
+        }
+    }
+    for (int sp = 0; sp < n_splits; ++sp) {
+        size_t slot = ((size_t)tb * (size_t)n_splits + (size_t)sp) * (size_t)n_head + (size_t)h;
+        float ms = split_ml[slot * 2 + 0];
+        float ls = split_ml[slot * 2 + 1];
+        if (ms > -FLT_MAX * 0.5f) {
+            float sc = expf(ms - m_all);
+            l_all += ls * sc;
+            const float* so = split_out + slot * (size_t)head_dim;
+            a0 = fmaf(sc, so[lane +  0], a0);
+            a1 = fmaf(sc, so[lane + 32], a1);
+            a2 = fmaf(sc, so[lane + 64], a2);
+            a3 = fmaf(sc, so[lane + 96], a3);
+        }
+    }
+
+    float* ao = acc_out + aslot * (size_t)head_dim;
+    ao[lane +  0] = a0; ao[lane + 32] = a1;
+    ao[lane + 64] = a2; ao[lane + 96] = a3;
+    if (lane == 0) {
+        acc_ml[aslot * 2 + 0] = m_all;
+        acc_ml[aslot * 2 + 1] = l_all;
+    }
+}
+
+__global__ void k_attn_global_finalize(
+    const float* __restrict__ acc_out, const float* __restrict__ acc_ml,
+    const float* __restrict__ sinks, float* __restrict__ out,
+    int n_head, int head_dim)
+{
+    int h = blockIdx.x, tb = blockIdx.y, lane = threadIdx.x;
+    size_t aslot = (size_t)tb * (size_t)n_head + (size_t)h;
+    float sink_t = sinks[aslot];
+    float ma = acc_ml[aslot * 2 + 0];
+    float la = acc_ml[aslot * 2 + 1];
+    float m_all = fmaxf(sink_t, ma);
+    float denom = expf(sink_t - m_all);
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    if (ma > -FLT_MAX * 0.5f) {
+        float sc = expf(ma - m_all);
+        denom += la * sc;
+        const float* ao = acc_out + aslot * (size_t)head_dim;
+        a0 = sc * ao[lane +  0];
+        a1 = sc * ao[lane + 32];
+        a2 = sc * ao[lane + 64];
+        a3 = sc * ao[lane + 96];
+    }
+    float inv_d = 1.0f / denom;
+    float* oh = out + aslot * (size_t)head_dim;
+    oh[lane +  0] = a0 * inv_d; oh[lane + 32] = a1 * inv_d;
+    oh[lane + 64] = a2 * inv_d; oh[lane + 96] = a3 * inv_d;
+}
+
+void ink_cuda_attn_global_paged_chunk(
+    const float* Q, const uint64_t* page_k_ptrs, const uint64_t* page_v_ptrs,
+    const int32_t* page_pos0, const int32_t* page_lens, int n_pages,
+    const float* rel_table,
+    float* split_out, float* split_ml,
+    float* acc_out, float* acc_ml,
+    int B, int n_head, int n_head_kv, int head_dim,
+    int pos0, int rel_extent, KVQuantMode kv_mode,
+    bool is_first_chunk, cudaStream_t stream)
+{
+    int n_splits = 1;
+    if (B == 1) {
+        if (n_pages >= 256)     n_splits = 32;
+        else if (n_pages >= 64) n_splits = 16;
+        else if (n_pages >= 16) n_splits = 8;
+        else if (n_pages >= 4)  n_splits = 4;
+        dim3 grid(n_head_kv, n_splits);
+        k_attn_global_splitk_gqa<<<grid, 128, 0, stream>>>(
+            Q, page_k_ptrs, page_v_ptrs, page_pos0, page_lens,
+            n_pages, n_splits, rel_table, split_out, split_ml,
+            n_head, n_head_kv, head_dim, pos0, rel_extent, (int)kv_mode);
+    } else {
+        int max_sp = (B <= 8) ? 16 : ((B <= 64) ? 4 : 2);
+        int cap_sp = 256 / B;
+        if (cap_sp < 1) cap_sp = 1;
+        if (max_sp > cap_sp) max_sp = cap_sp;
+        if (n_pages >= 64)      n_splits = max_sp;
+        else if (n_pages >= 16) n_splits = min(max_sp, 8);
+        else if (n_pages >= 4)  n_splits = min(max_sp, 4);
+        dim3 grid(n_head_kv, n_splits, B);
+        k_attn_global_splitk_gqa_batch<<<grid, 128, 0, stream>>>(
+            Q, page_k_ptrs, page_v_ptrs, page_pos0, page_lens, n_pages, n_splits, rel_table,
+            split_out, split_ml, n_head, n_head_kv, head_dim, pos0, rel_extent, (int)kv_mode);
+    }
+    k_attn_global_merge_chunk<<<dim3(n_head, B), 32, 0, stream>>>(
+        split_out, split_ml, acc_out, acc_ml, n_splits, n_head, head_dim, is_first_chunk ? 1 : 0);
+}
+
+void ink_cuda_attn_global_finalize(
+    const float* acc_out, const float* acc_ml,
+    const float* sinks, float* out,
+    int B, int n_head, int head_dim, cudaStream_t stream)
+{
+    k_attn_global_finalize<<<dim3(n_head, B), 32, 0, stream>>>(
+        acc_out, acc_ml, sinks, out, n_head, head_dim);
+}
+
+// =========================================================================
+// R14 (SR1-03): Bit-Exact GPU Superset Candidate Pre-Filter for Sampling
+// =========================================================================
+__global__ void k_sample_prefilter(
+    const float* __restrict__ logits, int n_vocab, int32_t argmax_val,
+    float inv_t, float log_min_p,
+    SamplePrefilterPacket* __restrict__ pkt,
+    int32_t* __restrict__ ext_ids, float* __restrict__ ext_vals)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+    if (argmax_val < 0 || argmax_val >= n_vocab) {
+        if (tid == 0) pkt->overflow = 1;
+        return;
+    }
+    float raw_max = logits[argmax_val];
+    if (tid == 0) pkt->raw_max = raw_max;
+    float max_scaled = raw_max * inv_t;
+    float margin = 1e-3f * (1.0f + fabsf(max_scaled));
+    float gpu_thresh = (max_scaled + log_min_p) - margin;
+    if (!isfinite(raw_max) || !isfinite(max_scaled) || !isfinite(gpu_thresh)) {
+        if (tid == 0) pkt->overflow = 1;
+        return;
+    }
+
+    for (int i = tid; i < n_vocab; i += stride) {
+        float rv = logits[i];
+        if (rv > raw_max || !isfinite(rv)) {
+            atomicExch(&pkt->overflow, 1);
+            return;
+        }
+        float sc = rv * inv_t;
+        if (sc >= gpu_thresh) {
+            int idx = atomicAdd(&pkt->count, 1);
+            if (idx < INK_SAMPLE_INLINE_CAP) {
+                pkt->ids[idx]  = i;
+                pkt->vals[idx] = rv;
+            } else if (idx < INK_SAMPLE_OVERFLOW_CAP) {
+                ext_ids[idx - INK_SAMPLE_INLINE_CAP]  = i;
+                ext_vals[idx - INK_SAMPLE_INLINE_CAP] = rv;
+            } else {
+                atomicExch(&pkt->overflow, 1);
+            }
+        }
+    }
+}
+
+void ink_cuda_sample_prefilter(
+    const float* logits, int n_vocab, int32_t argmax_val,
+    float inv_t, float log_min_p,
+    SamplePrefilterPacket* d_pkt, int32_t* d_ext_ids, float* d_ext_vals,
+    cudaStream_t stream)
+{
+    cudaMemsetAsync(d_pkt, 0, 16, stream);
+    k_sample_prefilter<<<256, 256, 0, stream>>>(
+        logits, n_vocab, argmax_val, inv_t, log_min_p, d_pkt, d_ext_ids, d_ext_vals);
+}
+
 __global__ void k_router_topk_batch(const float* __restrict__ logits, const float* __restrict__ bias,
                                     int32_t* __restrict__ top_ids, float* __restrict__ top_weights,
                                     int n_expert, int k, float w_scale) {
@@ -3714,7 +3961,7 @@ __global__ void k_router_topk_batch(const float* __restrict__ logits, const floa
     float wsum = 0.0f;
     for (int j = 0; j < k; ++j) {
         float best_s = -FLT_MAX;
-        int best_e = 0;
+        int best_e = -1;
         float best_p = 0.0f;
         #pragma unroll
         for (int i = 0; i < 4; ++i) {
@@ -3725,10 +3972,14 @@ __global__ void k_router_topk_batch(const float* __restrict__ logits, const floa
             float os = __shfl_xor_sync(0xFFFFFFFFu, best_s, off);
             int   oe = __shfl_xor_sync(0xFFFFFFFFu, best_e, off);
             float op = __shfl_xor_sync(0xFFFFFFFFu, best_p, off);
-            if (os > best_s || (os == best_s && oe < best_e)) { best_s = os; best_e = oe; best_p = op; }
+            if (os > best_s || (os == best_s && oe >= 0 && (best_e < 0 || oe < best_e))) {
+                best_s = os; best_e = oe; best_p = op;
+            }
         }
-        sel_i[j] = best_e; sel_w[j] = best_p; wsum += best_p;
-        if ((best_e & 31) == lane) used[best_e >> 5] = true;
+        sel_i[j] = (best_e >= 0) ? best_e : 0;
+        sel_w[j] = (best_e >= 0) ? best_p : 0.0f;
+        wsum += sel_w[j];
+        if (best_e >= 0 && (best_e >> 5) < 4 && (best_e & 31) == lane) used[best_e >> 5] = true;
     }
     if (lane == 0) {
         float inv = w_scale / (wsum + 1e-20f);

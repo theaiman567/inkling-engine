@@ -528,13 +528,36 @@ void ExpertCache::reset_stats() {
 }
 
 bool ExpertCache::read_expert_from_ssd(int uid, uint8_t* dst) {
+    if (test_ssd_fail_) {
+        io_error_ = true;
+        last_error_ = "Injected SSD expert read failure";
+        return false;
+    }
     int ip = uid / n_experts_;
     int e  = uid % n_experts_;
     const auto& lm = layers_[ip];
     bool ok1 = gguf_->pread(lm.gate_up_file_off + (uint64_t)e * lm.gate_up_exp_bytes, dst, lm.gate_up_exp_bytes);
-    bool ok2 = gguf_->pread(lm.down_file_off + (uint64_t)e * lm.down_exp_bytes, dst + lm.down_aligned_off, lm.down_exp_bytes);
+    bool ok2 = ok1 && gguf_->pread(lm.down_file_off + (uint64_t)e * lm.down_exp_bytes, dst + lm.down_aligned_off, lm.down_exp_bytes);
     stats_.ssd_reads++;
-    return ok1 && ok2;
+    if (!ok2) {
+        io_error_ = true;
+        last_error_ = "Short or failed GGUF SSD read for expert uid=" + std::to_string(uid);
+    }
+    return ok2;
+}
+
+bool ExpertCache::evict_ram_expert_for_test(int uid) {
+    auto work = [&]() -> bool {
+        if (uid < 0 || uid >= total_experts_) return false;
+        int rs = uid_to_ram_slot_[uid];
+        if (rs < 0 || ram_slot_pin_[rs] > 0) return false;
+        ram_slot_owner_[rs] = -1;
+        uid_to_ram_slot_[uid] = -1;
+        return true;
+    };
+    if (ram_preload_done_.load(std::memory_order_acquire)) return work();
+    std::lock_guard<std::mutex> lk(ram_mu_);
+    return work();
 }
 
 int ExpertCache::find_ram_victim_unlocked(size_t need_bytes) const {
@@ -578,6 +601,9 @@ int ExpertCache::ensure_in_ram_unlocked(int uid) {
     }
     uint8_t* dst = ram_slot_ptr_[rslot];
     if (!read_expert_from_ssd(uid, dst)) {
+        // R6 (SR3-03): Never publish incomplete/failed expert bytes into RAM slot!
+        ram_slot_owner_[rslot] = -1;
+        uid_to_ram_slot_[uid] = -1;
         std::fprintf(stderr, "[ExpertCache] ERROR: SSD read failed for expert uid=%d\n", uid);
         return -1;
     }
@@ -719,7 +745,7 @@ void ExpertCache::maybe_promote_to_vram(int uid, int ram_slot) {
     pending_promos_.push_back(uid);
 }
 
-void ExpertCache::resolve_gpu_split(
+bool ExpertCache::resolve_gpu_split(
     int ip,
     const MoESplitPacket& pkt,
     CPUExpertTask* cpu_tasks,
@@ -740,13 +766,18 @@ void ExpertCache::resolve_gpu_split(
     if (lm.is_core) { stats_.core_lookups += 8; stats_.core_vram_hits += pkt.n_gpu; }
     else            { stats_.outer_lookups += 8; stats_.outer_vram_hits += pkt.n_gpu; }
 
-    n_cpu = pkt.n_cpu;
-    for (int i = 0; i < n_cpu; ++i) {
+    n_cpu = 0;
+    for (int i = 0; i < pkt.n_cpu; ++i) {
         int e = pkt.miss_ids[i];
         int uid = ip * n_experts_ + e;
         int rslot = ensure_in_ram(uid);
+        if (rslot < 0) {
+            io_error_ = true;
+            if (last_error_.empty()) last_error_ = "Failed loading missed expert uid=" + std::to_string(uid) + " into RAM";
+            return false;
+        }
         const uint8_t* base = ram_slot_ptr_[rslot];
-        CPUExpertTask& tk = cpu_tasks[i];
+        CPUExpertTask& tk = cpu_tasks[n_cpu++];
         tk.gate_up_data  = base;
         tk.down_data     = base + lm.down_aligned_off;
         tk.gate_up_type  = lm.gate_up_type;
@@ -761,6 +792,7 @@ void ExpertCache::resolve_gpu_split(
             if (!dup) pending_promos_.push_back(uid);
         }
     }
+    return true;
 }
 
 int ExpertCache::find_vram_victim_pred(float incoming_score, float min_gain, size_t need_bytes, int phase_filter) const {
@@ -1058,7 +1090,7 @@ void ExpertCache::on_token_end() {
     finish_token_end_swaps(nullptr);
 }
 
-void ExpertCache::resolve_layer_experts(
+bool ExpertCache::resolve_layer_experts(
     int ip,
     const int32_t* expert_ids,
     const float* router_weights,
@@ -1105,6 +1137,11 @@ void ExpertCache::resolve_layer_experts(
             gpu_batch.down_w_scales[b]  = lm.down_scales[e] * rw;
         } else {
             int rslot = ensure_in_ram(uid);
+            if (rslot < 0) {
+                io_error_ = true;
+                if (last_error_.empty()) last_error_ = "Failed loading expert uid=" + std::to_string(uid) + " into RAM";
+                return false;
+            }
             const uint8_t* base = ram_slot_ptr_[rslot];
             CPUExpertTask& tk = cpu_tasks[n_cpu++];
             tk.gate_up_data  = base;
@@ -1117,4 +1154,5 @@ void ExpertCache::resolve_layer_experts(
             maybe_promote_to_vram(uid, rslot);
         }
     }
+    return true;
 }

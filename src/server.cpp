@@ -1283,6 +1283,20 @@ bool OpenAIServer::run() {
             full_sys_prefix_tokens,
             mm_ptr);
 
+        if (res.io_error) {
+            std::string emsg = res.error_msg.empty() ? "Internal KV/expert storage I/O error" : res.error_msg;
+            std::fprintf(stderr, "[HTTP] %s I/O ERROR (id=%llu): %s\n", path.c_str(), (unsigned long long)rid, emsg.c_str());
+            if (!stream) {
+                send_json(cli, 500, "{\"error\":{\"message\":\"" + json_escape(emsg) + "\",\"type\":\"server_error\",\"code\":\"storage_io_error\"}}", cfg_.cors_origin);
+            } else if (client_alive) {
+                std::ostringstream err_evt;
+                err_evt << "data: {\"error\":{\"message\":\"" << json_escape(emsg) << "\",\"type\":\"server_error\",\"code\":\"storage_io_error\"}}\n\n"
+                        << "data: [DONE]\n\n";
+                send_all(cli, err_evt.str());
+            }
+            return;
+        }
+
         if (client_alive) {
             flush_utf8_buffers();
             if ((st == ST_TOOL_JSON || st == ST_TOOL_TEXT) && !tool_buf.empty()) {

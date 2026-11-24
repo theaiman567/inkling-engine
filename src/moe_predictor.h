@@ -124,6 +124,8 @@ public:
         std::vector<float>& out_scores) const;
 
     int64_t answer_pos() const { return answer_tokens_; }
+    const std::vector<float>& map(MoePredMapKind k) const { return maps_[k]; }
+    int total_experts() const { return total_; }
 
 private:
     void build_raw_map_ptrs(const MoePredictorModel& model, std::vector<const float*>& ptrs) const;
