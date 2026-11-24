@@ -190,6 +190,9 @@ private:
                              float* d_out, int rel_extent, cudaStream_t stream);
     bool ensure_chunk_accum(int B);
     void unpin_vram_slots(const std::vector<int>& slots);
+    void rebuild_free_lists();
+    void release_vram_slot(int s);
+    void release_ram_slot(int s);
     int alloc_vram_page_slot(int protect_g, int protect_recent_start, cudaStream_t stream);
     int alloc_ram_page_slot(int& evicted_g, int& evicted_p);
     bool spill_ram_to_ssd(int g, int p, int rslot);
@@ -237,6 +240,8 @@ private:
     int vram_page_cap_ = 0;
     std::vector<std::pair<int, int>> vram_owner_; // [slot] -> (g, page_id)
     std::vector<uint8_t> vram_pin_;               // [slot] > 0 means pinned for in-flight attention/append (R4!)
+    std::vector<int> vram_free_list_;             // R18: O(1) free VRAM frame stack
+    int vram_evict_cursor_ = 0;                   // R18: bounded clock-LRU eviction hand
 
     // R4 lazy online-softmax chunk accumulators (0 bytes VRAM when single-chunk suffices!)
     float* d_chunk_out_ = nullptr;
@@ -247,6 +252,8 @@ private:
     int ram_page_cap_ = 0;
     std::vector<std::pair<int, int>> ram_owner_;  // [slot] -> (g, page_id)
     std::vector<uint64_t> ram_lru_;
+    std::vector<int> ram_free_list_;              // R18: O(1) free RAM frame stack
+    int ram_evict_cursor_ = 0;                    // R18: bounded clock-LRU eviction hand
 
     std::string ssd_path_;
     void* h_ssd_file_ = nullptr;

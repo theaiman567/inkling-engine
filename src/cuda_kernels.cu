@@ -235,6 +235,60 @@ __device__ __forceinline__ void quantize_x_gated_to_smem(const float* __restrict
     }
 }
 
+static_assert(sizeof(Q8Block32GPU) == 40, "Q8Block32GPU must be 40 bytes");
+
+// =========================================================================
+// R11: Single-Pass Activation Quantization Kernels into L2-resident g_batch_qx_buf
+// Eliminates redundant per-block Q8 quantization across GEMV, Multi-Proj, Wo, MoE, and LM Head!
+// =========================================================================
+__global__ void k_quantize_vec_q8(const float* __restrict__ X, Q8Block32GPU* __restrict__ qx_out, int K) {
+    int b = blockIdx.x;
+    int nb_k = K >> 5;
+    quantize_x_to_smem(X + (size_t)b * K, qx_out + (size_t)b * nb_k, K);
+}
+
+__global__ void k_quantize_vec_dyn_q8(const int32_t* __restrict__ d_n_gpu, const float* __restrict__ X,
+                                      Q8Block32GPU* __restrict__ qx_out, int K) {
+    int b = blockIdx.x;
+    if (b >= *d_n_gpu) return;
+    int nb_k = K >> 5;
+    quantize_x_to_smem(X + (size_t)b * K, qx_out + (size_t)b * nb_k, K);
+}
+
+__global__ void k_quantize_gated_vec_q8(const float* __restrict__ x, const float* __restrict__ gate,
+                                        Q8Block32GPU* __restrict__ qx_out, int K) {
+    quantize_x_gated_to_smem(x, gate, qx_out, K);
+}
+
+struct MultiQ8Ptrs {
+    const float* ptrs[8];
+    int8_t slot_idx[8];
+};
+
+__global__ void k_quantize_multi_q8(MultiQ8Ptrs mp, Q8Block32GPU* __restrict__ qx_out, int K) {
+    int u = blockIdx.x;
+    int nb_k = K >> 5;
+    quantize_x_to_smem(mp.ptrs[u], qx_out + (size_t)u * nb_k, K);
+}
+
+// Fast cooperative L2 -> SMEM staging of already-quantized Q8 blocks (<1 uint4 load/thread for K=2304!)
+// Prevents streaming weight reads from evicting Q8 activations out of L1 while keeping 0 redundant quantizations!
+__device__ __forceinline__ void stage_qx_to_smem(const Q8Block32GPU* __restrict__ g_qx,
+                                                 Q8Block32GPU* __restrict__ s_qx, int K) {
+    int n_bytes = (K >> 5) * (int)sizeof(Q8Block32GPU);
+    if ((n_bytes & 15) == 0 && ((((uintptr_t)g_qx) & 15) == 0)) {
+        int n16 = n_bytes >> 4;
+        const uint4* src = (const uint4*)g_qx;
+        uint4*       dst = (uint4*)s_qx;
+        for (int i = threadIdx.x; i < n16; i += blockDim.x) dst[i] = src[i];
+    } else {
+        int n4 = n_bytes >> 2;
+        const uint32_t* src = (const uint32_t*)g_qx;
+        uint32_t*       dst = (uint32_t*)s_qx;
+        for (int i = threadIdx.x; i < n4; i += blockDim.x) dst[i] = src[i];
+    }
+}
+
 // =========================================================================
 // Ultra-Fast Sub-Warp __dp4a + __ldg Quantized Dot Products!
 // Eliminates 25-87.5% warp-tail waste on K=2304 (72 blocks -> G=8 exact; 36 chunks -> G=4 exact!)
@@ -612,10 +666,10 @@ __device__ __forceinline__ float dot_quant_dp4a(const uint8_t* row, const Q8Bloc
 }
 
 template <uint32_t TYPE, int G>
-__global__ void k_gemv_dp4a(const uint8_t* __restrict__ W, const float* __restrict__ x, float* __restrict__ y,
-                            int M, int K, size_t row_bytes) {
+__global__ void k_gemv_dp4a_q8(const uint8_t* __restrict__ W, const Q8Block32GPU* __restrict__ g_qx,
+                               float* __restrict__ y, int M, int K, size_t row_bytes) {
     extern __shared__ Q8Block32GPU s_qx[];
-    quantize_x_to_smem(x, s_qx, K);
+    stage_qx_to_smem(g_qx, s_qx, K);
     __syncthreads();
 
     constexpr int RPB_SHIFT = (G == 4) ? 2 : ((G == 8) ? 3 : 5);
@@ -662,20 +716,24 @@ void ink_cuda_gemv(uint32_t type, const void* W, const float* x, float* y, int M
         return;
     }
 
+    // R11: Quantize activation vector ONCE into L2-resident g_batch_qx_buf (0 redundant quants!)
+    // Stage 2.88 KB Q8 into smem per block (<1.5 loads/thread) so streaming weights never thrash L1!
+    Q8Block32GPU* d_qx = (Q8Block32GPU*)g_batch_qx_buf;
+    k_quantize_vec_q8<<<1, 256, 0, stream>>>(x, d_qx, K);
     size_t smem = (size_t)(K >> 5) * sizeof(Q8Block32GPU);
-    // Coalesced G=32 (1 warp = 1 row) maximizes GDDR6 burst efficiency on RTX 4060!
-    // For huge vocab LM Head (M >= 32768), G=4 amortizes activation quantization across 32 rows/block (1.37 ms!).
+
+    // R22: Large-M G=4 (32 rows/block) extended to ALL 10 quantized types for LM Head!
     auto launch_gemv = [&](auto tag) {
         constexpr uint32_t T = decltype(tag)::value;
-        if (M >= 32768 && (T == GGML_TYPE_Q4_K || T == GGML_TYPE_Q5_K || T == GGML_TYPE_Q6_K)) {
+        if (M >= 32768) {
             int threads = 128;
             int rpb = threads / 4;
             int blocks = (M + rpb - 1) / rpb;
-            k_gemv_dp4a<T, 4><<<blocks, threads, smem, stream>>>(Wp, x, y, M, K, row_bytes);
+            k_gemv_dp4a_q8<T, 4><<<blocks, threads, smem, stream>>>(Wp, d_qx, y, M, K, row_bytes);
         } else {
             int WPB = (M <= 128) ? 2 : 8;
             int blocks = (M + WPB - 1) / WPB;
-            k_gemv_dp4a<T, 32><<<blocks, WPB * 32, smem, stream>>>(Wp, x, y, M, K, row_bytes);
+            k_gemv_dp4a_q8<T, 32><<<blocks, WPB * 32, smem, stream>>>(Wp, d_qx, y, M, K, row_bytes);
         }
     };
 
@@ -697,10 +755,10 @@ void ink_cuda_gemv(uint32_t type, const void* W, const float* x, float* y, int M
 }
 
 // =========================================================================
-// InkEngine v3.0 Super-Fused Multi-Projection GEMV & Gated Wo GEMV
-// (Only instantiates dense attention quant types Q8_0/Q4_K/Q5_K/Q6_K/BF16 -> low register count, max occupancy!)
+// InkEngine v4.0 Super-Fused Multi-Projection GEMV & Gated Wo GEMV (R11 Single-Pass Quant + SMEM Stage)
 // =========================================================================
-__global__ void __launch_bounds__(256, 3) k_fused_multi_gemv(FusedProjList list, int K) {
+__global__ void __launch_bounds__(256, 4) k_fused_multi_gemv(
+    FusedProjList list, MultiQ8Ptrs mp, const Q8Block32GPU* __restrict__ g_qx, int K) {
     extern __shared__ Q8Block32GPU s_qx[];
     int bid = blockIdx.x;
     int sidx = 0;
@@ -725,7 +783,7 @@ __global__ void __launch_bounds__(256, 3) k_fused_multi_gemv(FusedProjList list,
         return;
     }
 
-    quantize_x_to_smem(sl.x, s_qx, K);
+    stage_qx_to_smem(g_qx + (size_t)mp.slot_idx[sidx] * (K >> 5), s_qx, K);
     __syncthreads();
     if (row >= sl.M) return;
 
@@ -740,25 +798,30 @@ __global__ void __launch_bounds__(256, 3) k_fused_multi_gemv(FusedProjList list,
 
 void ink_cuda_fused_multi_gemv(const FusedProjList& list, int K, cudaStream_t stream) {
     if (list.total_blocks <= 0) return;
+    MultiQ8Ptrs mp{};
+    int n_uniq = 0;
+    for (int i = 0; i < list.count; ++i) {
+        uint32_t t = list.slots[i].type;
+        if (t == GGML_TYPE_BF16 || t == GGML_TYPE_F32 || t == GGML_TYPE_F16) {
+            mp.slot_idx[i] = 0;
+            continue;
+        }
+        int found = -1;
+        for (int u = 0; u < n_uniq; ++u) {
+            if (mp.ptrs[u] == list.slots[i].x) { found = u; break; }
+        }
+        if (found < 0) {
+            found = n_uniq;
+            mp.ptrs[n_uniq++] = list.slots[i].x;
+        }
+        mp.slot_idx[i] = (int8_t)found;
+    }
+    Q8Block32GPU* d_qx = (Q8Block32GPU*)g_batch_qx_buf;
+    if (n_uniq > 0) {
+        k_quantize_multi_q8<<<n_uniq, 256, 0, stream>>>(mp, d_qx, K);
+    }
     size_t smem = (size_t)(K >> 5) * sizeof(Q8Block32GPU);
-    k_fused_multi_gemv<<<list.total_blocks, 256, smem, stream>>>(list, K);
-}
-
-template <uint32_t TYPE>
-__global__ void k_gemv_gated_dp4a(const uint8_t* __restrict__ W, const float* __restrict__ x,
-                                  const float* __restrict__ gate, float* __restrict__ y,
-                                  int M, int K, size_t row_bytes) {
-    extern __shared__ Q8Block32GPU s_qx[];
-    quantize_x_gated_to_smem(x, gate, s_qx, K);
-    __syncthreads();
-
-    int warp = threadIdx.x >> 5;
-    int lane = threadIdx.x & 31;
-    int row  = blockIdx.x * (blockDim.x >> 5) + warp;
-    if (row >= M) return;
-
-    float val = dot_quant_dp4a<TYPE, 32>(W + (size_t)row * row_bytes, s_qx, K, lane);
-    if (lane == 0) y[row] = val;
+    k_fused_multi_gemv<<<list.total_blocks, 256, smem, stream>>>(list, mp, d_qx, K);
 }
 
 void ink_cuda_gemv_gated(uint32_t type, const void* W, const float* x, const float* gate,
@@ -770,17 +833,22 @@ void ink_cuda_gemv_gated(uint32_t type, const void* W, const float* x, const flo
     }
     size_t row_bytes = (size_t)(K / ggml_type_block_size(type)) * ggml_type_byte_size(type);
     const uint8_t* Wp = (const uint8_t*)W;
+    Q8Block32GPU* d_qx = (Q8Block32GPU*)g_batch_qx_buf;
+    k_quantize_gated_vec_q8<<<1, 256, 0, stream>>>(x, gate, d_qx, K);
     size_t smem = (size_t)(K >> 5) * sizeof(Q8Block32GPU);
     constexpr int WPB = 8;
     int blocks = (M + WPB - 1) / WPB;
     switch (type) {
-        case GGML_TYPE_Q8_0:    k_gemv_gated_dp4a<GGML_TYPE_Q8_0>   <<<blocks, WPB*32, smem, stream>>>(Wp, x, gate, y, M, K, row_bytes); break;
-        case GGML_TYPE_Q4_K:    k_gemv_gated_dp4a<GGML_TYPE_Q4_K>   <<<blocks, WPB*32, smem, stream>>>(Wp, x, gate, y, M, K, row_bytes); break;
-        case GGML_TYPE_Q5_K:    k_gemv_gated_dp4a<GGML_TYPE_Q5_K>   <<<blocks, WPB*32, smem, stream>>>(Wp, x, gate, y, M, K, row_bytes); break;
-        case GGML_TYPE_Q6_K:    k_gemv_gated_dp4a<GGML_TYPE_Q6_K>   <<<blocks, WPB*32, smem, stream>>>(Wp, x, gate, y, M, K, row_bytes); break;
-        case GGML_TYPE_NVFP4:   k_gemv_gated_dp4a<GGML_TYPE_NVFP4>  <<<blocks, WPB*32, smem, stream>>>(Wp, x, gate, y, M, K, row_bytes); break;
-        case GGML_TYPE_IQ4_NL:  k_gemv_gated_dp4a<GGML_TYPE_IQ4_NL> <<<blocks, WPB*32, smem, stream>>>(Wp, x, gate, y, M, K, row_bytes); break;
-        case GGML_TYPE_IQ3_XXS: k_gemv_gated_dp4a<GGML_TYPE_IQ3_XXS><<<blocks, WPB*32, smem, stream>>>(Wp, x, gate, y, M, K, row_bytes); break;
+        case GGML_TYPE_Q8_0:    k_gemv_dp4a_q8<GGML_TYPE_Q8_0,    32><<<blocks, WPB*32, smem, stream>>>(Wp, d_qx, y, M, K, row_bytes); break;
+        case GGML_TYPE_Q4_K:    k_gemv_dp4a_q8<GGML_TYPE_Q4_K,    32><<<blocks, WPB*32, smem, stream>>>(Wp, d_qx, y, M, K, row_bytes); break;
+        case GGML_TYPE_Q5_K:    k_gemv_dp4a_q8<GGML_TYPE_Q5_K,    32><<<blocks, WPB*32, smem, stream>>>(Wp, d_qx, y, M, K, row_bytes); break;
+        case GGML_TYPE_Q6_K:    k_gemv_dp4a_q8<GGML_TYPE_Q6_K,    32><<<blocks, WPB*32, smem, stream>>>(Wp, d_qx, y, M, K, row_bytes); break;
+        case GGML_TYPE_NVFP4:   k_gemv_dp4a_q8<GGML_TYPE_NVFP4,   32><<<blocks, WPB*32, smem, stream>>>(Wp, d_qx, y, M, K, row_bytes); break;
+        case GGML_TYPE_IQ4_NL:  k_gemv_dp4a_q8<GGML_TYPE_IQ4_NL,  32><<<blocks, WPB*32, smem, stream>>>(Wp, d_qx, y, M, K, row_bytes); break;
+        case GGML_TYPE_IQ3_XXS: k_gemv_dp4a_q8<GGML_TYPE_IQ3_XXS, 32><<<blocks, WPB*32, smem, stream>>>(Wp, d_qx, y, M, K, row_bytes); break;
+        case GGML_TYPE_IQ2_S:   k_gemv_dp4a_q8<GGML_TYPE_IQ2_S,   32><<<blocks, WPB*32, smem, stream>>>(Wp, d_qx, y, M, K, row_bytes); break;
+        case GGML_TYPE_IQ2_XS:  k_gemv_dp4a_q8<GGML_TYPE_IQ2_XS,  32><<<blocks, WPB*32, smem, stream>>>(Wp, d_qx, y, M, K, row_bytes); break;
+        case GGML_TYPE_IQ2_XXS: k_gemv_dp4a_q8<GGML_TYPE_IQ2_XXS, 32><<<blocks, WPB*32, smem, stream>>>(Wp, d_qx, y, M, K, row_bytes); break;
         default:
             ink_cuda_gate_sigmoid_mul(const_cast<float*>(x), gate, K, stream);
             ink_cuda_gemv(type, W, x, y, M, K, stream);
@@ -1656,12 +1724,14 @@ __device__ __forceinline__ size_t kv_head_bytes_dev(int kv_mode) {
 }
 
 // GQA=3 Fused SWA Split-K Kernel: loads K & V ONCE for all 3 query heads -> 3x LESS GDDR6 traffic!
+// R20: When final_out != nullptr (n_splits == 1), fuses sink + normalization in-kernel and skips reduce launch!
 __global__ void k_attn_swa_gqa_splitk(
     const float* __restrict__ Q,
     const uint8_t* __restrict__ K_ring, const uint8_t* __restrict__ V_ring,
     const int32_t* __restrict__ pos_ring,
     const float* __restrict__ rel_table,
     float* __restrict__ split_out, float* __restrict__ split_ml,
+    const float* __restrict__ sinks, float* __restrict__ final_out,
     int n_head, int n_head_kv, int head_dim,
     int swa_len, int n_splits, int pos_q, int rel_extent, int kv_mode)
 {
@@ -1752,22 +1822,41 @@ __global__ void k_attn_swa_gqa_splitk(
                 }
             }
         }
-        float* so = split_out + (sp * n_head + h) * head_dim;
-        so[lane + 0] = a0; so[lane + 32] = a1; so[lane + 64] = a2; so[lane + 96] = a3;
-        if (lane == 0) {
-            split_ml[(sp * n_head + h) * 2 + 0] = m_all;
-            split_ml[(sp * n_head + h) * 2 + 1] = l_all;
+        if (final_out) {
+            float sink_t = sinks[h];
+            float m_tot = fmaxf(sink_t, m_all);
+            float denom = expf(sink_t - m_tot);
+            float sc = 0.0f;
+            if (m_all > -FLT_MAX * 0.5f) {
+                sc = expf(m_all - m_tot);
+                denom += l_all * sc;
+            }
+            float inv_d = 1.0f / denom;
+            float* oh = final_out + h * head_dim;
+            oh[lane +  0] = (sc * a0) * inv_d;
+            oh[lane + 32] = (sc * a1) * inv_d;
+            oh[lane + 64] = (sc * a2) * inv_d;
+            oh[lane + 96] = (sc * a3) * inv_d;
+        } else {
+            float* so = split_out + (sp * n_head + h) * head_dim;
+            so[lane + 0] = a0; so[lane + 32] = a1; so[lane + 64] = a2; so[lane + 96] = a3;
+            if (lane == 0) {
+                split_ml[(sp * n_head + h) * 2 + 0] = m_all;
+                split_ml[(sp * n_head + h) * 2 + 1] = l_all;
+            }
         }
     }
 }
 
 // GQA=3 Fused Global Paged Split-K Kernel: loads K & V ONCE for all 3 query heads -> 3x LESS GDDR6 traffic!
+// R20: When final_out != nullptr (n_splits == 1), fuses sink + normalization in-kernel and skips reduce launch!
 __global__ void k_attn_global_splitk_gqa(
     const float* __restrict__ Q,
     const uint64_t* __restrict__ page_k_ptrs, const uint64_t* __restrict__ page_v_ptrs,
     const int32_t* __restrict__ page_pos0, const int32_t* __restrict__ page_lens,
     int n_pages, int n_splits, const float* __restrict__ rel_table,
     float* __restrict__ split_out, float* __restrict__ split_ml,
+    const float* __restrict__ sinks, float* __restrict__ final_out,
     int n_head, int n_head_kv, int head_dim, int pos_q, int rel_extent, int kv_mode)
 {
     int h_kv = blockIdx.x, sp = blockIdx.y;
@@ -1861,11 +1950,28 @@ __global__ void k_attn_global_splitk_gqa(
                 }
             }
         }
-        float* so = split_out + (sp * n_head + h) * head_dim;
-        so[lane + 0] = a0; so[lane + 32] = a1; so[lane + 64] = a2; so[lane + 96] = a3;
-        if (lane == 0) {
-            split_ml[(sp * n_head + h) * 2 + 0] = m_all;
-            split_ml[(sp * n_head + h) * 2 + 1] = l_all;
+        if (final_out) {
+            float sink_t = sinks[h];
+            float m_tot = fmaxf(sink_t, m_all);
+            float denom = expf(sink_t - m_tot);
+            float sc = 0.0f;
+            if (m_all > -FLT_MAX * 0.5f) {
+                sc = expf(m_all - m_tot);
+                denom += l_all * sc;
+            }
+            float inv_d = 1.0f / denom;
+            float* oh = final_out + h * head_dim;
+            oh[lane +  0] = (sc * a0) * inv_d;
+            oh[lane + 32] = (sc * a1) * inv_d;
+            oh[lane + 64] = (sc * a2) * inv_d;
+            oh[lane + 96] = (sc * a3) * inv_d;
+        } else {
+            float* so = split_out + (sp * n_head + h) * head_dim;
+            so[lane + 0] = a0; so[lane + 32] = a1; so[lane + 64] = a2; so[lane + 96] = a3;
+            if (lane == 0) {
+                split_ml[(sp * n_head + h) * 2 + 0] = m_all;
+                split_ml[(sp * n_head + h) * 2 + 1] = l_all;
+            }
         }
     }
 }
@@ -1905,13 +2011,22 @@ void ink_cuda_attn_swa(const float* Q, const void* K_ring, const void* V_ring, c
                        const float* rel_table, const float* sinks, float* split_out, float* split_ml, float* out,
                        int n_head, int n_head_kv, int head_dim, int swa_len, int pos_q,
                        int rel_extent, KVQuantMode kv_mode, cudaStream_t stream) {
-    int n_splits = (swa_len >= 256) ? 4 : ((swa_len >= 64) ? 2 : 1);
+    int n_splits = (swa_len >= 256) ? 4 : ((swa_len >= 128) ? 2 : 1);
     dim3 grid(n_head_kv, n_splits);
-    k_attn_swa_gqa_splitk<<<grid, 128, 0, stream>>>(
-        Q, (const uint8_t*)K_ring, (const uint8_t*)V_ring, pos_ring,
-        rel_table, split_out, split_ml, n_head, n_head_kv, head_dim, swa_len, n_splits, pos_q, rel_extent, (int)kv_mode);
-    k_attn_global_reduce<<<n_head, 32, 0, stream>>>(
-        split_out, split_ml, sinks, out, n_splits, n_head, head_dim);
+    if (n_splits == 1) {
+        // R20: Fused single-split sink + normalization (saves 40 reduce kernel launches/token!)
+        k_attn_swa_gqa_splitk<<<grid, 128, 0, stream>>>(
+            Q, (const uint8_t*)K_ring, (const uint8_t*)V_ring, pos_ring,
+            rel_table, split_out, split_ml, sinks, out,
+            n_head, n_head_kv, head_dim, swa_len, 1, pos_q, rel_extent, (int)kv_mode);
+    } else {
+        k_attn_swa_gqa_splitk<<<grid, 128, 0, stream>>>(
+            Q, (const uint8_t*)K_ring, (const uint8_t*)V_ring, pos_ring,
+            rel_table, split_out, split_ml, nullptr, nullptr,
+            n_head, n_head_kv, head_dim, swa_len, n_splits, pos_q, rel_extent, (int)kv_mode);
+        k_attn_global_reduce<<<n_head, 32, 0, stream>>>(
+            split_out, split_ml, sinks, out, n_splits, n_head, head_dim);
+    }
 }
 
 void ink_cuda_attn_global_paged(
@@ -1929,12 +2044,20 @@ void ink_cuda_attn_global_paged(
     else if (n_pages >= 4)  n_splits = 4;
 
     dim3 grid(n_head_kv, n_splits);
-    k_attn_global_splitk_gqa<<<grid, 128, 0, stream>>>(
-        Q, page_k_ptrs, page_v_ptrs, page_pos0, page_lens,
-        n_pages, n_splits, rel_table, split_out, split_ml,
-        n_head, n_head_kv, head_dim, pos_q, rel_extent, (int)kv_mode);
-    k_attn_global_reduce<<<n_head, 32, 0, stream>>>(
-        split_out, split_ml, sinks, out, n_splits, n_head, head_dim);
+    if (n_splits == 1) {
+        // R20: Fused single-split sink + normalization (skips k_attn_global_reduce!)
+        k_attn_global_splitk_gqa<<<grid, 128, 0, stream>>>(
+            Q, page_k_ptrs, page_v_ptrs, page_pos0, page_lens,
+            n_pages, 1, rel_table, split_out, split_ml, sinks, out,
+            n_head, n_head_kv, head_dim, pos_q, rel_extent, (int)kv_mode);
+    } else {
+        k_attn_global_splitk_gqa<<<grid, 128, 0, stream>>>(
+            Q, page_k_ptrs, page_v_ptrs, page_pos0, page_lens,
+            n_pages, n_splits, rel_table, split_out, split_ml, nullptr, nullptr,
+            n_head, n_head_kv, head_dim, pos_q, rel_extent, (int)kv_mode);
+        k_attn_global_reduce<<<n_head, 32, 0, stream>>>(
+            split_out, split_ml, sinks, out, n_splits, n_head, head_dim);
+    }
 }
 
 __global__ void k_quest_score_q8(const float* __restrict__ Q,
@@ -2050,20 +2173,16 @@ void ink_cuda_quest_topk(const float* page_scores, int hist_start, int hist_end,
 }
 
 // =========================================================================
-// High-Speed Multi-Block MoE Router (32 blocks across all 24 SMs -> ~0.25 ms total!)
+// High-Speed Multi-Block MoE Router (32 blocks across all 24 SMs, 0 smem via L1/L2 cache!)
 // =========================================================================
 __global__ void k_router_gemv(const float* __restrict__ gate_inp, const float* __restrict__ x,
                               float* __restrict__ logits, int n_expert, int n_embd) {
-    extern __shared__ float s_x[];
-    for (int i = threadIdx.x; i < n_embd; i += blockDim.x) s_x[i] = x[i];
-    __syncthreads();
-
     int warp = threadIdx.x >> 5;
     int lane = threadIdx.x & 31;
     int e = blockIdx.x * (blockDim.x >> 5) + warp;
     if (e >= n_expert) return;
 
-    float v = dot_f32_vec((const uint8_t*)(gate_inp + (size_t)e * n_embd), s_x, n_embd, lane);
+    float v = dot_f32_vec((const uint8_t*)(gate_inp + (size_t)e * n_embd), x, n_embd, lane);
     if (lane == 0) logits[e] = v;
 }
 
@@ -2129,90 +2248,40 @@ void ink_cuda_moe_router(const float* gate_inp, const float* bias, const float* 
                          int n_expert, int n_embd, int k, float weights_scale, cudaStream_t stream) {
     constexpr int WPB = 4;
     int blocks = (n_expert + WPB - 1) / WPB; // 32 blocks across 24 SMs!
-    k_router_gemv<<<blocks, WPB * 32, (size_t)n_embd * sizeof(float), stream>>>(gate_inp, x, logits_scratch, n_expert, n_embd);
+    k_router_gemv<<<blocks, WPB * 32, 0, stream>>>(gate_inp, x, logits_scratch, n_expert, n_embd);
     k_router_topk<<<1, 32, 0, stream>>>(logits_scratch, bias, top_ids, top_weights, n_expert, k, weights_scale);
 }
 
-// Fused FFN RMSNorm + Exact FP32 Router GEMV (100% lossless exact FP32 router weights!)
-__global__ void k_fused_ffn_norm_router_gemv(
-    const float* __restrict__ ffn_x,
-    const float* __restrict__ ffn_norm_w,
-    float* __restrict__ d_ffn_normed,
-    const float* __restrict__ gate_inp,
-    float* __restrict__ logits,
-    int n_expert, int n_embd, float eps)
-{
-    extern __shared__ float s_x[];
-    __shared__ float s_red[8];
-    int tid = threadIdx.x;
-    int nw  = blockDim.x >> 5;
-    int n4  = n_embd >> 2;
-    const float4* x4 = (const float4*)ffn_x;
-    const float4* w4 = (const float4*)ffn_norm_w;
-
-    float ss = 0.0f;
-    for (int i = tid; i < n4; i += blockDim.x) {
-        float4 v = x4[i];
-        ss = fmaf(v.x, v.x, fmaf(v.y, v.y, fmaf(v.z, v.z, fmaf(v.w, v.w, ss))));
-    }
-    ss = warp_reduce_sum(ss);
-    if ((tid & 31) == 0) s_red[tid >> 5] = ss;
-    __syncthreads();
-    if (tid == 0) {
-        float tot = 0.0f;
-        for (int w = 0; w < nw; ++w) tot += s_red[w];
-        s_red[0] = rsqrtf(tot / (float)n_embd + eps);
-    }
-    __syncthreads();
-    float inv = s_red[0];
-    float4* sx4 = (float4*)s_x;
-    float4* o4  = (float4*)d_ffn_normed;
-    const bool write_out = (blockIdx.x == 0);
-    for (int i = tid; i < n4; i += blockDim.x) {
-        float4 v = x4[i], g = w4[i];
-        float4 nv = make_float4(v.x * inv * g.x, v.y * inv * g.y, v.z * inv * g.z, v.w * inv * g.w);
-        sx4[i] = nv;
-        if (write_out) o4[i] = nv;
-    }
-    __syncthreads();
-
-    int warp = tid >> 5;
-    int lane = tid & 31;
-    int e = blockIdx.x * nw + warp;
-    if (e >= n_expert) return;
-
-    float v = dot_f32_vec((const uint8_t*)(gate_inp + (size_t)e * n_embd), s_x, n_embd, lane);
-    if (lane == 0) logits[e] = v;
-}
-
+// R11: Single-pass FFN RMSNorm + Zero-Smem L2-Cached Exact FP32 Router GEMV + Top-K
+// Eliminates 31x redundant RMSNorm reductions + 9.2 KB smem/block across all 48 layers!
 void ink_cuda_fused_ffn_norm_router(
     const float* ffn_x, const float* ffn_norm_w, float* d_ffn_normed,
     const float* gate_inp, const float* bias, float* logits_scratch,
     int32_t* top_ids, float* top_weights,
     int n_expert, int n_embd, int k, float eps, float weights_scale, cudaStream_t stream)
 {
+    k_rms_norm<<<1, 256, 0, stream>>>(ffn_x, ffn_norm_w, d_ffn_normed, n_embd, eps);
     constexpr int WPB = 4;
     int blocks = (n_expert + WPB - 1) / WPB; // 32 blocks across 24 SMs!
-    k_fused_ffn_norm_router_gemv<<<blocks, WPB * 32, (size_t)n_embd * sizeof(float), stream>>>(
-        ffn_x, ffn_norm_w, d_ffn_normed, gate_inp, logits_scratch, n_expert, n_embd, eps);
+    k_router_gemv<<<blocks, WPB * 32, 0, stream>>>(gate_inp, d_ffn_normed, logits_scratch, n_expert, n_embd);
     k_router_topk<<<1, 32, 0, stream>>>(logits_scratch, bias, top_ids, top_weights, n_expert, k, weights_scale);
 }
 
 // =========================================================================
-// Supercharged Sub-Warp __dp4a Fused Multi-Expert GateUp + SITU & Down + Reduce!
-// Uses G=8 (72/8=9 exact, 0% warp waste!) and G=4 for IQ4_NL (36/4=9 exact!)
-// Supports: (1) host-resolved batch, (2) 100%-resident zero-sync indirect,
-//           (3) GPU-first zero-bubble dynamic split + indirect (overlaps GPU & CPU!)
+// R11 + R12: Single-Pass Pre-Quantized Sub-Warp __dp4a Fused Multi-Expert GateUp + SITU & Down + Reduce!
+// - Zero shared memory (reads L2-resident g_batch_qx_buf pre-quantized ONCE!)
+// - GateUp uses G=8 (72/8=9 exact, 0% warp waste!)
+// - Down uses G=8 for NVFP4 (72/8=9 exact) and G=4 for IQ4_NL/IQ3_XXS (36/4=9 exact, 0% warp waste!)
 // =========================================================================
 template <uint32_t TYPE, int G>
-__global__ void k_moe_gate_up_situ_dp4a(GPUExpertBatch batch, const float* __restrict__ x,
+__global__ void k_moe_gate_up_situ_dp4a(GPUExpertBatch batch, const Q8Block32GPU* __restrict__ g_qx,
                                         float* __restrict__ h_out, int n_embd, int n_ff,
                                         size_t row_bytes, float beta, float lb) {
     int eidx = blockIdx.y;
     if (eidx >= batch.count) return;
 
     extern __shared__ Q8Block32GPU s_qx[];
-    quantize_x_to_smem(x, s_qx, n_embd);
+    stage_qx_to_smem(g_qx, s_qx, n_embd);
     __syncthreads();
 
     constexpr int SHIFT = (G == 4) ? 2 : ((G == 8) ? 3 : 5);
@@ -2230,26 +2299,20 @@ __global__ void k_moe_gate_up_situ_dp4a(GPUExpertBatch batch, const float* __res
 }
 
 template <uint32_t TYPE, int G>
-__global__ void k_moe_down_reduce_dp4a(GPUExpertBatch batch, const float* __restrict__ h_in,
+__global__ void k_moe_down_reduce_dp4a(GPUExpertBatch batch, const Q8Block32GPU* __restrict__ g_qh,
                                        float* __restrict__ out, int n_embd, int n_ff, size_t row_bytes) {
-    extern __shared__ Q8Block32GPU s_qh[];
-    int nb_ff = n_ff >> 5;
-    for (int k = 0; k < batch.count; ++k) {
-        quantize_x_to_smem(h_in + k * n_ff, s_qh + k * nb_ff, n_ff);
-    }
-    __syncthreads();
-
     constexpr int SHIFT = (G == 4) ? 2 : ((G == 8) ? 3 : 5);
     int rpb   = blockDim.x >> SHIFT;
     int gid   = threadIdx.x >> SHIFT;
     int glane = threadIdx.x & (G - 1);
     int row   = blockIdx.x * rpb + gid;
     int srow  = (row < n_embd) ? row : (n_embd - 1);
+    int nb_ff = n_ff >> 5;
 
     float acc = 0.0f;
     for (int k = 0; k < batch.count; ++k) {
         const uint8_t* rp = (const uint8_t*)batch.down_ptrs[k] + (size_t)srow * row_bytes;
-        float v = dot_quant_dp4a<TYPE, G>(rp, s_qh + k * nb_ff, n_ff, glane);
+        float v = dot_quant_dp4a<TYPE, G>(rp, g_qh + k * nb_ff, n_ff, glane);
         acc = fmaf(v, batch.down_w_scales[k], acc);
     }
     if (glane == 0 && row < n_embd) out[row] = acc;
@@ -2260,14 +2323,14 @@ template <uint32_t TYPE, int G>
 __global__ void k_moe_gate_up_situ_indirect(
     const uint64_t* __restrict__ d_gu_ptrs, const float* __restrict__ d_gu_scales,
     const int32_t* __restrict__ d_top_ids, int k_cnt,
-    const float* __restrict__ x, float* __restrict__ h_out,
+    const Q8Block32GPU* __restrict__ g_qx, float* __restrict__ h_out,
     int n_embd, int n_ff, size_t row_bytes, float beta, float lb)
 {
     int eidx = blockIdx.y;
     if (eidx >= k_cnt) return;
 
     extern __shared__ Q8Block32GPU s_qx[];
-    quantize_x_to_smem(x, s_qx, n_embd);
+    stage_qx_to_smem(g_qx, s_qx, n_embd);
     __syncthreads();
 
     constexpr int SHIFT = (G == 4) ? 2 : ((G == 8) ? 3 : 5);
@@ -2290,28 +2353,22 @@ template <uint32_t TYPE, int G>
 __global__ void k_moe_down_reduce_indirect(
     const uint64_t* __restrict__ d_dn_ptrs, const float* __restrict__ d_dn_scales,
     const int32_t* __restrict__ d_top_ids, const float* __restrict__ d_top_weights, int k_cnt,
-    const float* __restrict__ h_in, float* __restrict__ out,
+    const Q8Block32GPU* __restrict__ g_qh, float* __restrict__ out,
     int n_embd, int n_ff, size_t row_bytes)
 {
-    extern __shared__ Q8Block32GPU s_qh[];
-    int nb_ff = n_ff >> 5;
-    for (int k = 0; k < k_cnt; ++k) {
-        quantize_x_to_smem(h_in + k * n_ff, s_qh + k * nb_ff, n_ff);
-    }
-    __syncthreads();
-
     constexpr int SHIFT = (G == 4) ? 2 : ((G == 8) ? 3 : 5);
     int rpb   = blockDim.x >> SHIFT;
     int gid   = threadIdx.x >> SHIFT;
     int glane = threadIdx.x & (G - 1);
     int row   = blockIdx.x * rpb + gid;
     int srow  = (row < n_embd) ? row : (n_embd - 1);
+    int nb_ff = n_ff >> 5;
 
     float acc = 0.0f;
     for (int k = 0; k < k_cnt; ++k) {
         int exp_id = d_top_ids[k];
         const uint8_t* rp = (const uint8_t*)(uintptr_t)d_dn_ptrs[exp_id] + (size_t)srow * row_bytes;
-        float v = dot_quant_dp4a<TYPE, G>(rp, s_qh + k * nb_ff, n_ff, glane);
+        float v = dot_quant_dp4a<TYPE, G>(rp, g_qh + k * nb_ff, n_ff, glane);
         acc = fmaf(v, d_dn_scales[exp_id] * d_top_weights[k], acc);
     }
     if (glane == 0 && row < n_embd) out[row] = acc;
@@ -2334,7 +2391,8 @@ __global__ void k_moe_split_hits(
     int32_t* __restrict__ d_gpu_hit_ids,
     float* __restrict__ d_gpu_hit_weights,
     MoESplitPacket* __restrict__ d_mapped_pkt,
-    float* __restrict__ d_mapped_ffn_in)
+    float* __restrict__ d_mapped_ffn_in,
+    uint32_t seq)
 {
     __shared__ int s_ncpu;
     if (threadIdx.x == 0) {
@@ -2382,16 +2440,20 @@ __global__ void k_moe_split_hits(
             dst[i] = src[i];
         }
     }
-    // Every thread that wrote zero-copy pinned host memory MUST issue a system-scope fence!
+    // Every thread that wrote zero-copy pinned host memory MUST issue a system-scope fence BEFORE publishing seq!
     __threadfence_system();
     __syncthreads();
+    if (threadIdx.x == 0 && d_mapped_pkt) {
+        *reinterpret_cast<volatile uint32_t*>(&d_mapped_pkt->seq) = seq;
+        __threadfence_system();
+    }
 }
 
 template <uint32_t TYPE, int G>
 __global__ void k_moe_gate_up_situ_dyn(
     const uint64_t* __restrict__ d_gu_ptrs, const float* __restrict__ d_gu_scales,
     const int32_t* __restrict__ d_n_gpu, const int32_t* __restrict__ d_hit_ids,
-    const float* __restrict__ x, float* __restrict__ h_out,
+    const Q8Block32GPU* __restrict__ g_qx, float* __restrict__ h_out,
     int n_embd, int n_ff, size_t row_bytes, float beta, float lb)
 {
     int n_gpu = *d_n_gpu;
@@ -2399,7 +2461,7 @@ __global__ void k_moe_gate_up_situ_dyn(
     if (eidx >= n_gpu) return;
 
     extern __shared__ Q8Block32GPU s_qx[];
-    quantize_x_to_smem(x, s_qx, n_embd);
+    stage_qx_to_smem(g_qx, s_qx, n_embd);
     __syncthreads();
 
     constexpr int SHIFT = (G == 4) ? 2 : ((G == 8) ? 3 : 5);
@@ -2422,7 +2484,7 @@ template <uint32_t TYPE, int G>
 __global__ void k_moe_down_reduce_dyn(
     const uint64_t* __restrict__ d_dn_ptrs, const float* __restrict__ d_dn_scales,
     const int32_t* __restrict__ d_n_gpu, const int32_t* __restrict__ d_hit_ids, const float* __restrict__ d_hit_weights,
-    const float* __restrict__ h_in, float* __restrict__ out,
+    const Q8Block32GPU* __restrict__ g_qh, float* __restrict__ out,
     int n_embd, int n_ff, size_t row_bytes)
 {
     constexpr int SHIFT = (G == 4) ? 2 : ((G == 8) ? 3 : 5);
@@ -2437,19 +2499,13 @@ __global__ void k_moe_down_reduce_dyn(
         return;
     }
 
-    extern __shared__ Q8Block32GPU s_qh[];
     int nb_ff = n_ff >> 5;
-    for (int k = 0; k < n_gpu; ++k) {
-        quantize_x_to_smem(h_in + k * n_ff, s_qh + k * nb_ff, n_ff);
-    }
-    __syncthreads();
-
     int srow = (row < n_embd) ? row : (n_embd - 1);
     float acc = 0.0f;
     for (int k = 0; k < n_gpu; ++k) {
         int exp_id = d_hit_ids[k];
         const uint8_t* rp = (const uint8_t*)(uintptr_t)d_dn_ptrs[exp_id] + (size_t)srow * row_bytes;
-        float v = dot_quant_dp4a<TYPE, G>(rp, s_qh + k * nb_ff, n_ff, glane);
+        float v = dot_quant_dp4a<TYPE, G>(rp, g_qh + k * nb_ff, n_ff, glane);
         acc = fmaf(v, d_dn_scales[exp_id] * d_hit_weights[k], acc);
     }
     if (glane == 0 && row < n_embd) out[row] = acc;
@@ -2460,17 +2516,21 @@ void ink_cuda_moe_gate_up_situ(uint32_t gate_up_type, GPUExpertBatch batch, cons
                                cudaStream_t stream) {
     if (batch.count <= 0) return;
     size_t rb = (size_t)(n_embd / ggml_type_block_size(gate_up_type)) * ggml_type_byte_size(gate_up_type);
+    Q8Block32GPU* d_qx = (Q8Block32GPU*)g_batch_qx_buf;
+    k_quantize_vec_q8<<<1, 256, 0, stream>>>(x, d_qx, n_embd);
+
+    constexpr int THREADS = 256;
+    constexpr int RPB = THREADS / 8; // G=8 -> 32 rows/block, 72/8 = 9 exact iterations!
+    dim3 grid((n_ff + RPB - 1) / RPB, batch.count);
     size_t smem = (size_t)(n_embd >> 5) * sizeof(Q8Block32GPU);
-    constexpr int WPB = 8;
-    dim3 grid((n_ff + WPB - 1) / WPB, batch.count);
 
     switch (gate_up_type) {
-        case GGML_TYPE_IQ3_XXS: k_moe_gate_up_situ_dp4a<GGML_TYPE_IQ3_XXS, 32><<<grid, WPB*32, smem, stream>>>(batch, x, h_out, n_embd, n_ff, rb, situ_beta, situ_linear_beta); break;
-        case GGML_TYPE_IQ2_S:   k_moe_gate_up_situ_dp4a<GGML_TYPE_IQ2_S,   32><<<grid, WPB*32, smem, stream>>>(batch, x, h_out, n_embd, n_ff, rb, situ_beta, situ_linear_beta); break;
-        case GGML_TYPE_IQ2_XS:  k_moe_gate_up_situ_dp4a<GGML_TYPE_IQ2_XS,  32><<<grid, WPB*32, smem, stream>>>(batch, x, h_out, n_embd, n_ff, rb, situ_beta, situ_linear_beta); break;
-        case GGML_TYPE_IQ2_XXS: k_moe_gate_up_situ_dp4a<GGML_TYPE_IQ2_XXS, 32><<<grid, WPB*32, smem, stream>>>(batch, x, h_out, n_embd, n_ff, rb, situ_beta, situ_linear_beta); break;
-        case GGML_TYPE_NVFP4:   k_moe_gate_up_situ_dp4a<GGML_TYPE_NVFP4,   32><<<grid, WPB*32, smem, stream>>>(batch, x, h_out, n_embd, n_ff, rb, situ_beta, situ_linear_beta); break;
-        case GGML_TYPE_IQ4_NL:  k_moe_gate_up_situ_dp4a<GGML_TYPE_IQ4_NL,  32><<<grid, WPB*32, smem, stream>>>(batch, x, h_out, n_embd, n_ff, rb, situ_beta, situ_linear_beta); break;
+        case GGML_TYPE_IQ3_XXS: k_moe_gate_up_situ_dp4a<GGML_TYPE_IQ3_XXS, 8><<<grid, THREADS, smem, stream>>>(batch, d_qx, h_out, n_embd, n_ff, rb, situ_beta, situ_linear_beta); break;
+        case GGML_TYPE_IQ2_S:   k_moe_gate_up_situ_dp4a<GGML_TYPE_IQ2_S,   8><<<grid, THREADS, smem, stream>>>(batch, d_qx, h_out, n_embd, n_ff, rb, situ_beta, situ_linear_beta); break;
+        case GGML_TYPE_IQ2_XS:  k_moe_gate_up_situ_dp4a<GGML_TYPE_IQ2_XS,  8><<<grid, THREADS, smem, stream>>>(batch, d_qx, h_out, n_embd, n_ff, rb, situ_beta, situ_linear_beta); break;
+        case GGML_TYPE_IQ2_XXS: k_moe_gate_up_situ_dp4a<GGML_TYPE_IQ2_XXS, 8><<<grid, THREADS, smem, stream>>>(batch, d_qx, h_out, n_embd, n_ff, rb, situ_beta, situ_linear_beta); break;
+        case GGML_TYPE_NVFP4:   k_moe_gate_up_situ_dp4a<GGML_TYPE_NVFP4,   8><<<grid, THREADS, smem, stream>>>(batch, d_qx, h_out, n_embd, n_ff, rb, situ_beta, situ_linear_beta); break;
+        case GGML_TYPE_IQ4_NL:  k_moe_gate_up_situ_dp4a<GGML_TYPE_IQ4_NL,  8><<<grid, THREADS, smem, stream>>>(batch, d_qx, h_out, n_embd, n_ff, rb, situ_beta, situ_linear_beta); break;
         default: std::fprintf(stderr, "[CUDA] Unsupported MoE gate_up %u\n", gate_up_type); std::abort();
     }
 }
@@ -2482,14 +2542,29 @@ void ink_cuda_moe_down_reduce(uint32_t down_type, GPUExpertBatch batch, const fl
         return;
     }
     size_t rb = (size_t)(n_ff / ggml_type_block_size(down_type)) * ggml_type_byte_size(down_type);
-    constexpr int WPB = 8;
-    int blocks = (n_embd + WPB - 1) / WPB;
-    size_t smem = (size_t)batch.count * (n_ff >> 5) * sizeof(Q8Block32GPU);
+    Q8Block32GPU* d_qh = (Q8Block32GPU*)g_batch_qx_buf;
+    k_quantize_vec_q8<<<batch.count, 128, 0, stream>>>(h_in, d_qh, n_ff);
 
+    constexpr int THREADS = 128;
     switch (down_type) {
-        case GGML_TYPE_NVFP4:   k_moe_down_reduce_dp4a<GGML_TYPE_NVFP4,   32><<<blocks, WPB*32, smem, stream>>>(batch, h_in, out, n_embd, n_ff, rb); break;
-        case GGML_TYPE_IQ4_NL:  k_moe_down_reduce_dp4a<GGML_TYPE_IQ4_NL,  32><<<blocks, WPB*32, smem, stream>>>(batch, h_in, out, n_embd, n_ff, rb); break;
-        case GGML_TYPE_IQ3_XXS: k_moe_down_reduce_dp4a<GGML_TYPE_IQ3_XXS, 32><<<blocks, WPB*32, smem, stream>>>(batch, h_in, out, n_embd, n_ff, rb); break;
+        case GGML_TYPE_NVFP4: {
+            constexpr int RPB = THREADS / 8; // 72 sub-blocks / 8 = 9 exact, 144 blocks!
+            int blocks = (n_embd + RPB - 1) / RPB;
+            k_moe_down_reduce_dp4a<GGML_TYPE_NVFP4, 8><<<blocks, THREADS, 0, stream>>>(batch, d_qh, out, n_embd, n_ff, rb);
+            break;
+        }
+        case GGML_TYPE_IQ4_NL: {
+            constexpr int RPB = THREADS / 4; // 36 sub-blocks / 4 = 9 exact, 72 blocks!
+            int blocks = (n_embd + RPB - 1) / RPB;
+            k_moe_down_reduce_dp4a<GGML_TYPE_IQ4_NL, 4><<<blocks, THREADS, 0, stream>>>(batch, d_qh, out, n_embd, n_ff, rb);
+            break;
+        }
+        case GGML_TYPE_IQ3_XXS: {
+            constexpr int RPB = THREADS / 4; // 36 sub-blocks / 4 = 9 exact, 72 blocks!
+            int blocks = (n_embd + RPB - 1) / RPB;
+            k_moe_down_reduce_dp4a<GGML_TYPE_IQ3_XXS, 4><<<blocks, THREADS, 0, stream>>>(batch, d_qh, out, n_embd, n_ff, rb);
+            break;
+        }
         default: std::fprintf(stderr, "[CUDA] Unsupported MoE down %u\n", down_type); std::abort();
     }
 }
@@ -2501,26 +2576,39 @@ void ink_cuda_moe_pinned_indirect(
     const float* x, float* h_scratch, float* out,
     int n_embd, int n_ff, float situ_beta, float situ_linear_beta, cudaStream_t stream)
 {
-    constexpr int WPB = 8;
+    Q8Block32GPU* d_qx = (Q8Block32GPU*)g_batch_qx_buf;
     {
+        k_quantize_vec_q8<<<1, 256, 0, stream>>>(x, d_qx, n_embd);
         size_t rb = (size_t)(n_embd / ggml_type_block_size(gate_up_type)) * ggml_type_byte_size(gate_up_type);
-        dim3 grid((n_ff + WPB - 1) / WPB, k);
+        constexpr int THREADS = 256;
+        constexpr int RPB = THREADS / 8; // G=8 -> 32 rows/block, 36*k blocks!
+        dim3 grid((n_ff + RPB - 1) / RPB, k);
         size_t smem = (size_t)(n_embd >> 5) * sizeof(Q8Block32GPU);
         switch (gate_up_type) {
-            case GGML_TYPE_IQ3_XXS: k_moe_gate_up_situ_indirect<GGML_TYPE_IQ3_XXS, 32><<<grid, WPB*32, smem, stream>>>(tbl.d_gu_ptrs, tbl.d_gu_scales, d_top_ids, k, x, h_scratch, n_embd, n_ff, rb, situ_beta, situ_linear_beta); break;
-            case GGML_TYPE_IQ2_S:   k_moe_gate_up_situ_indirect<GGML_TYPE_IQ2_S,   32><<<grid, WPB*32, smem, stream>>>(tbl.d_gu_ptrs, tbl.d_gu_scales, d_top_ids, k, x, h_scratch, n_embd, n_ff, rb, situ_beta, situ_linear_beta); break;
-            case GGML_TYPE_IQ2_XS:  k_moe_gate_up_situ_indirect<GGML_TYPE_IQ2_XS,  32><<<grid, WPB*32, smem, stream>>>(tbl.d_gu_ptrs, tbl.d_gu_scales, d_top_ids, k, x, h_scratch, n_embd, n_ff, rb, situ_beta, situ_linear_beta); break;
-            case GGML_TYPE_IQ2_XXS: k_moe_gate_up_situ_indirect<GGML_TYPE_IQ2_XXS, 32><<<grid, WPB*32, smem, stream>>>(tbl.d_gu_ptrs, tbl.d_gu_scales, d_top_ids, k, x, h_scratch, n_embd, n_ff, rb, situ_beta, situ_linear_beta); break;
+            case GGML_TYPE_IQ3_XXS: k_moe_gate_up_situ_indirect<GGML_TYPE_IQ3_XXS, 8><<<grid, THREADS, smem, stream>>>(tbl.d_gu_ptrs, tbl.d_gu_scales, d_top_ids, k, d_qx, h_scratch, n_embd, n_ff, rb, situ_beta, situ_linear_beta); break;
+            case GGML_TYPE_IQ2_S:   k_moe_gate_up_situ_indirect<GGML_TYPE_IQ2_S,   8><<<grid, THREADS, smem, stream>>>(tbl.d_gu_ptrs, tbl.d_gu_scales, d_top_ids, k, d_qx, h_scratch, n_embd, n_ff, rb, situ_beta, situ_linear_beta); break;
+            case GGML_TYPE_IQ2_XS:  k_moe_gate_up_situ_indirect<GGML_TYPE_IQ2_XS,  8><<<grid, THREADS, smem, stream>>>(tbl.d_gu_ptrs, tbl.d_gu_scales, d_top_ids, k, d_qx, h_scratch, n_embd, n_ff, rb, situ_beta, situ_linear_beta); break;
+            case GGML_TYPE_IQ2_XXS: k_moe_gate_up_situ_indirect<GGML_TYPE_IQ2_XXS, 8><<<grid, THREADS, smem, stream>>>(tbl.d_gu_ptrs, tbl.d_gu_scales, d_top_ids, k, d_qx, h_scratch, n_embd, n_ff, rb, situ_beta, situ_linear_beta); break;
             default: std::fprintf(stderr, "[CUDA] Unsupported indirect gate_up %u\n", gate_up_type); std::abort();
         }
     }
     {
+        k_quantize_vec_q8<<<k, 128, 0, stream>>>(h_scratch, d_qx, n_ff);
         size_t rb = (size_t)(n_ff / ggml_type_block_size(down_type)) * ggml_type_byte_size(down_type);
-        int blocks = (n_embd + WPB - 1) / WPB;
-        size_t smem = (size_t)k * (n_ff >> 5) * sizeof(Q8Block32GPU);
+        constexpr int THREADS = 128;
         switch (down_type) {
-            case GGML_TYPE_NVFP4:  k_moe_down_reduce_indirect<GGML_TYPE_NVFP4,  32><<<blocks, WPB*32, smem, stream>>>(tbl.d_dn_ptrs, tbl.d_dn_scales, d_top_ids, d_top_weights, k, h_scratch, out, n_embd, n_ff, rb); break;
-            case GGML_TYPE_IQ4_NL: k_moe_down_reduce_indirect<GGML_TYPE_IQ4_NL, 32><<<blocks, WPB*32, smem, stream>>>(tbl.d_dn_ptrs, tbl.d_dn_scales, d_top_ids, d_top_weights, k, h_scratch, out, n_embd, n_ff, rb); break;
+            case GGML_TYPE_NVFP4: {
+                constexpr int RPB = THREADS / 8;
+                int blocks = (n_embd + RPB - 1) / RPB;
+                k_moe_down_reduce_indirect<GGML_TYPE_NVFP4, 8><<<blocks, THREADS, 0, stream>>>(tbl.d_dn_ptrs, tbl.d_dn_scales, d_top_ids, d_top_weights, k, d_qx, out, n_embd, n_ff, rb);
+                break;
+            }
+            case GGML_TYPE_IQ4_NL: {
+                constexpr int RPB = THREADS / 4;
+                int blocks = (n_embd + RPB - 1) / RPB;
+                k_moe_down_reduce_indirect<GGML_TYPE_IQ4_NL, 4><<<blocks, THREADS, 0, stream>>>(tbl.d_dn_ptrs, tbl.d_dn_scales, d_top_ids, d_top_weights, k, d_qx, out, n_embd, n_ff, rb);
+                break;
+            }
             default: std::fprintf(stderr, "[CUDA] Unsupported indirect down %u\n", down_type); std::abort();
         }
     }
@@ -2531,11 +2619,11 @@ void ink_cuda_moe_split_hits(
     const int32_t* d_top_ids, const float* d_top_weights, int k,
     const float* d_x, int n_embd,
     int32_t* d_n_gpu, int32_t* d_gpu_hit_ids, float* d_gpu_hit_weights,
-    MoESplitPacket* d_mapped_pkt, float* d_mapped_ffn_in, cudaStream_t stream)
+    MoESplitPacket* d_mapped_pkt, float* d_mapped_ffn_in, uint32_t seq, cudaStream_t stream)
 {
     k_moe_split_hits<<<1, 256, 0, stream>>>(
         tbl.d_gu_ptrs, d_top_ids, d_top_weights, k, d_x, n_embd,
-        d_n_gpu, d_gpu_hit_ids, d_gpu_hit_weights, d_mapped_pkt, d_mapped_ffn_in);
+        d_n_gpu, d_gpu_hit_ids, d_gpu_hit_weights, d_mapped_pkt, d_mapped_ffn_in, seq);
 }
 
 void ink_cuda_moe_dynamic_indirect(
@@ -2545,27 +2633,361 @@ void ink_cuda_moe_dynamic_indirect(
     const float* x, float* h_scratch, float* out,
     int n_embd, int n_ff, float situ_beta, float situ_linear_beta, cudaStream_t stream)
 {
-    constexpr int WPB = 8;
+    Q8Block32GPU* d_qx = (Q8Block32GPU*)g_batch_qx_buf;
     {
+        k_quantize_vec_q8<<<1, 256, 0, stream>>>(x, d_qx, n_embd);
         size_t rb = (size_t)(n_embd / ggml_type_block_size(gate_up_type)) * ggml_type_byte_size(gate_up_type);
-        dim3 grid((n_ff + WPB - 1) / WPB, max_k);
+        constexpr int THREADS = 256;
+        constexpr int RPB = THREADS / 8;
+        dim3 grid((n_ff + RPB - 1) / RPB, max_k);
         size_t smem = (size_t)(n_embd >> 5) * sizeof(Q8Block32GPU);
         switch (gate_up_type) {
-            case GGML_TYPE_IQ3_XXS: k_moe_gate_up_situ_dyn<GGML_TYPE_IQ3_XXS, 32><<<grid, WPB*32, smem, stream>>>(tbl.d_gu_ptrs, tbl.d_gu_scales, d_n_gpu, d_gpu_hit_ids, x, h_scratch, n_embd, n_ff, rb, situ_beta, situ_linear_beta); break;
-            case GGML_TYPE_IQ2_S:   k_moe_gate_up_situ_dyn<GGML_TYPE_IQ2_S,   32><<<grid, WPB*32, smem, stream>>>(tbl.d_gu_ptrs, tbl.d_gu_scales, d_n_gpu, d_gpu_hit_ids, x, h_scratch, n_embd, n_ff, rb, situ_beta, situ_linear_beta); break;
-            case GGML_TYPE_IQ2_XS:  k_moe_gate_up_situ_dyn<GGML_TYPE_IQ2_XS,  32><<<grid, WPB*32, smem, stream>>>(tbl.d_gu_ptrs, tbl.d_gu_scales, d_n_gpu, d_gpu_hit_ids, x, h_scratch, n_embd, n_ff, rb, situ_beta, situ_linear_beta); break;
-            case GGML_TYPE_IQ2_XXS: k_moe_gate_up_situ_dyn<GGML_TYPE_IQ2_XXS, 32><<<grid, WPB*32, smem, stream>>>(tbl.d_gu_ptrs, tbl.d_gu_scales, d_n_gpu, d_gpu_hit_ids, x, h_scratch, n_embd, n_ff, rb, situ_beta, situ_linear_beta); break;
+            case GGML_TYPE_IQ3_XXS: k_moe_gate_up_situ_dyn<GGML_TYPE_IQ3_XXS, 8><<<grid, THREADS, smem, stream>>>(tbl.d_gu_ptrs, tbl.d_gu_scales, d_n_gpu, d_gpu_hit_ids, d_qx, h_scratch, n_embd, n_ff, rb, situ_beta, situ_linear_beta); break;
+            case GGML_TYPE_IQ2_S:   k_moe_gate_up_situ_dyn<GGML_TYPE_IQ2_S,   8><<<grid, THREADS, smem, stream>>>(tbl.d_gu_ptrs, tbl.d_gu_scales, d_n_gpu, d_gpu_hit_ids, d_qx, h_scratch, n_embd, n_ff, rb, situ_beta, situ_linear_beta); break;
+            case GGML_TYPE_IQ2_XS:  k_moe_gate_up_situ_dyn<GGML_TYPE_IQ2_XS,  8><<<grid, THREADS, smem, stream>>>(tbl.d_gu_ptrs, tbl.d_gu_scales, d_n_gpu, d_gpu_hit_ids, d_qx, h_scratch, n_embd, n_ff, rb, situ_beta, situ_linear_beta); break;
+            case GGML_TYPE_IQ2_XXS: k_moe_gate_up_situ_dyn<GGML_TYPE_IQ2_XXS, 8><<<grid, THREADS, smem, stream>>>(tbl.d_gu_ptrs, tbl.d_gu_scales, d_n_gpu, d_gpu_hit_ids, d_qx, h_scratch, n_embd, n_ff, rb, situ_beta, situ_linear_beta); break;
             default: std::fprintf(stderr, "[CUDA] Unsupported dyn gate_up %u\n", gate_up_type); std::abort();
         }
     }
     {
+        k_quantize_vec_dyn_q8<<<max_k, 128, 0, stream>>>(d_n_gpu, h_scratch, d_qx, n_ff);
         size_t rb = (size_t)(n_ff / ggml_type_block_size(down_type)) * ggml_type_byte_size(down_type);
-        int blocks = (n_embd + WPB - 1) / WPB;
-        size_t smem = (size_t)max_k * (n_ff >> 5) * sizeof(Q8Block32GPU);
+        constexpr int THREADS = 128;
         switch (down_type) {
-            case GGML_TYPE_NVFP4:  k_moe_down_reduce_dyn<GGML_TYPE_NVFP4,  32><<<blocks, WPB*32, smem, stream>>>(tbl.d_dn_ptrs, tbl.d_dn_scales, d_n_gpu, d_gpu_hit_ids, d_gpu_hit_weights, h_scratch, out, n_embd, n_ff, rb); break;
-            case GGML_TYPE_IQ4_NL: k_moe_down_reduce_dyn<GGML_TYPE_IQ4_NL, 32><<<blocks, WPB*32, smem, stream>>>(tbl.d_dn_ptrs, tbl.d_dn_scales, d_n_gpu, d_gpu_hit_ids, d_gpu_hit_weights, h_scratch, out, n_embd, n_ff, rb); break;
+            case GGML_TYPE_NVFP4: {
+                constexpr int RPB = THREADS / 8;
+                int blocks = (n_embd + RPB - 1) / RPB;
+                k_moe_down_reduce_dyn<GGML_TYPE_NVFP4, 8><<<blocks, THREADS, 0, stream>>>(tbl.d_dn_ptrs, tbl.d_dn_scales, d_n_gpu, d_gpu_hit_ids, d_gpu_hit_weights, d_qx, out, n_embd, n_ff, rb);
+                break;
+            }
+            case GGML_TYPE_IQ4_NL: {
+                constexpr int RPB = THREADS / 4;
+                int blocks = (n_embd + RPB - 1) / RPB;
+                k_moe_down_reduce_dyn<GGML_TYPE_IQ4_NL, 4><<<blocks, THREADS, 0, stream>>>(tbl.d_dn_ptrs, tbl.d_dn_scales, d_n_gpu, d_gpu_hit_ids, d_gpu_hit_weights, d_qx, out, n_embd, n_ff, rb);
+                break;
+            }
             default: std::fprintf(stderr, "[CUDA] Unsupported dyn down %u\n", down_type); std::abort();
+        }
+    }
+}
+
+// =========================================================================
+// R13: Zero-Sync & Zero-Bubble Spin-Poll Indirect Batch MoE for Speculative Verify (B <= 8)
+// Eliminates 48x cudaStreamSynchronize stalls, CPU bucketing, H2D uploads, and atomicAdd!
+// =========================================================================
+template <uint32_t TYPE, int G>
+__global__ void k_moe_gate_up_situ_indirect_batch(
+    const uint64_t* __restrict__ d_gu_ptrs, const float* __restrict__ d_gu_scales,
+    const int32_t* __restrict__ d_top_ids, int B, int k_cnt,
+    const Q8Block32GPU* __restrict__ g_qx, float* __restrict__ h_out,
+    int n_embd, int n_ff, size_t row_bytes, float beta, float lb)
+{
+    int b = blockIdx.z;
+    int eidx = blockIdx.y;
+    if (b >= B || eidx >= k_cnt) return;
+
+    extern __shared__ Q8Block32GPU s_qx[];
+    stage_qx_to_smem(g_qx + (size_t)b * (n_embd >> 5), s_qx, n_embd);
+    __syncthreads();
+
+    constexpr int SHIFT = (G == 4) ? 2 : ((G == 8) ? 3 : 5);
+    int rpb   = blockDim.x >> SHIFT;
+    int gid   = threadIdx.x >> SHIFT;
+    int glane = threadIdx.x & (G - 1);
+    int j     = blockIdx.x * rpb + gid;
+    int sj    = (j < n_ff) ? j : (n_ff - 1);
+
+    int slot = b * k_cnt + eidx;
+    int exp_id = d_top_ids[slot];
+    const uint8_t* base = (const uint8_t*)(uintptr_t)d_gu_ptrs[exp_id];
+    float sc = d_gu_scales[exp_id];
+
+    float g = dot_quant_dp4a<TYPE, G>(base + (size_t)sj * row_bytes, s_qx, n_embd, glane) * sc;
+    float u = dot_quant_dp4a<TYPE, G>(base + (size_t)(sj + n_ff) * row_bytes, s_qx, n_embd, glane) * sc;
+    if (glane == 0 && j < n_ff) h_out[(size_t)slot * n_ff + j] = d_situ(g, u, beta, lb);
+}
+
+template <uint32_t TYPE, int G>
+__global__ void k_moe_down_reduce_indirect_batch(
+    const uint64_t* __restrict__ d_dn_ptrs, const float* __restrict__ d_dn_scales,
+    const int32_t* __restrict__ d_top_ids, const float* __restrict__ d_top_weights, int B, int k_cnt,
+    const Q8Block32GPU* __restrict__ g_qh, float* __restrict__ out,
+    int n_embd, int n_ff, size_t row_bytes)
+{
+    int b = blockIdx.y;
+    if (b >= B) return;
+
+    constexpr int SHIFT = (G == 4) ? 2 : ((G == 8) ? 3 : 5);
+    int rpb   = blockDim.x >> SHIFT;
+    int gid   = threadIdx.x >> SHIFT;
+    int glane = threadIdx.x & (G - 1);
+    int row   = blockIdx.x * rpb + gid;
+    int srow  = (row < n_embd) ? row : (n_embd - 1);
+    int nb_ff = n_ff >> 5;
+    int base_k = b * k_cnt;
+
+    float acc = 0.0f;
+    for (int k = 0; k < k_cnt; ++k) {
+        int exp_id = d_top_ids[base_k + k];
+        const uint8_t* rp = (const uint8_t*)(uintptr_t)d_dn_ptrs[exp_id] + (size_t)srow * row_bytes;
+        float v = dot_quant_dp4a<TYPE, G>(rp, g_qh + (size_t)(base_k + k) * nb_ff, n_ff, glane);
+        acc = fmaf(v, d_dn_scales[exp_id] * d_top_weights[base_k + k], acc);
+    }
+    if (glane == 0 && row < n_embd) out[(size_t)b * n_embd + row] = acc;
+}
+
+void ink_cuda_moe_pinned_indirect_batch(
+    uint32_t gate_up_type, uint32_t down_type,
+    const PinnedLayerDeviceTable& tbl,
+    const int32_t* d_top_ids, const float* d_top_weights, int B, int k,
+    const float* x, float* h_scratch, float* out,
+    int n_embd, int n_ff, float situ_beta, float situ_linear_beta, cudaStream_t stream)
+{
+    Q8Block32GPU* d_qx = (Q8Block32GPU*)g_batch_qx_buf;
+    {
+        k_quantize_vec_q8<<<B, 256, 0, stream>>>(x, d_qx, n_embd);
+        size_t rb = (size_t)(n_embd / ggml_type_block_size(gate_up_type)) * ggml_type_byte_size(gate_up_type);
+        constexpr int THREADS = 256;
+        constexpr int RPB = THREADS / 8;
+        dim3 grid((n_ff + RPB - 1) / RPB, k, B);
+        size_t smem = (size_t)(n_embd >> 5) * sizeof(Q8Block32GPU);
+        switch (gate_up_type) {
+            case GGML_TYPE_IQ3_XXS: k_moe_gate_up_situ_indirect_batch<GGML_TYPE_IQ3_XXS, 8><<<grid, THREADS, smem, stream>>>(tbl.d_gu_ptrs, tbl.d_gu_scales, d_top_ids, B, k, d_qx, h_scratch, n_embd, n_ff, rb, situ_beta, situ_linear_beta); break;
+            case GGML_TYPE_IQ2_S:   k_moe_gate_up_situ_indirect_batch<GGML_TYPE_IQ2_S,   8><<<grid, THREADS, smem, stream>>>(tbl.d_gu_ptrs, tbl.d_gu_scales, d_top_ids, B, k, d_qx, h_scratch, n_embd, n_ff, rb, situ_beta, situ_linear_beta); break;
+            case GGML_TYPE_IQ2_XS:  k_moe_gate_up_situ_indirect_batch<GGML_TYPE_IQ2_XS,  8><<<grid, THREADS, smem, stream>>>(tbl.d_gu_ptrs, tbl.d_gu_scales, d_top_ids, B, k, d_qx, h_scratch, n_embd, n_ff, rb, situ_beta, situ_linear_beta); break;
+            case GGML_TYPE_IQ2_XXS: k_moe_gate_up_situ_indirect_batch<GGML_TYPE_IQ2_XXS, 8><<<grid, THREADS, smem, stream>>>(tbl.d_gu_ptrs, tbl.d_gu_scales, d_top_ids, B, k, d_qx, h_scratch, n_embd, n_ff, rb, situ_beta, situ_linear_beta); break;
+            case GGML_TYPE_NVFP4:   k_moe_gate_up_situ_indirect_batch<GGML_TYPE_NVFP4,   8><<<grid, THREADS, smem, stream>>>(tbl.d_gu_ptrs, tbl.d_gu_scales, d_top_ids, B, k, d_qx, h_scratch, n_embd, n_ff, rb, situ_beta, situ_linear_beta); break;
+            case GGML_TYPE_IQ4_NL:  k_moe_gate_up_situ_indirect_batch<GGML_TYPE_IQ4_NL,  8><<<grid, THREADS, smem, stream>>>(tbl.d_gu_ptrs, tbl.d_gu_scales, d_top_ids, B, k, d_qx, h_scratch, n_embd, n_ff, rb, situ_beta, situ_linear_beta); break;
+            default: std::fprintf(stderr, "[CUDA] Unsupported batch indirect gate_up %u\n", gate_up_type); std::abort();
+        }
+    }
+    {
+        k_quantize_vec_q8<<<B * k, 128, 0, stream>>>(h_scratch, d_qx, n_ff);
+        size_t rb = (size_t)(n_ff / ggml_type_block_size(down_type)) * ggml_type_byte_size(down_type);
+        constexpr int THREADS = 128;
+        switch (down_type) {
+            case GGML_TYPE_NVFP4: {
+                constexpr int RPB = THREADS / 8;
+                dim3 grid((n_embd + RPB - 1) / RPB, B);
+                k_moe_down_reduce_indirect_batch<GGML_TYPE_NVFP4, 8><<<grid, THREADS, 0, stream>>>(tbl.d_dn_ptrs, tbl.d_dn_scales, d_top_ids, d_top_weights, B, k, d_qx, out, n_embd, n_ff, rb);
+                break;
+            }
+            case GGML_TYPE_IQ4_NL: {
+                constexpr int RPB = THREADS / 4;
+                dim3 grid((n_embd + RPB - 1) / RPB, B);
+                k_moe_down_reduce_indirect_batch<GGML_TYPE_IQ4_NL, 4><<<grid, THREADS, 0, stream>>>(tbl.d_dn_ptrs, tbl.d_dn_scales, d_top_ids, d_top_weights, B, k, d_qx, out, n_embd, n_ff, rb);
+                break;
+            }
+            case GGML_TYPE_IQ3_XXS: {
+                constexpr int RPB = THREADS / 4;
+                dim3 grid((n_embd + RPB - 1) / RPB, B);
+                k_moe_down_reduce_indirect_batch<GGML_TYPE_IQ3_XXS, 4><<<grid, THREADS, 0, stream>>>(tbl.d_dn_ptrs, tbl.d_dn_scales, d_top_ids, d_top_weights, B, k, d_qx, out, n_embd, n_ff, rb);
+                break;
+            }
+            default: std::fprintf(stderr, "[CUDA] Unsupported batch indirect down %u\n", down_type); std::abort();
+        }
+    }
+}
+
+__global__ void k_moe_split_hits_batch(
+    const uint64_t* __restrict__ d_gu_ptrs,
+    const int32_t* __restrict__ d_top_ids,
+    const float* __restrict__ d_top_weights,
+    int B, int k_cnt,
+    const float* __restrict__ d_x,
+    int n_embd,
+    int32_t* __restrict__ d_n_gpu,
+    int32_t* __restrict__ d_gpu_hit_ids,
+    float* __restrict__ d_gpu_hit_weights,
+    MoEBatchSplitPacket* __restrict__ d_mapped_pkt,
+    float* __restrict__ d_mapped_ffn_in,
+    uint32_t seq)
+{
+    __shared__ int s_ncpu;
+    if (threadIdx.x == 0) {
+        int ng_tot = 0, nc_tot = 0;
+        for (int b = 0; b < B; ++b) {
+            int ng_b = 0;
+            int base = b * k_cnt;
+            for (int i = 0; i < k_cnt; ++i) {
+                int e = d_top_ids[base + i];
+                float w = d_top_weights[base + i];
+                d_mapped_pkt->all_ids[base + i] = e;
+                if (d_gu_ptrs[e] != 0) {
+                    d_gpu_hit_ids[base + ng_b]     = e;
+                    d_gpu_hit_weights[base + ng_b] = w;
+                    ng_b++;
+                    ng_tot++;
+                } else {
+                    d_mapped_pkt->miss_tok[nc_tot] = (int16_t)b;
+                    d_mapped_pkt->miss_exp[nc_tot] = (int16_t)e;
+                    d_mapped_pkt->miss_w[nc_tot]   = w;
+                    nc_tot++;
+                }
+            }
+            d_n_gpu[b] = ng_b;
+        }
+        d_mapped_pkt->n_gpu_tot = ng_tot;
+        d_mapped_pkt->n_cpu_tot = nc_tot;
+        s_ncpu = nc_tot;
+    }
+    __syncthreads();
+
+    if (s_ncpu > 0) {
+        int n4 = (B * n_embd) >> 2;
+        const float4* src = (const float4*)d_x;
+        float4*       dst = (float4*)d_mapped_ffn_in;
+        for (int i = threadIdx.x; i < n4; i += blockDim.x) {
+            dst[i] = src[i];
+        }
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        *reinterpret_cast<volatile uint32_t*>(&d_mapped_pkt->seq) = seq;
+        __threadfence_system();
+    }
+}
+
+__global__ void k_quantize_vec_dyn_batch_q8(const int32_t* __restrict__ d_n_gpu, int max_k,
+                                            const float* __restrict__ X, Q8Block32GPU* __restrict__ qx_out, int K) {
+    int k = blockIdx.x;
+    int b = blockIdx.y;
+    if (k >= d_n_gpu[b]) return;
+    int slot = b * max_k + k;
+    int nb_k = K >> 5;
+    quantize_x_to_smem(X + (size_t)slot * K, qx_out + (size_t)slot * nb_k, K);
+}
+
+template <uint32_t TYPE, int G>
+__global__ void k_moe_gate_up_situ_dyn_batch(
+    const uint64_t* __restrict__ d_gu_ptrs, const float* __restrict__ d_gu_scales,
+    const int32_t* __restrict__ d_n_gpu, const int32_t* __restrict__ d_hit_ids, int B, int max_k,
+    const Q8Block32GPU* __restrict__ g_qx, float* __restrict__ h_out,
+    int n_embd, int n_ff, size_t row_bytes, float beta, float lb)
+{
+    int b = blockIdx.z;
+    int eidx = blockIdx.y;
+    if (b >= B || eidx >= d_n_gpu[b]) return;
+
+    extern __shared__ Q8Block32GPU s_qx[];
+    stage_qx_to_smem(g_qx + (size_t)b * (n_embd >> 5), s_qx, n_embd);
+    __syncthreads();
+
+    constexpr int SHIFT = (G == 4) ? 2 : ((G == 8) ? 3 : 5);
+    int rpb   = blockDim.x >> SHIFT;
+    int gid   = threadIdx.x >> SHIFT;
+    int glane = threadIdx.x & (G - 1);
+    int j     = blockIdx.x * rpb + gid;
+    int sj    = (j < n_ff) ? j : (n_ff - 1);
+
+    int slot = b * max_k + eidx;
+    int exp_id = d_hit_ids[slot];
+    const uint8_t* base = (const uint8_t*)(uintptr_t)d_gu_ptrs[exp_id];
+    float sc = d_gu_scales[exp_id];
+
+    float g = dot_quant_dp4a<TYPE, G>(base + (size_t)sj * row_bytes, s_qx, n_embd, glane) * sc;
+    float u = dot_quant_dp4a<TYPE, G>(base + (size_t)(sj + n_ff) * row_bytes, s_qx, n_embd, glane) * sc;
+    if (glane == 0 && j < n_ff) h_out[(size_t)slot * n_ff + j] = d_situ(g, u, beta, lb);
+}
+
+template <uint32_t TYPE, int G>
+__global__ void k_moe_down_reduce_dyn_batch(
+    const uint64_t* __restrict__ d_dn_ptrs, const float* __restrict__ d_dn_scales,
+    const int32_t* __restrict__ d_n_gpu, const int32_t* __restrict__ d_hit_ids,
+    const float* __restrict__ d_hit_weights, int B, int max_k,
+    const Q8Block32GPU* __restrict__ g_qh, float* __restrict__ out,
+    int n_embd, int n_ff, size_t row_bytes)
+{
+    int b = blockIdx.y;
+    if (b >= B) return;
+
+    constexpr int SHIFT = (G == 4) ? 2 : ((G == 8) ? 3 : 5);
+    int rpb   = blockDim.x >> SHIFT;
+    int gid   = threadIdx.x >> SHIFT;
+    int glane = threadIdx.x & (G - 1);
+    int row   = blockIdx.x * rpb + gid;
+
+    int n_gpu = d_n_gpu[b];
+    if (n_gpu <= 0) {
+        if (glane == 0 && row < n_embd) out[(size_t)b * n_embd + row] = 0.0f;
+        return;
+    }
+
+    int nb_ff = n_ff >> 5;
+    int srow = (row < n_embd) ? row : (n_embd - 1);
+    int base_k = b * max_k;
+    float acc = 0.0f;
+    for (int k = 0; k < n_gpu; ++k) {
+        int exp_id = d_hit_ids[base_k + k];
+        const uint8_t* rp = (const uint8_t*)(uintptr_t)d_dn_ptrs[exp_id] + (size_t)srow * row_bytes;
+        float v = dot_quant_dp4a<TYPE, G>(rp, g_qh + (size_t)(base_k + k) * nb_ff, n_ff, glane);
+        acc = fmaf(v, d_dn_scales[exp_id] * d_hit_weights[base_k + k], acc);
+    }
+    if (glane == 0 && row < n_embd) out[(size_t)b * n_embd + row] = acc;
+}
+
+void ink_cuda_moe_split_hits_batch(
+    const PinnedLayerDeviceTable& tbl,
+    const int32_t* d_top_ids, const float* d_top_weights, int B, int k,
+    const float* d_x, int n_embd,
+    int32_t* d_n_gpu, int32_t* d_gpu_hit_ids, float* d_gpu_hit_weights,
+    MoEBatchSplitPacket* d_mapped_pkt, float* d_mapped_ffn_in, uint32_t seq, cudaStream_t stream)
+{
+    k_moe_split_hits_batch<<<1, 256, 0, stream>>>(
+        tbl.d_gu_ptrs, d_top_ids, d_top_weights, B, k, d_x, n_embd,
+        d_n_gpu, d_gpu_hit_ids, d_gpu_hit_weights, d_mapped_pkt, d_mapped_ffn_in, seq);
+}
+
+void ink_cuda_moe_dynamic_indirect_batch(
+    uint32_t gate_up_type, uint32_t down_type,
+    const PinnedLayerDeviceTable& tbl,
+    const int32_t* d_n_gpu, const int32_t* d_gpu_hit_ids, const float* d_gpu_hit_weights, int B, int max_k,
+    const float* x, float* h_scratch, float* out,
+    int n_embd, int n_ff, float situ_beta, float situ_linear_beta, cudaStream_t stream)
+{
+    Q8Block32GPU* d_qx = (Q8Block32GPU*)g_batch_qx_buf;
+    {
+        k_quantize_vec_q8<<<B, 256, 0, stream>>>(x, d_qx, n_embd);
+        size_t rb = (size_t)(n_embd / ggml_type_block_size(gate_up_type)) * ggml_type_byte_size(gate_up_type);
+        constexpr int THREADS = 256;
+        constexpr int RPB = THREADS / 8;
+        dim3 grid((n_ff + RPB - 1) / RPB, max_k, B);
+        size_t smem = (size_t)(n_embd >> 5) * sizeof(Q8Block32GPU);
+        switch (gate_up_type) {
+            case GGML_TYPE_IQ3_XXS: k_moe_gate_up_situ_dyn_batch<GGML_TYPE_IQ3_XXS, 8><<<grid, THREADS, smem, stream>>>(tbl.d_gu_ptrs, tbl.d_gu_scales, d_n_gpu, d_gpu_hit_ids, B, max_k, d_qx, h_scratch, n_embd, n_ff, rb, situ_beta, situ_linear_beta); break;
+            case GGML_TYPE_IQ2_S:   k_moe_gate_up_situ_dyn_batch<GGML_TYPE_IQ2_S,   8><<<grid, THREADS, smem, stream>>>(tbl.d_gu_ptrs, tbl.d_gu_scales, d_n_gpu, d_gpu_hit_ids, B, max_k, d_qx, h_scratch, n_embd, n_ff, rb, situ_beta, situ_linear_beta); break;
+            case GGML_TYPE_IQ2_XS:  k_moe_gate_up_situ_dyn_batch<GGML_TYPE_IQ2_XS,  8><<<grid, THREADS, smem, stream>>>(tbl.d_gu_ptrs, tbl.d_gu_scales, d_n_gpu, d_gpu_hit_ids, B, max_k, d_qx, h_scratch, n_embd, n_ff, rb, situ_beta, situ_linear_beta); break;
+            case GGML_TYPE_IQ2_XXS: k_moe_gate_up_situ_dyn_batch<GGML_TYPE_IQ2_XXS, 8><<<grid, THREADS, smem, stream>>>(tbl.d_gu_ptrs, tbl.d_gu_scales, d_n_gpu, d_gpu_hit_ids, B, max_k, d_qx, h_scratch, n_embd, n_ff, rb, situ_beta, situ_linear_beta); break;
+            case GGML_TYPE_NVFP4:   k_moe_gate_up_situ_dyn_batch<GGML_TYPE_NVFP4,   8><<<grid, THREADS, smem, stream>>>(tbl.d_gu_ptrs, tbl.d_gu_scales, d_n_gpu, d_gpu_hit_ids, B, max_k, d_qx, h_scratch, n_embd, n_ff, rb, situ_beta, situ_linear_beta); break;
+            case GGML_TYPE_IQ4_NL:  k_moe_gate_up_situ_dyn_batch<GGML_TYPE_IQ4_NL,  8><<<grid, THREADS, smem, stream>>>(tbl.d_gu_ptrs, tbl.d_gu_scales, d_n_gpu, d_gpu_hit_ids, B, max_k, d_qx, h_scratch, n_embd, n_ff, rb, situ_beta, situ_linear_beta); break;
+            default: std::fprintf(stderr, "[CUDA] Unsupported dyn batch gate_up %u\n", gate_up_type); std::abort();
+        }
+    }
+    {
+        k_quantize_vec_dyn_batch_q8<<<dim3(max_k, B), 128, 0, stream>>>(d_n_gpu, max_k, h_scratch, d_qx, n_ff);
+        size_t rb = (size_t)(n_ff / ggml_type_block_size(down_type)) * ggml_type_byte_size(down_type);
+        constexpr int THREADS = 128;
+        switch (down_type) {
+            case GGML_TYPE_NVFP4: {
+                constexpr int RPB = THREADS / 8;
+                dim3 grid((n_embd + RPB - 1) / RPB, B);
+                k_moe_down_reduce_dyn_batch<GGML_TYPE_NVFP4, 8><<<grid, THREADS, 0, stream>>>(tbl.d_dn_ptrs, tbl.d_dn_scales, d_n_gpu, d_gpu_hit_ids, d_gpu_hit_weights, B, max_k, d_qx, out, n_embd, n_ff, rb);
+                break;
+            }
+            case GGML_TYPE_IQ4_NL: {
+                constexpr int RPB = THREADS / 4;
+                dim3 grid((n_embd + RPB - 1) / RPB, B);
+                k_moe_down_reduce_dyn_batch<GGML_TYPE_IQ4_NL, 4><<<grid, THREADS, 0, stream>>>(tbl.d_dn_ptrs, tbl.d_dn_scales, d_n_gpu, d_gpu_hit_ids, d_gpu_hit_weights, B, max_k, d_qx, out, n_embd, n_ff, rb);
+                break;
+            }
+            case GGML_TYPE_IQ3_XXS: {
+                constexpr int RPB = THREADS / 4;
+                dim3 grid((n_embd + RPB - 1) / RPB, B);
+                k_moe_down_reduce_dyn_batch<GGML_TYPE_IQ3_XXS, 4><<<grid, THREADS, 0, stream>>>(tbl.d_dn_ptrs, tbl.d_dn_scales, d_n_gpu, d_gpu_hit_ids, d_gpu_hit_weights, B, max_k, d_qx, out, n_embd, n_ff, rb);
+                break;
+            }
+            default: std::fprintf(stderr, "[CUDA] Unsupported dyn batch down %u\n", down_type); std::abort();
         }
     }
 }
@@ -2845,20 +3267,22 @@ __global__ void k_quantize_batch_q8(const float* __restrict__ X, Q8Block32GPU* _
     quantize_x_to_smem(X + (size_t)b * K, qx_out + (size_t)b * nb_k, K);
 }
 
-template <uint32_t TYPE>
+template <uint32_t TYPE, int G = 32>
 __global__ void k_gemm_dp4a_batch(const uint8_t* __restrict__ W, const Q8Block32GPU* __restrict__ qx_all,
                                   float* __restrict__ Y, int B, int M, int K, size_t row_bytes) {
-    int warp = threadIdx.x >> 5;
-    int lane = threadIdx.x & 31;
-    int row  = blockIdx.x * (blockDim.x >> 5) + warp;
-    if (row >= M) return;
+    constexpr int RPB_SHIFT = (G == 4) ? 2 : ((G == 8) ? 3 : 5);
+    int rows_per_block = blockDim.x >> RPB_SHIFT;
+    int group_in_block = threadIdx.x >> RPB_SHIFT;
+    int glane          = threadIdx.x & (G - 1);
+    int row            = blockIdx.x * rows_per_block + group_in_block;
+    int safe_row       = (row < M) ? row : (M - 1);
 
     int nb_k = K >> 5;
-    const uint8_t* wrow = W + (size_t)row * row_bytes;
+    const uint8_t* wrow = W + (size_t)safe_row * row_bytes;
     // Weight row (~1 KB) stays hot in SM L1 across ALL B tokens (up to 64x less GDDR6 weight traffic!)
     for (int t = 0; t < B; ++t) {
-        float val = dot_quant_dp4a<TYPE, 32>(wrow, qx_all + (size_t)t * nb_k, K, lane);
-        if (lane == 0) Y[(size_t)t * M + row] = val;
+        float val = dot_quant_dp4a<TYPE, G>(wrow, qx_all + (size_t)t * nb_k, K, glane);
+        if (glane == 0 && row < M) Y[(size_t)t * M + row] = val;
     }
 }
 
@@ -2957,20 +3381,32 @@ void ink_cuda_gemm_batch(uint32_t type, const void* W, const float* X, float* Y,
         }
     }
 
-    int blocks_q = (M + WPB - 1) / WPB;
     Q8Block32GPU* d_qx = (Q8Block32GPU*)g_batch_qx_buf;
     k_quantize_batch_q8<<<B, 256, 0, stream>>>(X, d_qx, K);
+    auto launch_batch_dp4a = [&](auto tag) {
+        constexpr uint32_t T = decltype(tag)::value;
+        if (M >= 32768) {
+            // R22: Large-M G=4 (32 rows/block, 0% warp waste on K=2304!) for speculative verify LM Head!
+            constexpr int THREADS = 128;
+            constexpr int RPB = THREADS / 4;
+            int blocks_q = (M + RPB - 1) / RPB;
+            k_gemm_dp4a_batch<T, 4><<<blocks_q, THREADS, 0, stream>>>(Wp, d_qx, Y, B, M, K, row_bytes);
+        } else {
+            int blocks_q = (M + WPB - 1) / WPB;
+            k_gemm_dp4a_batch<T, 32><<<blocks_q, WPB * 32, 0, stream>>>(Wp, d_qx, Y, B, M, K, row_bytes);
+        }
+    };
     switch (type) {
-        case GGML_TYPE_Q8_0:    k_gemm_dp4a_batch<GGML_TYPE_Q8_0>   <<<blocks_q, WPB * 32, 0, stream>>>(Wp, d_qx, Y, B, M, K, row_bytes); break;
-        case GGML_TYPE_Q4_K:    k_gemm_dp4a_batch<GGML_TYPE_Q4_K>   <<<blocks_q, WPB * 32, 0, stream>>>(Wp, d_qx, Y, B, M, K, row_bytes); break;
-        case GGML_TYPE_Q5_K:    k_gemm_dp4a_batch<GGML_TYPE_Q5_K>   <<<blocks_q, WPB * 32, 0, stream>>>(Wp, d_qx, Y, B, M, K, row_bytes); break;
-        case GGML_TYPE_Q6_K:    k_gemm_dp4a_batch<GGML_TYPE_Q6_K>   <<<blocks_q, WPB * 32, 0, stream>>>(Wp, d_qx, Y, B, M, K, row_bytes); break;
-        case GGML_TYPE_NVFP4:   k_gemm_dp4a_batch<GGML_TYPE_NVFP4>  <<<blocks_q, WPB * 32, 0, stream>>>(Wp, d_qx, Y, B, M, K, row_bytes); break;
-        case GGML_TYPE_IQ4_NL:  k_gemm_dp4a_batch<GGML_TYPE_IQ4_NL> <<<blocks_q, WPB * 32, 0, stream>>>(Wp, d_qx, Y, B, M, K, row_bytes); break;
-        case GGML_TYPE_IQ3_XXS: k_gemm_dp4a_batch<GGML_TYPE_IQ3_XXS><<<blocks_q, WPB * 32, 0, stream>>>(Wp, d_qx, Y, B, M, K, row_bytes); break;
-        case GGML_TYPE_IQ2_S:   k_gemm_dp4a_batch<GGML_TYPE_IQ2_S>  <<<blocks_q, WPB * 32, 0, stream>>>(Wp, d_qx, Y, B, M, K, row_bytes); break;
-        case GGML_TYPE_IQ2_XS:  k_gemm_dp4a_batch<GGML_TYPE_IQ2_XS> <<<blocks_q, WPB * 32, 0, stream>>>(Wp, d_qx, Y, B, M, K, row_bytes); break;
-        case GGML_TYPE_IQ2_XXS: k_gemm_dp4a_batch<GGML_TYPE_IQ2_XXS><<<blocks_q, WPB * 32, 0, stream>>>(Wp, d_qx, Y, B, M, K, row_bytes); break;
+        case GGML_TYPE_Q8_0:    launch_batch_dp4a(std::integral_constant<uint32_t, GGML_TYPE_Q8_0>{}); break;
+        case GGML_TYPE_Q4_K:    launch_batch_dp4a(std::integral_constant<uint32_t, GGML_TYPE_Q4_K>{}); break;
+        case GGML_TYPE_Q5_K:    launch_batch_dp4a(std::integral_constant<uint32_t, GGML_TYPE_Q5_K>{}); break;
+        case GGML_TYPE_Q6_K:    launch_batch_dp4a(std::integral_constant<uint32_t, GGML_TYPE_Q6_K>{}); break;
+        case GGML_TYPE_NVFP4:   launch_batch_dp4a(std::integral_constant<uint32_t, GGML_TYPE_NVFP4>{}); break;
+        case GGML_TYPE_IQ4_NL:  launch_batch_dp4a(std::integral_constant<uint32_t, GGML_TYPE_IQ4_NL>{}); break;
+        case GGML_TYPE_IQ3_XXS: launch_batch_dp4a(std::integral_constant<uint32_t, GGML_TYPE_IQ3_XXS>{}); break;
+        case GGML_TYPE_IQ2_S:   launch_batch_dp4a(std::integral_constant<uint32_t, GGML_TYPE_IQ2_S>{}); break;
+        case GGML_TYPE_IQ2_XS:  launch_batch_dp4a(std::integral_constant<uint32_t, GGML_TYPE_IQ2_XS>{}); break;
+        case GGML_TYPE_IQ2_XXS: launch_batch_dp4a(std::integral_constant<uint32_t, GGML_TYPE_IQ2_XXS>{}); break;
         default: std::fprintf(stderr, "[CUDA] Unsupported batch GEMM type %u\n", type); std::abort();
     }
 }
@@ -3850,7 +4286,7 @@ void ink_cuda_attn_global_paged_chunk(
         dim3 grid(n_head_kv, n_splits);
         k_attn_global_splitk_gqa<<<grid, 128, 0, stream>>>(
             Q, page_k_ptrs, page_v_ptrs, page_pos0, page_lens,
-            n_pages, n_splits, rel_table, split_out, split_ml,
+            n_pages, n_splits, rel_table, split_out, split_ml, nullptr, nullptr,
             n_head, n_head_kv, head_dim, pos0, rel_extent, (int)kv_mode);
     } else {
         int max_sp = (B <= 8) ? 16 : ((B <= 64) ? 4 : 2);

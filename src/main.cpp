@@ -43,7 +43,7 @@ void print_usage() {
         "  --bench-prefill <N>    Benchmark batched prompt prefill speed on N tokens\n"
         "  --threads <N>          CPU AVX2 worker threads for missed experts (default: 10)\n"
         "  --verify               Run golden correctness check vs llama.cpp reference tokens\n"
-        "  --verify-suite         Run R0/v3.4 parity & robustness gate suite (SWA, spec, R4, R6, R8, R10, R14)\n"
+        "  --verify-suite         Run R0/v4.0 parity & robustness gate suite (SWA, spec, R4, R6, R8, R10, R14)\n"
         "  --bench <N>            Benchmark decode throughput for N tokens (with optional --bench-pos P)\n"
         "  --bench-pos <P>        Simulate long context at position P (e.g. 32768, 65536, 131072, 262144)\n"
         "  --profile              Print per-stage millisecond breakdown during --bench / --prompt\n"

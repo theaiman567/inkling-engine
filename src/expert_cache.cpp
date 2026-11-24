@@ -57,6 +57,11 @@ void ExpertCache::shutdown() {
     ram_slot_cap_.clear();
     if (d_core_pinned_) { cudaFree(d_core_pinned_); d_core_pinned_ = nullptr; }
     if (d_vram_pool_) { cudaFree(d_vram_pool_); d_vram_pool_ = nullptr; }
+    for (auto& reg : ram_dma_regions_) {
+        cudaHostUnregister(reg.first);
+    }
+    ram_dma_regions_.clear();
+    ram_dma_registered_bytes_ = 0;
     if (h_ram_pool_) { VirtualFree(h_ram_pool_, 0, MEM_RELEASE); h_ram_pool_ = nullptr; }
 }
 
@@ -403,6 +408,33 @@ bool ExpertCache::init(
             ram_slot_cap_[s] = max_slot_bytes_;
             off += max_slot_bytes_;
         }
+
+        // R15: Register contiguous Tier-1 RAM prefix via single cudaHostRegister (keeping >= 2.5 GiB OS headroom!)
+        // Single contiguous registration guarantees no expert slot ever straddles a CUDA host-registration boundary!
+        MEMORYSTATUSEX ms{};
+        ms.dwLength = sizeof(ms);
+        size_t reg_limit = ram_pool_bytes_;
+        if (GlobalMemoryStatusEx(&ms)) {
+            constexpr size_t OS_HEADROOM = 2560ull * 1024 * 1024;
+            size_t avail = (size_t)ms.ullAvailPhys;
+            size_t safe_pin = (avail > OS_HEADROOM) ? (avail - OS_HEADROOM) : 0;
+            reg_limit = std::min(ram_pool_bytes_, safe_pin);
+        }
+        constexpr size_t REG_STEP = 512ull * 1024 * 1024;
+        size_t try_sz = reg_limit;
+        while (try_sz >= max_slot_bytes_) {
+            size_t aligned_sz = (try_sz == ram_pool_bytes_) ? try_sz : (try_sz & ~4095ull);
+            if (aligned_sz < max_slot_bytes_) break;
+            cudaError_t err = cudaHostRegister(h_ram_pool_, aligned_sz, cudaHostRegisterDefault);
+            if (err == cudaSuccess) {
+                ram_dma_regions_.push_back({h_ram_pool_, aligned_sz});
+                ram_dma_registered_bytes_ = aligned_sz;
+                break;
+            }
+            cudaGetLastError(); // Clear error so subsequent CUDA calls stay clean
+            if (try_sz <= REG_STEP) break;
+            try_sz -= REG_STEP;
+        }
     }
 
     // Preload cold experts into Tier-1 RAM (either async background thread for ~14s instant startup, or inline!)
@@ -434,11 +466,12 @@ bool ExpertCache::init(
     stats_.ram_slots  = n_ram_slots_;
     stats_.pinned_core_experts = pinned_count;
 
-    std::printf("[ExpertCache] Ready in %.2fs | Policy=%s | VRAM=%.1f MiB (pinned=%d, dynamic=%d) | RAM=%.1f MiB (%d slots%s) | SSD backing=ON\n",
+    std::printf("[ExpertCache] Ready in %.2fs | Policy=%s | VRAM=%.1f MiB (pinned=%d, dynamic=%d) | RAM=%.1f MiB (%d slots, DMA-pinned=%.0f MiB%s) | SSD backing=ON\n",
                 sec,
                 policy_ == CACHE_CORE_PINNED ? "core-pinned" : "loop-lfu",
                 stats_.vram_mb, pinned_count, n_vram_slots_,
                 stats_.ram_mb, n_ram_slots_,
+                ram_dma_registered_bytes_ / (1024.0 * 1024.0),
                 (preload_ram && async_ram_preload) ? ", async warming" : "");
     std::fflush(stdout);
     return true;

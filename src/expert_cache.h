@@ -113,6 +113,14 @@ public:
     // Returns nullptr if every fitting RAM slot is already pinned (caller should flush current batch first).
     const uint8_t* pin_ram_expert(int uid, int* out_slot = nullptr);
     void unpin_ram_slots(const int* slots, int n);
+    // R15: True if [ptr, ptr+nbytes) lies inside cudaHostRegister'd Tier-1 RAM (direct PCIe DMA, zero bounce memcpy!)
+    bool is_ram_ptr_pinned_dma(const uint8_t* ptr, size_t nbytes) const {
+        if (!h_ram_pool_ || ram_dma_registered_bytes_ == 0 || !ptr) return false;
+        if (ptr < h_ram_pool_) return false;
+        size_t off = (size_t)(ptr - h_ram_pool_);
+        return off + nbytes <= ram_dma_registered_bytes_;
+    }
+    size_t ram_dma_registered_bytes() const { return ram_dma_registered_bytes_; }
     void record_batch_hit_stats(int ip, int n_vram_hits, int n_cpu_misses);
     cudaStream_t dma_stream() const { return stream_dma_; }
     size_t max_slot_bytes() const { return max_slot_bytes_; }
@@ -207,6 +215,8 @@ private:
     // 2-Bucket Variable-Size Tier-1 Host RAM slab pool
     uint8_t* h_ram_pool_ = nullptr;
     size_t   ram_pool_bytes_ = 0;
+    size_t   ram_dma_registered_bytes_ = 0; // R15: prefix of h_ram_pool_ registered via cudaHostRegister
+    std::vector<std::pair<void*, size_t>> ram_dma_regions_;
     int      n_ram_slots_ = 0;
     int      n_ram_small_ = 0;
     int      n_ram_large_ = 0;

@@ -336,6 +336,8 @@ private:
     float*   h_moe_cpu_out_ = nullptr; // [2304]
     int32_t* h_argmax_ = nullptr;      // [1]
     cudaEvent_t ev_split_ = nullptr;
+    uint32_t split_pkt_seq_ = 0;       // R19: monotonic release counter for spin-poll split packet
+    void wait_split_packet(uint32_t target_seq);
 
     TokenProfile prof_{};
     std::vector<int32_t> kv_tokens_; // exact token history currently resident in kv_
@@ -433,6 +435,18 @@ private:
     int32_t* h_grp_tok_ids_ = nullptr;  // [BATCH_MAX * 8]
     float*   h_grp_tok_w_ = nullptr;    // [BATCH_MAX * 8]
     int32_t* h_b_argmax_ = nullptr;     // [SPEC_MAX_B]
+
+    // R13: Zero-Sync & Spin-Poll Batch Split buffers for Speculative Verification (B <= SPEC_MAX_B)
+    int32_t* d_b_n_gpu_ = nullptr;              // [SPEC_MAX_B]
+    int32_t* d_b_hit_ids_ = nullptr;            // [SPEC_MAX_B * 8]
+    float*   d_b_hit_weights_ = nullptr;        // [SPEC_MAX_B * 8]
+    float*   h_b_mapped_ffn_in_ = nullptr;      // [SPEC_MAX_B * D] (cudaHostAllocMapped)
+    float*   d_b_mapped_ffn_in_ = nullptr;
+    MoEBatchSplitPacket* h_b_split_pkt_ = nullptr; // (cudaHostAllocMapped)
+    MoEBatchSplitPacket* d_b_split_pkt_ = nullptr;
+    int32_t* h_b_zero_sync_ids_ = nullptr;      // [48 * SPEC_MAX_B * 8]
+    uint32_t batch_split_seq_ = 0;
+    void wait_batch_split_packet(uint32_t target_seq);
 
     // Double-buffered PCIe cold-expert streaming ring for Tensor-Core Prefill (28 MiB VRAM + 28 MiB pinned RAM)
     uint8_t* d_prefill_stage_[STAGE_BUFS] = {};

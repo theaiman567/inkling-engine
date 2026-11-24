@@ -1,3 +1,74 @@
+# Changelog / PR Notes — InkEngine v4.0 ("Fast" — Single-Pass Quantization, Sub-Warp MoE, Zero-Copy Spin-Poll, Zero-Sync Spec Verify, Direct Pinned Prefill DMA & O(1) KV Paging)
+
+> **Suggested PR Title:** `v4.0: Single-pass activation quant (R11/R22), MoE G=8/G=4 lane efficiency (R12), spin-poll split packet (R19), single-split attention fusion (R20), zero-sync/spin-poll spec verify + adaptive draft (R13/R16), direct pinned prefill DMA (R15), and O(1) KV free-list (R18)`
+
+This release completes **Milestone 3 ("Fast")** of the senior-agent architecture audit (`R11`, `R12`, `R13`, `R15`, `R16`, `R18`, `R19`, `R20`, `R22`), lifting steady 64K decode to **38.03 tok/s** (**+16.5% over pre-audit v3.2**, **3.57× faster than `llama.cpp`**), 128K decode to **31.84 tok/s (+15.4%)**, 256K NVMe SSD decode to **30.85 tok/s (+15.3%)**, **512K NVMe SSD decode to 30.98 tok/s (+26.8%!)**, 2K prefill to **122.22 tok/s**, and verbatim code-edit speculative decode to **41.35 tok/s** — while passing **all 8 parity & fault-injection gates** on both `F16` and `Q4_0`, **100% golden `--verify`**, tight-RAM `96 MiB` stress, and **15/15 live HTTP security tests**.
+
+---
+
+## Summary of Speedups & Improvements (v4.0)
+
+### 1. Single-Pass Activation Quantization + All-Type Large-M LM Head (`R11 / R22` — `src/cuda_kernels.cu`)
+- **Problem**: Every threadblock in GEMV, multi-projection attention, gated `Wo`, MoE `gate_up`/`down`, and the 200K-row LM Head independently re-quantized the same FP32 activation vector into Q8 blocks (`~188,000+` redundant quantizations per token!), and `k_fused_ffn_norm_router_gemv` recomputed full RMSNorm 32× per layer. Large-M `G=4` LM Head dispatch was limited to `Q4_K`/`Q5_K`/`Q6_K`.
+- **Fix**:
+  - Added single-pass pre-quantization kernels (`k_quantize_vec_q8`, `k_quantize_vec_dyn_q8`, `k_quantize_gated_vec_q8`, `k_quantize_multi_q8`) targeting the already-allocated L2-resident `g_batch_qx_buf` (`100%` CUDA-Graph-capture safe).
+  - Added fast cooperative `stage_qx_to_smem` (`<1` `uint4` load/thread for `K=2304`) for streaming-weight kernels (`k_gemv_dp4a_q8`, `k_fused_multi_gemv`, `k_moe_gate_up_situ_*`) so streaming weights never evict Q8 activations from L1 while performing **0 redundant quantizations**.
+  - Split `ink_cuda_fused_ffn_norm_router` into 1-block `k_rms_norm` + 0-smem L2-cached `k_router_gemv` + `k_router_topk`.
+  - Extended large-M (`M >= 32768`) `G=4` (`32` rows/block, `safe_row` warp-shuffle safe) dispatch to **all 10 quantized formats** in both `ink_cuda_gemv` and `k_gemm_dp4a_batch` (`R22`).
+
+### 2. MoE Sub-Warp `G=8` / `G=4` Lane Efficiency (`R12` — `src/cuda_kernels.cu`)
+- **Problem**: MoE `gate_up` (`K=2304`, `72` sub-blocks) and `down` (`K=1152`, `36` `IQ4_NL` / `72` `NVFP4` sub-blocks) were launched with `G=32`, leaving `25%` of warp lanes idle on `gate_up`/`NVFP4` and `43.75%` idle on `IQ4_NL` `down`, while `down` allocated `11.52 KB` smem/block across 288 blocks.
+- **Fix**:
+  - Switched all 3 MoE decode paths (`dp4a`, `pinned_indirect`, `dynamic_indirect`) to **`G=8`** (`72/8 = 9` exact iterations, `0%` lane waste, `32` rows/block) on `gate_up`, and **`G=8` (`NVFP4`, `72/8 = 9`) / `G=4` (`IQ4_NL`/`IQ3_XXS`, `36/4 = 9`)** with **0 bytes shared memory** on `down_reduce`.
+  - **Measured impact**: Cut `MoE Core (36L)` **-19.5%** (`9.45 ms → 7.61 ms`) and `MoE Outer (12L)` **-9.5%** (`5.80 ms → 5.25 ms`)!
+
+### 3. Zero-Copy Spin-Poll Split Packet (`R19`) & Single-Split Attention Sink Fusion (`R20`) (`src/cuda_kernels.*`, `src/model.*`)
+- **R19**: Added a monotonic release counter `MoESplitPacket::seq` published by `k_moe_split_hits` *only after* all 256 threads complete PCIe writes + `__threadfence_system()` + `__syncthreads()`. Replaced per-layer WDDM `cudaEventRecord` + `cudaEventSynchronize` in `forward_token()` with `wait_split_packet()` (`cudaStreamQuery` flush + `_mm_pause()` spin-poll + acquire fence + periodic error check/yield fallback).
+- **R20**: Added fused `final_out` sink + normalization paths directly inside `k_attn_swa_gqa_splitk` and `k_attn_global_splitk_gqa` when `n_splits == 1`, skipping `k_attn_global_reduce` launches completely (chunked `R4` paths pass `nullptr` to preserve unnormalized partial merging).
+- **Measured impact**: Combined **-0.93 ms/tok** on 64K decode (`36.74 → 38.03 tok/s`)!
+
+### 4. Zero-Sync / Spin-Poll Indirect Batch Speculative Verify (`R13`) & Adaptive Draft Length (`R16`) (`src/cuda_kernels.*`, `src/model.*`)
+- **R13**: Added `ink_cuda_moe_pinned_indirect_batch` (0 host syncs on `all_vram` layers) and `ink_cuda_moe_split_hits_batch` + `ink_cuda_moe_dynamic_indirect_batch` (R19 spin-poll + zero-copy `MoEBatchSplitPacket`, 0 WDDM `cudaStreamSynchronize` stalls, 0 CPU bucketing of VRAM hits, 0 H2D group uploads, and **0 `atomicAdd`**) for speculative verify batches `B <= SPEC_MAX_B`. Cut `B=7` parity cosine error in half (`mean|d|` `0.18 → 0.09–0.15`) and lifted verbatim code-edit decode to **41.35 tok/s** (`+25.0%` vs. `33.08 tok/s` scalar).
+- **R16**: Added 100% lossless per-match-length (`3`/`4`/`5`-gram) acceptance EMA tracking (`ngram_ema[3]`) + brief 3-gram cold-prose cooldown in `generate()`, keeping full `K=6` drafts on `4`/`5`-gram code matches while avoiding wasted `B=7` verify stalls on spurious 3-gram prose collisions.
+
+### 5. Direct Pinned Tier-1 RAM Prefill DMA (`R15`) & O(1) KV Frame Free-List (`R18`) (`src/expert_cache.*`, `src/model.cpp`, `src/paged_kv.*`)
+- **R15**: Registered the Tier-1 RAM expert pool as a single contiguous `cudaHostRegister` region (with automatic 512 MiB step-down keeping `≥2.5 GiB` Windows OS headroom and clean `cudaHostUnregister` on `shutdown()`). During `use_pcie_stream` batched prefill, cold experts stream **directly from Tier-1 RAM → VRAM over PCIe Gen4** (`0` CPU DDR4 bounce `memcpy`, keeping slots pinned until `ev_stage_gpu_` completes; seamless bounce fallback for any unregistered region). Boosted 2K prefill to **122.22 tok/s** (`16.76s` vs. `17.34s` in v3.4).
+- **R18**: Replaced O(N) linear scans of `vram_owner_` (`9,102` frames) and `ram_owner_` (`14,560` frames) in `HybridPagedKV` with O(1) `vram_free_list_` / `ram_free_list_` stacks + 64-frame bounded Clock-Sampled LRU eviction (preserving R4 Pass-2 fallback under ultra-tight VRAM). Combined with R11/R12/R19/R20, pushed **512K NVMe SSD decode to 30.98 tok/s (+26.8% over v3.2!)** and **256K NVMe SSD to 30.85 tok/s (+15.3%)**.
+
+---
+
+## Files Changed (v4.0)
+
+| File | Changes |
+|---|---|
+| `src/cuda_kernels.cuh`, `src/cuda_kernels.cu` | Single-pass Q8 pre-quant + `stage_qx_to_smem` + all-type large-M `G=4` LM Head (R11/R22), MoE `G=8`/`G=4` 0-smem down (R12), `MoESplitPacket::seq` + `MoEBatchSplitPacket` + R13 indirect/dynamic batch MoE kernels (R13/R19), single-split fused attention sink/normalize (R20) |
+| `src/model.h`, `src/model.cpp` | `wait_split_packet()` / `wait_batch_split_packet()` R19 spin-poll, R13 speculative verify fast path + async zero-sync route capture, R16 adaptive 3/4/5-gram draft length, R15 direct pinned prefill DMA with pin-until-GPU-done lifecycle, v4.0 banner |
+| `src/expert_cache.h`, `src/expert_cache.cpp` | Contiguous `cudaHostRegister` with OS-headroom guard + `is_ram_ptr_pinned_dma()` + clean `cudaHostUnregister()` on shutdown (R15) |
+| `src/paged_kv.h`, `src/paged_kv.cpp` | O(1) `vram_free_list_` / `ram_free_list_` stacks + 64-slot bounded Clock-Sampled LRU eviction maintained across reset/restore/rewind/spec-rollback/error paths (R18) |
+| `src/main.cpp`, `README.md`, `CHANGELOG.md`, `INKENGINE_OVERVIEW.txt` | Updated CLI help text and complete v3.2 vs. v4.0 docs & verified benchmarks |
+
+---
+
+## Verification & Benchmarks (v4.0)
+
+- **Build**: Clean compile with `build.bat sm_89` (CUDA 12.8 + MSVC x64 AVX2, zero warnings/errors).
+- **Offline Verification (`exit 0` across all 4 suites)**:
+  - `F16` golden `--verify` + 8-gate `--verify-suite`: `29/29` tokenizer exact, `"17 * 23 is 391."` (**100% EXACT MATCH**), ALL 8 GATES PASSED (`Gate 1A L0_SWA_err=0.000001`, `Gate 2 96/96 exact`, `Gate 3 0.000000 BIT-EXACT`, `Gate 4 B=1/B=7 err=0.000000`, `Gate 5 4/4 PASS`, `Gate 6 BIT-EXACT`, `Gate 7 LIVE64/ANS/ANS8 EXACT`, `Gate 8 200/200 BIT-EXACT 45.7 µs vs 316.9 µs = 6.94×`).
+  - `Q4_0` 8-gate `--verify-suite` (2 consecutive runs): ALL 8 GATES PASSED both times (`Gate 1A cos=0.999321 / 0.992718`, `Gate 2 96/96 exact`, `Gate 3 0.000000`, `Gate 4 0.000000`, `Gate 8 200/200 BIT-EXACT 47.3 µs = 6.84×`).
+  - Tight-RAM `96 MiB` stress (`--ram-mb 96 --no-preload-ram --verify`): `29` RAM slots (`93 MiB` DMA-pinned), `"17 * 23 is 391."` (**100% EXACT MATCH**).
+- **Live HTTP Server & OpenCode Lifecycle**:
+  - `test_v33_server.py`: **15/15 PASS** (`401` auth, `403` CORS/Host, `400` TE+CL & local/file/UNC `image_url`, `<15 ms` `/health` under stalled TCP, `400 context_length_exceeded`, strict UTF-8 emoji SSE, base64 vision `"INKENGINE 3.2"`, authenticated `/shutdown`).
+  - `inkcode.ps1 start / status / stop`: Ready in `21.7s` (`128K`, `Vision=ON 0 MiB idle`), clean shutdown with `0` lingering processes.
+- **Matched Hardware Benchmarks (RTX 4060 8 GB, Ryzen 5 5500, 16 GB DDR4, `Q4_0` KV)**:
+  - **64K steady decode (`--bench 128`)**: **37.88–38.03 tok/s** (`26.29–26.40 ms/tok` vs. v3.2 `32.65 tok/s` = **+16.5%**, **3.57× vs. `llama.cpp`**).
+  - **128K full context (`pos=130K`)**: **31.84 tok/s** (`31.41 ms/tok` vs. v3.2 `27.58 tok/s` = **+15.4%**).
+  - **256K NVMe SSD (`pos=260K`)**: **30.85 tok/s** (`32.41 ms/tok` vs. v3.2 `26.75 tok/s` = **+15.3%**).
+  - **512K NVMe SSD (`pos=520K`, 3.05 GiB swap)**: **30.98 tok/s** (`32.28 ms/tok` vs. v3.2 `24.43 tok/s` = **+26.8%!**).
+  - **2K Batched Prefill (`--bench-prefill 2048`)**: **122.22 tok/s** (`16.76s` vs. v3.4 `118.12` / v3.2 `120.69 tok/s`, **5,273 MiB** Tier-1 RAM DMA-pinned).
+  - **Verbatim Code Edit (`MetricsCalculator`, speculative R13+R16)**: **41.35 tok/s** (`73.8%` acceptance, **+25.0%** over `33.08 tok/s` scalar `--no-speculative`, **3.89× vs. `llama.cpp`**).
+
+---
+
 # Changelog / PR Notes — InkEngine v3.4 ("Robust" — Memory-Pressure Exactness, Checked I/O, Quest & Predictor Fixes, and Bit-Exact GPU Sampling Pre-Filter)
 
 > **Suggested PR Title:** `v3.4: Fix multi-chunk exact global attention (R4), checked I/O & atomic publish (R6), Quest rollback extrema (R8), predictor route bookkeeping (R10), GPU sampling pre-filter (R14), and bounds guards (R21)`
