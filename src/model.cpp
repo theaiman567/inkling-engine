@@ -128,7 +128,7 @@ bool InklingEngine::load(const EngineConfig& cfg) {
 
     auto t_start = now_ms();
     std::printf("================================================================\n");
-    std::printf("  InkEngine v4.0 - Custom Looped-MoE 3-Tier Serving Engine\n");
+    std::printf("  InkEngine v4.1 - Custom Looped-MoE 3-Tier Serving Engine\n");
     std::printf("================================================================\n");
 
     if (!gguf_.open(cfg.model_path)) return false;
