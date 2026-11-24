@@ -1,3 +1,34 @@
+# Changelog / PR Notes — InkEngine v4.1 ("Agent Flow" — exact turn replay, streamed tool calls, decode telemetry)
+
+> **Suggested PR Title:** `v4.1: Token-exact assistant-turn replay (R2-01), streamed tool-call arguments (R2-05), reasoning field aliases (R2-03b), per-request decode telemetry + cache-miss diagnostics (R2-10)`
+
+Fixes from `improvement paper round 2.txt`, which diagnosed a real 36-request OpenCode session where ~30-38 of 87 engine-busy minutes were avoidable.
+
+### 1. Token-exact assistant-turn replay (`R2-01` — `src/server.cpp`, `src/tokenizer.*`)
+- **Problem**: KV reuse is all-or-nothing on the exact token history. After `write`/`todowrite` steps the server re-rendered the assistant turn from text (re-serialised tool JSON, nested keys re-sorted, escapes, non-canonical BPE splits at T=1), one token differed, and the whole generated turn was re-prefilled (51.6K tokens / ~10.4 min in the diagnosed session).
+- **Fix**: Every generated assistant turn is stored as its exact token sequence (generation prompt + generated tokens + closing tokens), keyed by its tool-call ids. When a request returns that turn unchanged (same ids, names, arguments, reasoning and text), the exact tokens are spliced into the prompt. `format_chat` now reports per-message byte ranges, and splitting at special-token boundaries keeps encoding exact. Tool-call ids gain a per-run nonce so they never collide across restarts.
+- Tool-call arguments not in the store are now rendered like the official template: top-level keys sorted, nested objects in original key order (previously every level was sorted).
+- **Measured** (real model, `--ctx 16384`): turn 2 after a streamed `write` reused 980/991 prompt tokens (11 new); the v4.0 binary missed and re-prefilled the turn.
+
+### 2. Streamed tool-call arguments (`R2-05` — `src/server.cpp`)
+- **Problem**: Tool-call JSON was buffered until `<|end_message|>`. A 21K-char file write (~10.5K tokens) showed nothing for ~8 minutes, which looked like a hang.
+- **Fix**: The tool call is opened (id + name) as soon as the header names the tool, and the raw `args` object is forwarded as standard OpenAI `function.arguments` deltas while it is generated (UTF-8 safe). String-valued args fall back to one delta at the end.
+- **Measured**: a FizzBuzz `write` arrived as 265 argument deltas that concatenate to valid JSON (v4.0: 1).
+
+### 3. Reasoning field aliases (`R2-03b` — `src/server.cpp`)
+- Inkling must get its previous thinking back (the official template re-inserts `reasoning_content` into every assistant turn). The server now also accepts `reasoning` and `thinking`, so clients using those names no longer lose it silently. **Measured**: with `reasoning`, v4.0 dropped the thinking (turn-2 prompt 507 tokens), v4.1 keeps it (991 tokens).
+
+### 4. Decode telemetry + cache-miss diagnostics (`R2-10` — `src/model.*`, `src/server.cpp`)
+- Each request log line now adds: scalar ms/token, speculative ms/step, tokens/step and **spec gain** (>1 = speculation helped), decode-only expert VRAM hit rate (core/outer), and replayed turns.
+- Every incremental-cache miss logs the common-prefix length, the resident tokens lost, and decoded tokens around the first difference.
+- First readings: spec gain **0.93x** and **0.76x** on two short agent turns, i.e. speculation was net slower there, consistent with the round-2 fit (break-even acceptance ~51%). Cost-aware drafting (R2-07) is the next fix.
+
+### Validation
+- `--verify-suite`: all 8 gates PASS.
+- Golden `--verify` outputs "17 * 23 = 391." instead of the reference "17 * 23 is 391." on **both** this build and the unchanged v4.0 binary, so it is pre-existing (likely the v4.0 numerically-equivalent kernel changes flipping a near-tied token), not caused by v4.1. Tracked separately.
+
+---
+
 # Changelog / PR Notes — InkEngine v4.0 ("Fast" — Single-Pass Quantization, Sub-Warp MoE, Zero-Copy Spin-Poll, Zero-Sync Spec Verify, Direct Pinned Prefill DMA & O(1) KV Paging)
 
 > **Suggested PR Title:** `v4.0: Single-pass activation quant (R11/R22), MoE G=8/G=4 lane efficiency (R12), spin-poll split packet (R19), single-split attention fusion (R20), zero-sync/spin-poll spec verify + adaptive draft (R13/R16), direct pinned prefill DMA (R15), and O(1) KV free-list (R18)`

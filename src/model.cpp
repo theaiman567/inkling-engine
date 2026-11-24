@@ -2327,7 +2327,37 @@ InklingEngine::GenResult InklingEngine::generate(
             return true;
         };
 
-        if (L > 0 && P > L && std::equal(kv_tokens_.begin(), kv_tokens_.end(), prompt_tokens.begin())) {
+        const bool incr_hit = (L > 0 && P > L && std::equal(kv_tokens_.begin(), kv_tokens_.end(), prompt_tokens.begin()));
+        if (!incr_hit && L > 0) {
+            // v4.1 (R2-10): explain every incremental-cache miss so re-prefills can be traced to their cause.
+            int lim = std::min(L, P);
+            int lcp = 0;
+            while (lcp < lim && kv_tokens_[lcp] == prompt_tokens[lcp]) ++lcp;
+            auto render = [&](const int32_t* ids, int n) -> std::string {
+                std::string out;
+                for (int k = 0; k < n && out.size() < 240; ++k) {
+                    std::string pc = tok_.decode_token(ids[k]);
+                    if (pc.empty()) { out += "<#" + std::to_string(ids[k]) + ">"; continue; }
+                    for (unsigned char ch : pc) {
+                        if (ch == '\n') out += "\\n";
+                        else if (ch == '\r') out += "\\r";
+                        else if (ch == '\t') out += "\\t";
+                        else if (ch < 0x20) out += "?";
+                        else out.push_back((char)ch);
+                    }
+                    out.push_back('|');
+                }
+                return out;
+            };
+            const int before = std::min(lcp, 24);
+            std::printf("[KV] Incremental miss: resident=%d prompt=%d common_prefix=%d (%d resident tokens not reusable)\n",
+                        L, P, lcp, L - lcp);
+            std::printf("[KV]   ...before : %s\n", render(prompt_tokens.data() + lcp - before, before).c_str());
+            if (lcp < L) std::printf("[KV]   resident  : %s\n", render(kv_tokens_.data() + lcp, std::min(16, L - lcp)).c_str());
+            if (lcp < P) std::printf("[KV]   new prompt: %s\n", render(prompt_tokens.data() + lcp, std::min(16, P - lcp)).c_str());
+            std::fflush(stdout);
+        }
+        if (incr_hit) {
             // Exact incremental continuation (e.g. tool-call follow-up turn -> 0 ms restore!)
             start_pos = L;
             res.cached_tokens = L;
@@ -2616,7 +2646,7 @@ InklingEngine::GenResult InklingEngine::generate(
 
     int32_t next_tok = sample_next(sp, rng);
     while (res.gen_tokens < sp.max_tokens) {
-        if (tok_.is_eog(next_tok)) break;
+        if (tok_.is_eog(next_tok)) { res.stop_token = next_tok; break; }
 
         std::string piece = tok_.decode_token(next_tok);
         res.tokens.push_back(next_tok);
@@ -2668,6 +2698,7 @@ InklingEngine::GenResult InklingEngine::generate(
             batch_toks[0] = next_tok;
             for (int k = 0; k < K_draft; ++k) batch_toks[1 + k] = draft_toks[k];
 
+            const double t_spec0 = now_ms();
             kv_.begin_spec_verify(pos, B, stream_);
             forward_batch(batch_toks, B, pos,
                           /*need_last_logits=*/false, /*need_all_logits=*/true,
@@ -2711,6 +2742,7 @@ InklingEngine::GenResult InklingEngine::generate(
             }
 
             kv_.commit_spec_verify(accepted, stream_);
+            res.spec_ms += now_ms() - t_spec0;
             const int K_exp = hp_.n_expert_used;
             const bool replay_spec_routes = predictor_active() && (batch_pred_B_ == B) &&
                 (batch_pred_ids_.size() >= (size_t)hp_.n_layer_logical * (size_t)B * (size_t)K_exp);
@@ -2750,6 +2782,7 @@ InklingEngine::GenResult InklingEngine::generate(
             if (stopped || res.gen_tokens >= sp.max_tokens) break;
             next_tok = bonus_tok;
         } else {
+            const double t_sc0 = now_ms();
             forward_token(next_tok, pos, true, enable_profile, /*is_answer=*/true, /*capture_pred_hidden=*/need_pred_now);
             if (io_error_) {
                 res.io_error = true;
@@ -2764,6 +2797,8 @@ InklingEngine::GenResult InklingEngine::generate(
             kv_tokens_.push_back(next_tok);
             pos++;
             next_tok = sample_next(sp, rng);
+            res.scalar_ms += now_ms() - t_sc0;
+            res.scalar_steps++;
         }
     }
     res.decode_ms = now_ms() - t_dec0;

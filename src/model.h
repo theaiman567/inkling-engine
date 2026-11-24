@@ -219,6 +219,11 @@ public:
         bool hit_max_ctx = false;
         bool io_error = false;
         std::string error_msg;
+        // v4.1 telemetry (R2-10): end-of-generation token and per-path decode timings
+        int32_t stop_token = -1;   // EOG token that ended generation (-1 = max_tokens / ctx / client stop)
+        double scalar_ms = 0.0;    // wall time of single-token decode steps (forward + sample)
+        int    scalar_steps = 0;
+        double spec_ms = 0.0;      // wall time of speculative verify steps (verify + sample + commit)
     };
     GenResult generate(
         const std::vector<int32_t>& prompt_tokens,

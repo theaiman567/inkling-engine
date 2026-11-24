@@ -339,7 +339,9 @@ std::string InkTokenizer::format_chat(
     const std::string& tools_canonical_json,
     size_t* out_static_prefix_bytes,
     size_t* out_tools_prefix_bytes,
-    size_t* out_full_sys_prefix_bytes) const
+    size_t* out_full_sys_prefix_bytes,
+    std::vector<std::pair<size_t, size_t>>* out_msg_ranges,
+    size_t* out_gen_prompt_bytes) const
 {
     std::string eff_l = effort;
     for (char& ch : eff_l) if (ch >= 'A' && ch <= 'Z') ch = (char)(ch - 'A' + 'a');
@@ -372,9 +374,11 @@ std::string InkTokenizer::format_chat(
         static_prefix_end = s.size();
     };
 
+    if (out_msg_ranges) out_msg_ranges->assign(msgs.size(), {0, 0});
     for (size_t idx = 0; idx < msgs.size(); ++idx) {
         const auto& m = msgs[idx];
         if (!effort_emitted && m.role != "system") emit_effort();
+        const size_t msg_begin = s.size();
 
         if (m.role == "system") {
             s += "<|message_system|><|content_text|>" + m.content + "<|end_message|>";
@@ -425,6 +429,7 @@ std::string InkTokenizer::format_chat(
             }
             s += "<|content_model_end_sampling|>";
         }
+        if (out_msg_ranges) (*out_msg_ranges)[idx] = {msg_begin, s.size()};
     }
 
     if (!effort_emitted) emit_effort();
@@ -452,6 +457,7 @@ std::string InkTokenizer::format_chat(
     if (out_static_prefix_bytes)   *out_static_prefix_bytes   = static_prefix_end;
     if (out_full_sys_prefix_bytes) *out_full_sys_prefix_bytes = full_sys_prefix_end;
 
+    if (out_gen_prompt_bytes) *out_gen_prompt_bytes = s.size();
     if (add_generation_prompt) {
         if (tools_canonical_json.empty()) {
             s += "<|message_model|>";

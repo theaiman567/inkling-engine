@@ -40,6 +40,11 @@ public:
     //   out_full_sys_prefix_bytes : end of tools + ALL leading system msgs + effort (fastest ~99% hit!)
     //   out_static_prefix_bytes   : trimmed before dynamic <env>/date blocks (survives env/file changes!)
     //   out_tools_prefix_bytes    : right after tool_declare (survives agent build<->plan switches!)
+    // v4.1 (R2-01) token-exact replay helpers (optional):
+    //   out_msg_ranges         : [begin, end) byte range of each message's rendering (index = message index).
+    //                            Every range starts and ends on a special-token boundary, so text outside a
+    //                            range can be encoded separately and an exact token sequence spliced in.
+    //   out_gen_prompt_bytes   : byte offset where the generation prompt starts (== text size when none).
     std::string format_chat(
         const std::vector<ChatMessage>& msgs,
         const std::string& effort = "none",
@@ -47,7 +52,9 @@ public:
         const std::string& tools_canonical_json = "",
         size_t* out_static_prefix_bytes = nullptr,
         size_t* out_tools_prefix_bytes = nullptr,
-        size_t* out_full_sys_prefix_bytes = nullptr) const;
+        size_t* out_full_sys_prefix_bytes = nullptr,
+        std::vector<std::pair<size_t, size_t>>* out_msg_ranges = nullptr,
+        size_t* out_gen_prompt_bytes = nullptr) const;
 
     bool is_eog(int32_t id) const { return id == eos_id_ || id == pad_id_; }
     int32_t eos_id() const { return eos_id_; }
