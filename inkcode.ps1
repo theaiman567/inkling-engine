@@ -5,7 +5,7 @@
   Usage:
     inkcode [opencode args...]                 Launch OpenCode CLI with Inkling-2-Mini (auto-starts background server)
     inkcode --ctx 131072 [opencode args...]    Set context length (65536 | 131072 | 262144 | 524288)
-    inkcode --effort max [opencode args...]    Set thinking effort (none | minimal | low | medium | high | xhigh | max)
+    inkcode --effort high [opencode args...]   Set thinking effort (none | minimal | low | medium | high | xhigh | max)
     inkcode start [--ctx N] [--effort L]       Start background server only (no TUI)
     inkcode status                             Show live VRAM / RAM / SSD telemetry
     inkcode stop                               Shut down background server & reclaim all VRAM/RAM
@@ -59,7 +59,7 @@ Sync-OpenCodeApiKey -Token $ApiToken
 $Action      = "launch"
 $Ctx         = 131072
 $CtxExplicit = $false
-$Effort      = "max"
+$Effort      = "high"
 $EffortExplicit = $false
 $RamKvMb     = 1024
 $GgufPath    = $env:INKENGINE_MODEL
@@ -178,7 +178,7 @@ switch ($Action) {
         Write-Host "InkCode - Lightweight Background InkEngine + OpenCode CLI Launcher" -ForegroundColor Cyan
         Write-Host "  inkcode [project|args...]           Auto-start InkEngine in background & launch OpenCode CLI"
         Write-Host "  inkcode --ctx 65536|131072|262144   Launch with specific context length (default: 131072)"
-        Write-Host "  inkcode --effort none|low|med|high|max  Set reasoning effort (default: max)"
+        Write-Host "  inkcode --effort none|low|med|high|max  Set reasoning effort (default: high)"
         Write-Host "  inkcode --gguf <path>               Use a custom GGUF path (or set INKENGINE_MODEL env var)"
         Write-Host "  inkcode start                       Preload InkEngine in background only"
         Write-Host "  inkcode status                      Show live VRAM / RAM / SSD telemetry"

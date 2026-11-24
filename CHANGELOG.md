@@ -1,3 +1,38 @@
+# Changelog / PR Notes — InkEngine v4.2 (effort `high`, thinking budget, cost-aware speculation, Coda prefetch probe)
+
+> **Suggested PR Title:** `v4.2: Default effort high, thinking budget (R2-04), cost-aware speculative drafting (R2-07), Coda expert-prefetch probe (R2-09, measured: not worth it)`
+
+### 1. Default effort `high` (`src/main.cpp`, `src/server.h`, `inkcode.ps1`)
+- The server, the CLI `--serve` default and `inkcode` now default to `high` (0.9), the official chat template's default, instead of `max` (0.99).
+
+### 2. Thinking budget (`R2-04` — `src/server.cpp`, `src/model.*`)
+- **Problem**: At `max` effort a reply could think for its whole output limit (one real turn: 16,384 tokens of thinking, drafting a file it never wrote).
+- **Fix**: After N thinking tokens the server forces `<|end_message|>` so the model moves on to its answer or tool call (again every 1,024 tokens if it re-opens thinking). Auto budget: low 2,048 / medium 4,096 / high 8,192 / max 12,288, always capped at `max_tokens / 2`. Override with `--think-budget N` (0 = unlimited) or the request field `thinking_budget` / `max_thinking_tokens`. Engine hook: `InklingEngine::force_next_token()`.
+- **Measured**: a request with `thinking_budget: 120` stopped thinking at exactly 120 tokens and then answered.
+
+### 3. Cost-aware speculative drafting (`R2-07` — `src/model.cpp`)
+- Drafting decides K from a measured cost model instead of fixed caps: per-match-length, per-position acceptance (EMA) and the measured marginal cost of a draft relative to a scalar step (EMA, logged as "draft cost"). It drafts only when expected tokens per unit time beat plain decoding, with a cheap probe every 24 declined opportunities. Still lossless (`--verify-suite` gate 2 exact).
+- **Measured** (real-session replay, below): drafted tokens fell 3,071 → 309 (−90%), but net decode speed was unchanged, because v4.1's speculation was already near break-even on this workload (average gain ~0.95x). Measured draft cost is 0.55–0.91 of a scalar token.
+
+### 4. Coda expert-prefetch probe (`R2-09` — `--probe-coda N --prompt-file F`)
+- Measures how well a mid-token hidden state predicts the last 6 layers' experts. On a real 5.6K-token code prompt: Coda hit rate 60.5% (~19 misses/token). The best predictor (router on the loop-pass-2 residual, top-8) covers only 29.8% of misses and would need ~35 expert transfers/token. **Prefetch was therefore not implemented**: its PCIe + host-copy cost exceeds the misses it saves.
+
+### Real-world benchmark (replay of a real 34-turn OpenCode session, 11 checkpoints 1.7K–58K tokens, 512 tokens each, effort high, fixed seeds)
+| | v4.1 | v4.2 |
+|---|---:|---:|
+| Decode | 26.10 tok/s | 26.24 tok/s (+0.5%, within noise) |
+| Prefill | 83.2 tok/s | 82.1 tok/s (−1.3%, within noise) |
+| Drafted tokens | 3,071 | 309 |
+- Caveat: with the benchmark's 512-token cap the auto thinking budget is 256, so 4 of 11 v4.2 replies were cut short; real use (`max_tokens` 16,384) gets 8,192.
+
+### Where decode time actually goes (`--bench 64 --profile`)
+- 33.6 ms/token at 4K context vs 41.2 ms at 57K. Attention grows +7.9 ms while every other stage stays flat. At 57K the 8 global layers read ~525 MB of KV per token (~2 ms at 272 GB/s) but take ~8 ms, i.e. ~25% of memory bandwidth. **The global-attention decode kernel is the next real speed target** (estimated −5 ms/token at 57K, more at 128K).
+
+### Validation
+- `--verify-suite`: all 8 gates PASS. End-to-end streamed-write + exact-replay test: PASS (3 runs).
+
+---
+
 # Changelog / PR Notes — InkEngine v4.1 ("Agent Flow" — exact turn replay, streamed tool calls, decode telemetry)
 
 > **Suggested PR Title:** `v4.1: Token-exact assistant-turn replay (R2-01), streamed tool-call arguments (R2-05), reasoning field aliases (R2-03b), per-request decode telemetry + cache-miss diagnostics (R2-10)`

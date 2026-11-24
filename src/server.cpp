@@ -1033,7 +1033,7 @@ bool OpenAIServer::run() {
     }
     listen(srv, 16);
 
-    std::printf("[Server] OpenAI-compatible InkEngine v4.1 listening on http://%s:%d (effort=%s, vision=%s, auth=%s, cors=%s)\n",
+    std::printf("[Server] OpenAI-compatible InkEngine v4.2 listening on http://%s:%d (effort=%s, vision=%s, auth=%s, cors=%s)\n",
                 cfg_.host.c_str(), cfg_.port, cfg_.default_effort.c_str(),
                 engine_.has_vision() ? "ON" : "OFF",
                 cfg_.require_auth ? "Bearer" : "OFF",
@@ -1293,6 +1293,31 @@ bool OpenAIServer::run() {
         int avail_gen = max_ctx - (int)prompt_ids.size();
         if (sp.max_tokens > avail_gen) sp.max_tokens = std::max(1, avail_gen);
 
+        // v4.2 (R2-04) thinking budget: once a reply has thought for this many tokens, force <|end_message|>
+        // so the model moves on to its answer or tool call instead of drafting whole files inside its thinking
+        // until max_tokens runs out. Auto budget scales with effort and always leaves half of max_tokens to act.
+        int think_budget = cfg_.think_budget;
+        if (const auto* tb = root.get("thinking_budget"); tb && tb->is_num()) think_budget = (int)tb->num;
+        else if (const auto* mt = root.get("max_thinking_tokens"); mt && mt->is_num()) think_budget = (int)mt->num;
+        if (think_budget < 0) {
+            std::string e = effort;
+            for (char& ch : e) ch = (char)std::tolower((unsigned char)ch);
+            double ev = 0.9;
+            if      (e == "none" || e == "0" || e == "0.0") ev = 0.0;
+            else if (e == "minimal") ev = 0.1;
+            else if (e == "low") ev = 0.2;
+            else if (e == "medium" || e == "med") ev = 0.7;
+            else if (e == "high") ev = 0.9;
+            else if (e == "xhigh" || e == "max") ev = 0.99;
+            else { try { ev = std::stod(e); } catch (...) { ev = 0.9; } }
+            think_budget = (ev <= 0.0) ? 1024 : (ev <= 0.1) ? 1024 : (ev <= 0.2) ? 2048 : (ev <= 0.7) ? 4096
+                         : (ev <= 0.9) ? 8192 : 12288;
+            think_budget = std::min(think_budget, std::max(256, sp.max_tokens / 2));
+        }
+        int think_tokens = 0;
+        int think_force_at = think_budget;
+        int think_forced = 0;
+
         uint64_t rid = req_counter.fetch_add(1);
         std::string chat_id = "chatcmpl-ink-" + std::to_string(rid);
         auto created = (long long)std::chrono::duration_cast<std::chrono::seconds>(
@@ -1530,6 +1555,11 @@ bool OpenAIServer::run() {
                 } else if (st == ST_THINKING) {
                     full_reasoning += piece;
                     silent_toks = 0;
+                    if (think_budget > 0 && ++think_tokens >= think_force_at) {
+                        engine_.force_next_token(id_endm);
+                        think_forced++;
+                        think_force_at = think_tokens + 1024; // if it re-opens thinking, close it again later
+                    }
                     if (stream) {
                         std::string valid = utf8_think.push(piece);
                         if (!valid.empty()) emit_sse_delta("{\"reasoning_content\":\"" + json_escape(valid) + "\"}");
@@ -1645,8 +1675,10 @@ bool OpenAIServer::run() {
             const double spec_gain = (spec_ms_step > 0 && scalar_ms_tok > 0) ? scalar_ms_tok * spec_tok_step / spec_ms_step : 0.0;
             std::snprintf(tb, sizeof(tb),
                 "\n         decode: scalar %.1f ms/tok x%d | spec %.1f ms/step x%d (%.2f tok/step, gain %.2fx) | "
+                "draft cost %.2f | think %d tok (budget %d%s) | "
                 "expert VRAM hit %.1f%% (core %.1f%%, outer %.1f%%) | replayed %d/%d turns%s",
                 scalar_ms_tok, res.scalar_steps, spec_ms_step, res.spec_steps, spec_tok_step, spec_gain,
+                res.spec_delta, think_tokens, think_budget, think_forced ? ", forced end" : "",
                 decode_started && dl ? pct(es1.vram_hits - es_dec0.vram_hits, dl) : 0.0,
                 pct(es1.core_vram_hits - es_dec0.core_vram_hits, es1.core_lookups - es_dec0.core_lookups),
                 pct(es1.outer_vram_hits - es_dec0.outer_vram_hits, es1.outer_lookups - es_dec0.outer_lookups),

@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <array>
 #include <functional>
 #include <cuda_runtime.h>
 #include "gguf.h"
@@ -224,7 +225,11 @@ public:
         double scalar_ms = 0.0;    // wall time of single-token decode steps (forward + sample)
         int    scalar_steps = 0;
         double spec_ms = 0.0;      // wall time of speculative verify steps (verify + sample + commit)
+        double spec_delta = 0.0;   // v4.2: learned marginal cost of one draft (scalar-token units)
     };
+    // v4.2 thinking budget: make the token after the current one `id` instead of sampling it.
+    // Call from the generate() on_token callback; applies to the next scalar step.
+    void force_next_token(int32_t id) { forced_next_ = id; }
     GenResult generate(
         const std::vector<int32_t>& prompt_tokens,
         const SamplingParams& sp,
@@ -243,6 +248,10 @@ public:
 
     // Empirical probe & R0 parity suite helpers
     void probe_early_exit(const std::string& prompt_text, int n_tokens = 48);
+
+    // v4.2 research probe: how well can a mid-token hidden state predict this token's Coda (layers 18-23)
+    // experts, i.e. how many CPU-fallback misses could be prefetched into VRAM during the Core loop?
+    void probe_coda_prefetch(const std::string& prompt_text, int n_tokens = 256);
     bool run_parity_suite();
     int max_ctx() const { return cfg_.max_ctx; }
     void set_batched_prefill(bool on) { cfg_.use_batched_prefill = on; }
@@ -345,6 +354,14 @@ private:
     void wait_split_packet(uint32_t target_seq);
 
     TokenProfile prof_{};
+    int32_t forced_next_ = -1;       // v4.2: pending forced token (thinking budget)
+    struct CodaProbe {
+        std::vector<int> capture_il;                       // logical layers whose output residual is captured
+        std::vector<std::vector<float>> h;                 // [capture][n_embd]
+        std::vector<std::array<int32_t, 8>> actual;        // [coda layer][k] routed expert ids
+        std::vector<std::array<uint8_t, 8>> resident;      // [coda layer][k] VRAM-resident at use time
+    };
+    CodaProbe* coda_probe_ = nullptr;
     std::vector<int32_t> kv_tokens_; // exact token history currently resident in kv_
     KVCheckpoint full_sys_ckpt_;     // tier-1 RAM checkpoint at end of ALL system msgs (~99% prompt hit!)
     KVCheckpoint prefix_ckpt_;       // tier-2 RAM checkpoint before dynamic <env> (~80% fallback!)

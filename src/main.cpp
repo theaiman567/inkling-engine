@@ -48,7 +48,7 @@ void print_usage() {
         "  --bench-pos <P>        Simulate long context at position P (e.g. 32768, 65536, 131072, 262144)\n"
         "  --profile              Print per-stage millisecond breakdown during --bench / --prompt\n"
         "  --prompt <text>        Run single prompt completion\n"
-        "  --effort <level>       Thinking effort: none|minimal|low|medium|high|xhigh|max (default: max for --serve, none for --prompt)\n"
+        "  --effort <level>       Thinking effort: none|minimal|low|medium|high|xhigh|max (default: high for --serve, none for --prompt)\n"
         "  --max-tokens <N>       Max output tokens (default: 256)\n"
         "  --temp <F>             Sampling temperature (default: 0.0 = greedy)\n"
         "  --serve                Start OpenAI-compatible HTTP server\n"
@@ -57,6 +57,8 @@ void print_usage() {
         "  --api-key <token>      Bearer auth token for HTTP server (default: auto-generated CSPRNG token)\n"
         "  --no-auth              Disable HTTP Bearer authentication (NOT recommended on shared machines)\n"
         "  --cors-origin <orig>   Allow CORS for one explicit origin (default: CORS disabled)\n"
+        "  --think-budget <N>     Max thinking tokens per reply before forcing an answer (default: auto by effort:\n"
+        "                         high=8192, max=12288, capped at max_tokens/2; 0 = unlimited)\n"
     );
 }
 
@@ -98,6 +100,8 @@ int main(int argc, char** argv) {
     bool do_verify_suite = false;
     bool do_verify_pred = false;
     bool do_probe_ee = false;
+    int probe_coda_n = 0;        // v4.2: --probe-coda <N> research probe
+    std::string prompt_file;     // v4.2: --prompt-file <path> (prompt text for probes)
     bool do_serve = false;
     bool do_profile = false;
     int  bench_n = 0;
@@ -153,6 +157,8 @@ int main(int argc, char** argv) {
         else if (a == "--self-draft-k") cfg.self_draft_k = std::stoi(next());
         else if (a == "--no-disk-kv-cache") cfg.use_disk_kv_cache = false;
         else if (a == "--probe-early-exit") do_probe_ee = true;
+        else if (a == "--probe-coda") probe_coda_n = std::stoi(next());
+        else if (a == "--prompt-file") prompt_file = next();
         else if (a == "--verify-predictor") do_verify_pred = true;
         else if (a == "--bench-prefill") bench_prefill_n = std::stoi(next());
         else if (a == "--threads") cfg.n_threads = std::stoi(next());
@@ -171,6 +177,7 @@ int main(int argc, char** argv) {
         else if (a == "--api-key") srv_cfg.api_key = next();
         else if (a == "--no-auth") srv_cfg.require_auth = false;
         else if (a == "--cors-origin") srv_cfg.cors_origin = next();
+        else if (a == "--think-budget") srv_cfg.think_budget = std::stoi(next());
     }
 
     if (do_verify_pred) {
@@ -244,6 +251,21 @@ int main(int argc, char** argv) {
 
     if (do_probe_ee) {
         engine.probe_early_exit("Explain how a B-tree works in a database and write a short Python binary search function.", 48);
+    }
+
+    if (probe_coda_n > 0) {
+        std::string ptxt = "Explain how a B-tree works in a database and write a short Python binary search function.";
+        if (!prompt_file.empty()) {
+            FILE* pf = std::fopen(prompt_file.c_str(), "rb");
+            if (pf) {
+                ptxt.clear();
+                char buf[65536];
+                size_t n;
+                while ((n = std::fread(buf, 1, sizeof(buf), pf)) > 0) ptxt.append(buf, n);
+                std::fclose(pf);
+            }
+        }
+        engine.probe_coda_prefetch(ptxt, probe_coda_n);
     }
 
     if (bench_prefill_n > 0) {
@@ -408,7 +430,7 @@ int main(int argc, char** argv) {
     }
 
     if (do_serve) {
-        srv_cfg.default_effort = effort.empty() ? "max" : effort;
+        srv_cfg.default_effort = effort.empty() ? "high" : effort;
         OpenAIServer srv(engine, srv_cfg);
         srv.run();
     }

@@ -128,7 +128,7 @@ bool InklingEngine::load(const EngineConfig& cfg) {
 
     auto t_start = now_ms();
     std::printf("================================================================\n");
-    std::printf("  InkEngine v4.1 - Custom Looped-MoE 3-Tier Serving Engine\n");
+    std::printf("  InkEngine v4.2 - Custom Looped-MoE 3-Tier Serving Engine\n");
     std::printf("================================================================\n");
 
     if (!gguf_.open(cfg.model_path)) return false;
@@ -966,6 +966,19 @@ int32_t InklingEngine::forward_token(int32_t token_id, int pos, bool need_logits
         const auto& lm = experts_.layer_meta(ip);
         const auto& tbl = experts_.layer_device_table(ip);
 
+        if (coda_probe_ && il >= coda_start_il) {
+            // v4.2 probe: actual Coda routing + which of those experts were VRAM-resident at use time
+            int32_t ids[8] = {};
+            INK_CUDA_CHECK(cudaMemcpyAsync(ids, d_top_ids_, hp_.n_expert_used * sizeof(int32_t), cudaMemcpyDeviceToHost, stream_));
+            INK_CUDA_CHECK(cudaStreamSynchronize(stream_));
+            auto& a = coda_probe_->actual[il - coda_start_il];
+            auto& r = coda_probe_->resident[il - coda_start_il];
+            for (int k = 0; k < hp_.n_expert_used && k < 8; ++k) {
+                a[k] = ids[k];
+                r[k] = experts_.is_in_vram(ip * hp_.n_expert + ids[k]) ? 1 : 0;
+            }
+        }
+
         if (experts_.is_layer_all_vram(ip)) {
             // ZERO-SYNC GPU-INDIRECT FAST PATH
             ink_cuda_moe_pinned_indirect(lm.gate_up_type, lm.down_type, tbl,
@@ -1018,6 +1031,14 @@ int32_t InklingEngine::forward_token(int32_t token_id, int pos, bool need_logits
                                (const float*)L.ffn_post_conv.ptr, d_ffn_inp_, d_cur_, D, stream_);
 
         mark(L.is_core ? prof_.moe_core_ms : prof_.moe_outer_ms);
+
+        if (coda_probe_) {
+            for (size_t c = 0; c < coda_probe_->capture_il.size(); ++c) {
+                if (coda_probe_->capture_il[c] != il) continue;
+                INK_CUDA_CHECK(cudaMemcpyAsync(coda_probe_->h[c].data(), d_cur_, (size_t)D * sizeof(float), cudaMemcpyDeviceToHost, stream_));
+                INK_CUDA_CHECK(cudaStreamSynchronize(stream_));
+            }
+        }
     }
 
     // Begin cross-tier/general exclusive VRAM <-> RAM swaps overlapped with LM Head (ZERO stall!)
@@ -2255,6 +2276,7 @@ InklingEngine::GenResult InklingEngine::generate(
     res.prompt_tokens = (int)prompt_tokens.size();
     if (prompt_tokens.empty()) return res;
     clear_io_errors();
+    forced_next_ = -1;
 
     int P = (int)prompt_tokens.size();
     if (P >= cfg_.max_ctx) {
@@ -2585,10 +2607,37 @@ InklingEngine::GenResult InklingEngine::generate(
     };
     if (cfg_.use_speculative) sync_ngram_index();
 
-    // R16: Per-match-length (3/4/5-gram) adaptive draft length tracker (100% lossless!)
-    float ngram_ema[3] = {1.5f, 3.0f, 5.0f};
-    int   ngram_3_cooldown = 0;
-    int   ngram_3_consec_rejects = 0;
+    // v4.2 (R2-07): Cost-aware speculative drafting (100% lossless: only decides HOW MANY drafts to verify).
+    // On this MoE every extra token in a verify batch pulls in up to 8 more experts per layer, so one draft
+    // costs roughly half a scalar token (v4.1 log fit: ~0.4-0.6). Draft K tokens only when expected tokens per
+    // unit time beat plain decoding:
+    //   E(K) = 1 + sum_{k=1..K} prod_{j<=k} q[L][j]      cost(K) = 1 + d*K   (scalar-token units)
+    // q[L][j] = EMA acceptance of draft position j given j-1 accepted, per n-gram match length L (3/4/5);
+    // d       = EMA of the measured marginal verify cost per drafted token.
+    constexpr int SPEC_POS = HybridPagedKV::SPEC_MAX_B - 2;
+    float spec_q[3][SPEC_POS];
+    for (int L = 0; L < 3; ++L)
+        for (int k = 0; k < SPEC_POS; ++k)
+            spec_q[L][k] = (L == 0) ? 0.45f : ((L == 1) ? 0.60f : 0.75f);
+    double spec_t_scalar = -1.0; // EMA ms per scalar decode step (measured)
+    double spec_delta = 0.5;     // EMA marginal verify cost per draft, in scalar-token units (prior from v4.1 telemetry)
+    int spec_declined = 0;       // consecutive declined drafting opportunities (probe every 24 to refresh q)
+    auto choose_draft_len = [&](int L_idx, int avail) -> int {
+        double best_ratio = 1.0, e = 1.0, p = 1.0;
+        int best_k = 0;
+        for (int k = 1; k <= avail && k <= SPEC_POS; ++k) {
+            p *= spec_q[L_idx][k - 1];
+            e += p;
+            const double ratio = e / (1.0 + spec_delta * k);
+            if (ratio > best_ratio * 1.02) { best_ratio = ratio; best_k = k; }
+        }
+        if (best_k == 0 && avail > 0) {
+            if (++spec_declined >= 24) { spec_declined = 0; best_k = 1; } // cheap probe keeps q current
+        } else {
+            spec_declined = 0;
+        }
+        return best_k;
+    };
 
     auto draft_ngram = [&](int32_t cur_tok, int max_draft, int32_t* out_draft, int& out_match_len) -> int {
         out_match_len = 0;
@@ -2622,26 +2671,14 @@ InklingEngine::GenResult InklingEngine::generate(
         if (best_idx < 0) return 0;
         out_match_len = best_len;
 
-        // R16: Scale draft length K adaptively by match length + acceptance EMA!
-        int k_cap = max_draft;
-        if (best_len == 3) {
-            if (ngram_3_cooldown > 0 || ngram_ema[0] < 0.35f) {
-                if (ngram_3_cooldown > 0) ngram_3_cooldown--;
-                ngram_ema[0] = std::min(1.0f, ngram_ema[0] + 0.04f); // gradual recovery when switching back to code
-                return 0;
-            }
-            k_cap = std::clamp((int)std::lround(ngram_ema[0] + 1.0f), 1, std::min(4, max_draft));
-        } else if (best_len == 4) {
-            k_cap = std::clamp((int)std::lround(ngram_ema[1] + 1.5f), 2, max_draft);
-        }
-
-        int k = 0;
-        for (; k < k_cap && (best_idx + 1 + k) < H; ++k) {
-            int32_t cand = kv_tokens_[best_idx + 1 + k];
+        int avail = 0;
+        for (; avail < max_draft && (best_idx + 1 + avail) < H; ++avail) {
+            int32_t cand = kv_tokens_[best_idx + 1 + avail];
             if (tok_.is_eog(cand)) break;
-            out_draft[k] = cand;
+            out_draft[avail] = cand;
         }
-        return k;
+        // R2-07: keep only as many drafts as the measured cost model says will pay off.
+        return choose_draft_len(std::clamp(best_len - 3, 0, 2), avail);
     };
 
     int32_t next_tok = sample_next(sp, rng);
@@ -2658,18 +2695,19 @@ InklingEngine::GenResult InklingEngine::generate(
         if (res.gen_tokens >= sp.max_tokens) break;
 
         bool need_pred_now = pred_main_.loaded() && (res.gen_tokens >= next_pred_at);
+        const bool forcing = (forced_next_ >= 0); // v4.2 thinking budget: next token is dictated, no drafting
 
-        // Stage 5 / v4.0: Zero-VRAM Lossless Adaptive Speculative Decoding (R13 + R16)!
-        //  1) O(1) Rolling 3-Gram Suffix Hash Drafter (adaptive K <= 6 by match_len + EMA, <1 us!)
+        // Stage 5 / v4.2: Zero-VRAM Lossless Cost-Aware Speculative Decoding (R13 + R2-07)!
+        //  1) O(1) Rolling 3-Gram Suffix Hash Drafter (K chosen by the measured cost model, <1 us!)
         //  2) 1-Loop (24L) GPU-Only Self-Speculative Fallback (zero extra VRAM)
         int32_t draft_toks[HybridPagedKV::SPEC_MAX_B];
         int max_d = std::min(HybridPagedKV::SPEC_MAX_B - 2, std::min(sp.max_tokens - res.gen_tokens, cfg_.max_ctx - 2 - pos));
         int ngram_match_len = 0;
-        int K_draft = (cfg_.use_speculative && !enable_profile && !need_pred_now && max_d >= 2)
+        int K_draft = (cfg_.use_speculative && !enable_profile && !need_pred_now && !forcing && max_d >= 2)
             ? draft_ngram(next_tok, max_d, draft_toks, ngram_match_len)
             : 0;
 
-        if (K_draft == 0 && cfg_.use_speculative && cfg_.self_draft_k > 0 && !enable_profile && !need_pred_now && max_d >= 2) {
+        if (K_draft == 0 && cfg_.use_speculative && cfg_.self_draft_k > 0 && !enable_profile && !need_pred_now && !forcing && max_d >= 2) {
             int k_self = std::min(cfg_.self_draft_k, max_d);
             kv_.begin_draft_snapshot(pos, k_self, stream_);
             int32_t d_in = next_tok;
@@ -2742,7 +2780,8 @@ InklingEngine::GenResult InklingEngine::generate(
             }
 
             kv_.commit_spec_verify(accepted, stream_);
-            res.spec_ms += now_ms() - t_spec0;
+            const double t_step = now_ms() - t_spec0;
+            res.spec_ms += t_step;
             const int K_exp = hp_.n_expert_used;
             const bool replay_spec_routes = predictor_active() && (batch_pred_B_ == B) &&
                 (batch_pred_ids_.size() >= (size_t)hp_.n_layer_logical * (size_t)B * (size_t)K_exp);
@@ -2765,17 +2804,23 @@ InklingEngine::GenResult InklingEngine::generate(
             res.spec_drafted += K_draft;
             res.spec_steps++;
 
-            // R16: Update adaptive n-gram acceptance EMA + cold-prose 3-gram cooldown
+            // R2-07: update per-position acceptance (positions after the first rejection are unobserved)
+            // and the measured marginal cost of a draft relative to a scalar step.
             if (ngram_match_len >= 3) {
-                int n_acc = accepted - 1;
-                int bi = std::clamp(ngram_match_len - 3, 0, 2);
-                ngram_ema[bi] = 0.70f * ngram_ema[bi] + 0.30f * (float)n_acc;
-                if (bi == 0 && n_acc == 0) {
-                    if (++ngram_3_consec_rejects >= 2) ngram_3_cooldown = 3;
-                } else if (n_acc > 0) {
-                    ngram_3_consec_rejects = 0;
-                    ngram_3_cooldown = 0;
+                const int n_acc = accepted - 1;
+                const int bi = std::clamp(ngram_match_len - 3, 0, 2);
+                for (int k = 0; k < K_draft && k < SPEC_POS; ++k) {
+                    if (k < n_acc) {
+                        spec_q[bi][k] = 0.92f * spec_q[bi][k] + 0.08f;
+                    } else {
+                        if (!stopped) spec_q[bi][k] = 0.92f * spec_q[bi][k];
+                        break;
+                    }
                 }
+            }
+            if (spec_t_scalar > 0.0 && K_draft >= 1 && !stopped) {
+                const double d_obs = std::clamp((t_step / spec_t_scalar - 1.0) / (double)K_draft, 0.0, 3.0);
+                spec_delta = 0.9 * spec_delta + 0.1 * d_obs;
             }
 
             if (pos >= cfg_.max_ctx - 1) { res.hit_max_ctx = true; break; }
@@ -2783,7 +2828,8 @@ InklingEngine::GenResult InklingEngine::generate(
             next_tok = bonus_tok;
         } else {
             const double t_sc0 = now_ms();
-            forward_token(next_tok, pos, true, enable_profile, /*is_answer=*/true, /*capture_pred_hidden=*/need_pred_now);
+            // A forced next token (thinking budget) needs no logits for this step.
+            forward_token(next_tok, pos, /*need_logits=*/!forcing, enable_profile, /*is_answer=*/true, /*capture_pred_hidden=*/need_pred_now);
             if (io_error_) {
                 res.io_error = true;
                 res.error_msg = last_error_;
@@ -2796,13 +2842,132 @@ InklingEngine::GenResult InklingEngine::generate(
             }
             kv_tokens_.push_back(next_tok);
             pos++;
-            next_tok = sample_next(sp, rng);
-            res.scalar_ms += now_ms() - t_sc0;
+            if (forcing) {
+                next_tok = forced_next_;
+                forced_next_ = -1;
+            } else {
+                next_tok = sample_next(sp, rng);
+            }
+            const double t_sc = now_ms() - t_sc0;
+            res.scalar_ms += t_sc;
             res.scalar_steps++;
+            if (!need_pred_now && !forcing) {
+                spec_t_scalar = (spec_t_scalar < 0.0) ? t_sc : (0.9 * spec_t_scalar + 0.1 * t_sc);
+            }
         }
     }
+    forced_next_ = -1;
+    res.spec_delta = spec_delta;
     res.decode_ms = now_ms() - t_dec0;
     return res;
+}
+
+void InklingEngine::probe_coda_prefetch(const std::string& prompt_text, int n_tokens) {
+    const int D = hp_.n_embd, E = hp_.n_expert, K = hp_.n_expert_used;
+    const int n_core = hp_.core_end - hp_.core_start;
+    const int coda_ip0 = hp_.core_end;
+    const int n_coda = hp_.n_layer_phys - coda_ip0;
+    const int coda_il0 = hp_.core_start + hp_.num_loops * n_core;
+    std::printf("\n[CODA PROBE] Predicting Coda (physical layers %d..%d) experts from mid-token hidden states over %d tokens...\n",
+                coda_ip0, hp_.n_layer_phys - 1, n_tokens);
+
+    // Host copies of the Coda routers (F32), selection biases and FFN norms
+    std::vector<std::vector<float>> W(n_coda), Bv(n_coda), Nw(n_coda);
+    for (int c = 0; c < n_coda; ++c) {
+        const auto& L = layers_[coda_ip0 + c];
+        W[c].resize((size_t)E * D);
+        INK_CUDA_CHECK(cudaMemcpy(W[c].data(), L.ffn_gate_inp.ptr, W[c].size() * sizeof(float), cudaMemcpyDeviceToHost));
+        Bv[c].assign(E, 0.0f);
+        if (L.ffn_exp_probs_b.ptr) INK_CUDA_CHECK(cudaMemcpy(Bv[c].data(), L.ffn_exp_probs_b.ptr, E * sizeof(float), cudaMemcpyDeviceToHost));
+        Nw[c].resize(D);
+        INK_CUDA_CHECK(cudaMemcpy(Nw[c].data(), L.ffn_norm.ptr, D * sizeof(float), cudaMemcpyDeviceToHost));
+    }
+
+    CodaProbe pr;
+    pr.capture_il = { hp_.core_start + n_core - 1, hp_.core_start + 2 * n_core - 1, coda_il0 - 1 };
+    const char* cap_name[3] = { "after loop pass 1", "after loop pass 2", "after loop pass 3" };
+    pr.h.assign(pr.capture_il.size(), std::vector<float>(D, 0.0f));
+    pr.actual.assign(n_coda, {});
+    pr.resident.assign(n_coda, {});
+
+    reset_context();
+    std::string fmt = tok_.format_chat({{"user", prompt_text}}, "none", true);
+    auto ptoks = tok_.encode(fmt, true);
+    int32_t tok = prefill(ptoks, 0);
+    int pos = (int)ptoks.size();
+    std::printf("[CODA PROBE] prompt %d tokens prefilled\n", pos);
+
+    const int KS[3] = { 8, 12, 16 };
+    uint64_t lookups = 0, misses = 0;
+    uint64_t covered[3][3] = {}, dmas[3][3] = {};
+    uint64_t covered_prev = 0;
+    std::vector<std::array<int32_t, 8>> prev_actual(n_coda);
+    bool have_prev = false;
+    std::vector<float> x(D), score(E);
+    std::vector<int> order(E);
+
+    coda_probe_ = &pr;
+    for (int t = 0; t < n_tokens && pos < cfg_.max_ctx - 1; ++t) {
+        int32_t next = forward_token(tok, pos, /*need_logits=*/true);
+        for (int c = 0; c < n_coda; ++c) {
+            const int ip = coda_ip0 + c;
+            bool miss[8];
+            int n_miss = 0;
+            for (int k = 0; k < K; ++k) { miss[k] = !pr.resident[c][k]; n_miss += miss[k] ? 1 : 0; }
+            lookups += K;
+            misses += n_miss;
+            if (have_prev) {
+                for (int k = 0; k < K; ++k) {
+                    if (!miss[k]) continue;
+                    for (int j = 0; j < K; ++j) if (prev_actual[c][j] == pr.actual[c][k]) { covered_prev++; break; }
+                }
+            }
+            for (size_t cp = 0; cp < pr.capture_il.size(); ++cp) {
+                // x = RMSNorm(h) * ffn_norm ; s = sigmoid(W x) + bias (the router's own selection score)
+                double ss = 0.0;
+                for (int d = 0; d < D; ++d) ss += (double)pr.h[cp][d] * pr.h[cp][d];
+                const float inv = 1.0f / std::sqrt((float)(ss / D) + hp_.rms_eps);
+                for (int d = 0; d < D; ++d) x[d] = pr.h[cp][d] * inv * Nw[c][d];
+                for (int e = 0; e < E; ++e) {
+                    const float* w = W[c].data() + (size_t)e * D;
+                    double acc = 0.0;
+                    for (int d = 0; d < D; ++d) acc += (double)w[d] * x[d];
+                    score[e] = 1.0f / (1.0f + std::exp(-(float)acc)) + Bv[c][e];
+                }
+                for (int e = 0; e < E; ++e) order[e] = e;
+                std::partial_sort(order.begin(), order.begin() + 16, order.end(),
+                                  [&](int a, int b) { return score[a] > score[b]; });
+                for (int ki = 0; ki < 3; ++ki) {
+                    for (int j = 0; j < KS[ki]; ++j) if (!experts_.is_in_vram(ip * E + order[j])) dmas[cp][ki]++;
+                    for (int k = 0; k < K; ++k) {
+                        if (!miss[k]) continue;
+                        for (int j = 0; j < KS[ki]; ++j) if (order[j] == pr.actual[c][k]) { covered[cp][ki]++; break; }
+                    }
+                }
+            }
+            prev_actual[c] = pr.actual[c];
+        }
+        have_prev = true;
+        kv_tokens_.push_back(tok);
+        tok = next;
+        pos++;
+        if (tok_.is_eog(tok)) break;
+    }
+    coda_probe_ = nullptr;
+
+    const double T = (double)std::max<uint64_t>(1, lookups / (uint64_t)(K * n_coda));
+    std::printf("[CODA PROBE] tokens=%.0f | Coda lookups/token=%d | VRAM misses/token=%.2f (hit %.1f%%)\n",
+                T, K * n_coda, misses / T, lookups ? 100.0 * (1.0 - (double)misses / lookups) : 0.0);
+    std::printf("[CODA PROBE] previous-token experts cover %.1f%% of misses\n",
+                misses ? 100.0 * covered_prev / misses : 0.0);
+    for (size_t cp = 0; cp < pr.capture_il.size(); ++cp) {
+        for (int ki = 0; ki < 3; ++ki) {
+            std::printf("[CODA PROBE] router on residual %s (il=%d), top-%2d: covers %.1f%% of misses | prefetch DMAs/token=%.1f\n",
+                        cap_name[cp], pr.capture_il[cp], KS[ki],
+                        misses ? 100.0 * covered[cp][ki] / misses : 0.0, dmas[cp][ki] / T);
+        }
+    }
+    std::fflush(stdout);
 }
 
 void InklingEngine::probe_early_exit(const std::string& prompt_text, int n_tokens) {
