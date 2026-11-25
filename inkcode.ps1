@@ -47,7 +47,7 @@ function Sync-OpenCodeApiKey {
     if (-not (Test-Path $ocCfg)) { return }
     try {
         $raw = Get-Content -Path $ocCfg -Raw
-        $pattern = '("inkengine"\s*:\s*\{[^{}]*"options"\s*:\s*\{[^{}]*"apiKey"\s*:\s*")([^"]*)(")'
+        $pattern = '("inkengine"\s*:\s*\{[^{}]*"(?:options|settings)"\s*:\s*\{[^{}]*"apiKey"\s*:\s*")([^"]*)(")'
         if ($raw -match $pattern -and $Matches[2] -ne $Token) {
             $updated = [regex]::Replace($raw, $pattern, { param($m) $m.Groups[1].Value + $Token + $m.Groups[3].Value }, 1)
             Set-Content -Path $ocCfg -Value $updated -NoNewline
@@ -254,16 +254,49 @@ if ($health) {
 }
 
 # Launch OpenCode CLI directly with inkengine/Inkling-2-Mini pre-selected!
+# Supports both OpenCode v2.x (uses OPENCODE_CONFIG_CONTENT for TUI, -m for run/mini) and v1.x (-m).
 $opencodeArgs = New-Object System.Collections.Generic.List[string]
 $hasModel = $false
 for ($j = 0; $j -lt $PassArgs.Count; $j++) {
     if ($PassArgs[$j] -eq "-m" -or $PassArgs[$j] -eq "--model") { $hasModel = $true }
 }
-if (-not $hasModel) {
-    $opencodeArgs.Add("-m")
-    $opencodeArgs.Add($ModelSpec)
-}
-foreach ($pa in $PassArgs) { $opencodeArgs.Add($pa) }
+$ocVer = (& opencode --version 2>$null | Select-Object -First 1)
+$isV2  = ($ocVer -match '(^|\s)v?2\.')
+$firstPass = if ($PassArgs.Count -gt 0) { $PassArgs[0] } else { "" }
 
-& opencode @opencodeArgs
-exit $LASTEXITCODE
+if ($isV2) {
+    foreach ($pa in $PassArgs) { $opencodeArgs.Add($pa) }
+    if (-not $hasModel -and $firstPass -in @("run", "mini")) {
+        $opencodeArgs.Insert(1, $ModelSpec)
+        $opencodeArgs.Insert(1, "-m")
+    }
+    $prevOcCfg = $env:OPENCODE_CONFIG_CONTENT
+    try {
+        if (-not $hasModel -and -not $prevOcCfg) {
+            $env:OPENCODE_CONFIG_CONTENT = '{"model":{"providerID":"inkengine","model":"Inkling-2-Mini"}}'
+            # OpenCode 2.x only reads OPENCODE_CONFIG_CONTENT in a process that runs its own server; the shared
+            # background service never sees this environment. Start the TUI on a private server so Inkling is
+            # actually pre-selected (otherwise it opens on the config's default model).
+            $ocSubcommands = @("run", "mini", "acp", "api", "debug", "auth", "mcp", "plugin", "models", "stats",
+                               "session", "service", "upgrade", "update", "uninstall")
+            if (-not ($firstPass -in $ocSubcommands) -and -not ($PassArgs -contains "--standalone") -and -not ($PassArgs -contains "--server")) {
+                $opencodeArgs.Insert(0, "--standalone")
+            }
+        }
+        [object[]]$ocArr = @($opencodeArgs.ToArray())
+        & opencode @ocArr
+        $code = $LASTEXITCODE
+    } finally {
+        if ($null -eq $prevOcCfg) { Remove-Item Env:OPENCODE_CONFIG_CONTENT -ErrorAction SilentlyContinue } else { $env:OPENCODE_CONFIG_CONTENT = $prevOcCfg }
+    }
+    exit $code
+} else {
+    if (-not $hasModel) {
+        $opencodeArgs.Add("-m")
+        $opencodeArgs.Add($ModelSpec)
+    }
+    foreach ($pa in $PassArgs) { $opencodeArgs.Add($pa) }
+    [object[]]$ocArr = @($opencodeArgs.ToArray())
+    & opencode @ocArr
+    exit $LASTEXITCODE
+}
