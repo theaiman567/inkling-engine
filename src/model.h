@@ -43,6 +43,7 @@ struct EngineConfig {
     bool use_cuda_graphs = true;    // CUDA Graphs for all 48 layer preludes/postludes + LM Head!
     bool use_batched_prefill = true; // WMMA Tensor-Core + PCIe-Streamed Batched Prefill (B=128!)
     bool use_speculative = true;    // Zero-VRAM lossless O(1) Suffix-Hash speculative decoding (K <= 6)!
+    bool spec_cost_model = true;    // v4.2: choose draft length from measured cost (false = always draft the full match; tests)
     int  self_draft_k = 0;          // Opt-in 1-Loop (24L) GPU-Only lossless self-draft (--self-draft-k 2|3, up to 37.9 tok/s on code!)
     bool use_disk_kv_cache = true;  // Persistent NVMe OpenCode KV prefix cache (<100 ms cold Turn 1!)
     std::string kv_cache_dir;       // defaults to %LOCALAPPDATA%\InkEngine\kv_cache

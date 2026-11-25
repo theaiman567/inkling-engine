@@ -2029,6 +2029,249 @@ void ink_cuda_attn_swa(const float* Q, const void* K_ring, const void* V_ring, c
     }
 }
 
+// =========================================================================
+// v4.2: Flash-decoding global paged attention for Q4_0 KV (B = 1, head_dim 128, GQA 3).
+// The v4.0 kernel walks tokens one at a time per warp: three 32-lane shuffle reductions plus a serial
+// online-softmax update per token, so it is latency bound (~25% of GDDR6 bandwidth at 57K context).
+// This kernel processes 128 tokens (2 pages) per chunk with 128 threads and no shuffles in the hot loops:
+//   A) one thread per token: dequantize its 72-byte K head from 8-byte loads and dot it with all 3 query
+//      heads held in shared memory (broadcast reads);
+//   B) one warp per query head: chunk max, exp, running (m, l) update -- once per chunk, not per token;
+//   C) one thread per output dim: o[h][d] = alpha*o + sum_t p[h][t] * V[t][d] (coalesced 72-byte V rows).
+// Output semantics are identical to k_attn_global_splitk_gqa (unnormalised split partials + (m, l), or the
+// fused sink + normalisation when final_out != nullptr). Numerically equivalent, different FP32 sum order.
+// =========================================================================
+__global__ void __launch_bounds__(128) k_attn_global_flashdec_q4(
+    const float* __restrict__ Q,
+    const uint64_t* __restrict__ page_k_ptrs, const uint64_t* __restrict__ page_v_ptrs,
+    const int32_t* __restrict__ page_pos0, const int32_t* __restrict__ page_lens,
+    int n_pages, int n_splits, const float* __restrict__ rel_table,
+    float* __restrict__ split_out, float* __restrict__ split_ml,
+    const float* __restrict__ sinks, float* __restrict__ final_out,
+    int n_head, int n_head_kv, int pos_q, int rel_extent)
+{
+    constexpr int HD = 128, G = 3, CH = 128, HB = 72;
+    const int h_kv = blockIdx.x, sp = blockIdx.y;
+    if (h_kv >= n_head_kv || sp >= n_splits) return;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const size_t tok_stride = (size_t)n_head_kv * HB;
+
+    __shared__ float q_s[G][HD];
+    __shared__ float p_s[G][CH];
+    __shared__ float m_run[G], l_run[G], alpha_s[G];
+    __shared__ int   any_valid;
+
+    #pragma unroll
+    for (int g = 0; g < G; ++g) q_s[g][tid] = Q[(h_kv * G + g) * HD + tid];
+    if (tid < G) { m_run[tid] = -FLT_MAX; l_run[tid] = 0.0f; }
+    __syncthreads();
+
+    const float inv_sqrt_d = rsqrtf((float)HD);
+    const int p_start = (n_pages * sp) / n_splits;
+    const int p_end   = (n_pages * (sp + 1)) / n_splits;
+    // Phase C layout: 8 token groups x 16 threads. Thread part (0..15) owns 8 dims of the 128:
+    // Q4_0 block vb = part/4, quant bytes vi..vi+3 (vi = 4*(part%4)) -> dims 32vb+vi+{0..3} (low nibbles)
+    // and 32vb+16+vi+{0..3} (high nibbles). Accumulators persist across chunks; groups are summed at the end.
+    const int tg = tid >> 4, part = tid & 15;
+    const int vb = part >> 2, vi = (part & 3) * 4;
+    const int v_off = 18 * vb + 2 + vi;     // even -> two aligned 16-bit loads
+    float o[G][8];
+    #pragma unroll
+    for (int g = 0; g < G; ++g)
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) o[g][k] = 0.0f;
+
+    for (int cp = p_start; cp < p_end; cp += 2) {
+        // ---------------- Phase A: scores, one thread per token ----------------
+        const int pg = cp + (tid >> 6);
+        const int t  = tid & 63;
+        float sc[G] = {-FLT_MAX, -FLT_MAX, -FLT_MAX};
+        bool valid = false;
+        if (pg < p_end) {
+            const int p0 = __ldg(&page_pos0[pg]), plen = __ldg(&page_lens[pg]);
+            const int dist = pos_q - (p0 + t);
+            if (t < plen && dist >= 0) {
+                valid = true;
+                const uint8_t* kp = (const uint8_t*)(uintptr_t)__ldg(&page_k_ptrs[pg]) + (size_t)t * tok_stride + (size_t)h_kv * HB;
+                uint32_t w[18];
+                const uint2* k2 = (const uint2*)kp;            // 72-byte head is 8-byte aligned
+                #pragma unroll
+                for (int i = 0; i < 9; ++i) { uint2 v = __ldg(&k2[i]); w[2 * i] = v.x; w[2 * i + 1] = v.y; }
+                float acc[G] = {0.0f, 0.0f, 0.0f};
+                #pragma unroll
+                for (int b = 0; b < 4; ++b) {
+                    const int o0 = 18 * b;
+                    const uint32_t lo_b = (w[o0 >> 2] >> (8 * (o0 & 3))) & 0xFFu;
+                    const uint32_t hi_b = (w[(o0 + 1) >> 2] >> (8 * ((o0 + 1) & 3))) & 0xFFu;
+                    const float d = d_fp16_to_f32((uint16_t)(lo_b | (hi_b << 8)));
+                    float part[G] = {0.0f, 0.0f, 0.0f};
+                    #pragma unroll
+                    for (int j = 0; j < 16; ++j) {
+                        const int bi = o0 + 2 + j;
+                        const uint32_t byte = (w[bi >> 2] >> (8 * (bi & 3))) & 0xFFu;
+                        const float lo = (float)((int)(byte & 0xFu) - 8);
+                        const float hi = (float)((int)(byte >> 4) - 8);
+                        #pragma unroll
+                        for (int g = 0; g < G; ++g) {
+                            part[g] = fmaf(q_s[g][32 * b + j], lo, part[g]);
+                            part[g] = fmaf(q_s[g][32 * b + 16 + j], hi, part[g]);
+                        }
+                    }
+                    #pragma unroll
+                    for (int g = 0; g < G; ++g) acc[g] = fmaf(part[g], d, acc[g]);
+                }
+                const bool in_rel = dist < rel_extent;
+                #pragma unroll
+                for (int g = 0; g < G; ++g) {
+                    const float bias = in_rel ? __ldg(&rel_table[(h_kv * G + g) * rel_extent + dist]) : 0.0f;
+                    sc[g] = acc[g] * inv_sqrt_d + bias;
+                }
+            }
+        }
+        #pragma unroll
+        for (int g = 0; g < G; ++g) p_s[g][tid] = valid ? sc[g] : -FLT_MAX;
+        if (tid == 0) any_valid = 0;
+        __syncthreads();
+        if (valid) any_valid = 1;
+
+        // ---------------- Phase B: chunk softmax update, one warp per query head ----------------
+        if (warp < G) {
+            const int g = warp;
+            float v0 = p_s[g][lane], v1 = p_s[g][lane + 32], v2 = p_s[g][lane + 64], v3 = p_s[g][lane + 96];
+            float cm = fmaxf(fmaxf(v0, v1), fmaxf(v2, v3));
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) cm = fmaxf(cm, __shfl_xor_sync(0xFFFFFFFFu, cm, off));
+            const float m_old = m_run[g];
+            const float m_new = fmaxf(m_old, cm);
+            float alpha = 1.0f, e0 = 0.0f, e1 = 0.0f, e2 = 0.0f, e3 = 0.0f;
+            if (m_new > -FLT_MAX * 0.5f) {
+                alpha = (m_old > -FLT_MAX * 0.5f) ? expf(m_old - m_new) : 0.0f;
+                e0 = (v0 > -FLT_MAX * 0.5f) ? expf(v0 - m_new) : 0.0f;
+                e1 = (v1 > -FLT_MAX * 0.5f) ? expf(v1 - m_new) : 0.0f;
+                e2 = (v2 > -FLT_MAX * 0.5f) ? expf(v2 - m_new) : 0.0f;
+                e3 = (v3 > -FLT_MAX * 0.5f) ? expf(v3 - m_new) : 0.0f;
+            }
+            p_s[g][lane] = e0; p_s[g][lane + 32] = e1; p_s[g][lane + 64] = e2; p_s[g][lane + 96] = e3;
+            float ls = (e0 + e1) + (e2 + e3);
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) ls += __shfl_xor_sync(0xFFFFFFFFu, ls, off);
+            if (lane == 0) {
+                l_run[g] = l_run[g] * alpha + ls;
+                m_run[g] = m_new;
+                alpha_s[g] = alpha;
+            }
+        }
+        __syncthreads();
+
+        // ---------------- Phase C: P x V, 16 threads per token, 8 tokens in flight ----------------
+        if (any_valid) {
+            #pragma unroll
+            for (int g = 0; g < G; ++g) {
+                const float a = alpha_s[g];
+                #pragma unroll
+                for (int k = 0; k < 8; ++k) o[g][k] *= a;
+            }
+            #pragma unroll 2
+            for (int half = 0; half < 2; ++half) {
+                const int pgv = cp + half;
+                if (pgv >= p_end) break;
+                const uint8_t* vbase = (const uint8_t*)(uintptr_t)__ldg(&page_v_ptrs[pgv]) + (size_t)h_kv * HB;
+                const int plen = __ldg(&page_lens[pgv]);
+                #pragma unroll 2
+                for (int t2 = tg; t2 < plen; t2 += 8) {
+                    const int ci = half * 64 + t2;
+                    const float pa = p_s[0][ci], pb = p_s[1][ci], pc = p_s[2][ci];
+                    if (pa == 0.0f && pb == 0.0f && pc == 0.0f) continue;   // uniform within the 16-thread group
+                    const uint8_t* vp = vbase + (size_t)t2 * tok_stride;
+                    const float d = d_fp16_to_f32(__ldg((const uint16_t*)(vp + 18 * vb)));
+                    const uint32_t q = (uint32_t)__ldg((const uint16_t*)(vp + v_off)) |
+                                       ((uint32_t)__ldg((const uint16_t*)(vp + v_off + 2)) << 16);
+                    const float fa = pa * d, fb = pb * d, fc = pc * d;
+                    #pragma unroll
+                    for (int k = 0; k < 4; ++k) {
+                        const uint32_t byte = (q >> (8 * k)) & 0xFFu;
+                        const float lo = (float)((int)(byte & 0xFu) - 8);
+                        const float hi = (float)((int)(byte >> 4) - 8);
+                        o[0][k] = fmaf(fa, lo, o[0][k]); o[0][4 + k] = fmaf(fa, hi, o[0][4 + k]);
+                        o[1][k] = fmaf(fb, lo, o[1][k]); o[1][4 + k] = fmaf(fb, hi, o[1][4 + k]);
+                        o[2][k] = fmaf(fc, lo, o[2][k]); o[2][4 + k] = fmaf(fc, hi, o[2][4 + k]);
+                    }
+                }
+            }
+        }
+        __syncthreads(); // p_s / alpha_s are rewritten by the next chunk
+    }
+
+    // ---------------- Reduce the 8 token groups, then output ----------------
+    __shared__ float red_s[8][G][HD];
+    #pragma unroll
+    for (int g = 0; g < G; ++g) {
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            red_s[tg][g][32 * vb + vi + k]      = o[g][k];
+            red_s[tg][g][32 * vb + 16 + vi + k] = o[g][4 + k];
+        }
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int g = 0; g < G; ++g) {
+        float acc = 0.0f;
+        #pragma unroll
+        for (int r = 0; r < 8; ++r) acc += red_s[r][g][tid];
+        const int h = h_kv * G + g;
+        const float m_all = m_run[g], l_all = l_run[g];
+        if (final_out) {
+            const float sink_t = sinks[h];
+            const float m_tot = fmaxf(sink_t, m_all);
+            float denom = expf(sink_t - m_tot);
+            float scl = 0.0f;
+            if (m_all > -FLT_MAX * 0.5f) { scl = expf(m_all - m_tot); denom += l_all * scl; }
+            final_out[h * HD + tid] = (scl * acc) / denom;
+        } else {
+            split_out[(sp * n_head + h) * HD + tid] = acc;
+            if (tid == 0) {
+                split_ml[(sp * n_head + h) * 2 + 0] = m_all;
+                split_ml[(sp * n_head + h) * 2 + 1] = l_all;
+            }
+        }
+    }
+}
+
+// 0 = auto (flash-decoding kernel for Q4_0), 1 = force the v4.0 kernel (env INK_ATTN_V1=1 or tests)
+static int g_attn_impl_override = -1;
+void ink_cuda_set_attn_impl(int impl) { g_attn_impl_override = impl; }
+
+static bool use_flashdec(KVQuantMode kv_mode, int head_dim, int n_head, int n_head_kv) {
+    if (g_attn_impl_override < 0) {
+        const char* ev = std::getenv("INK_ATTN_V1");
+        g_attn_impl_override = (ev && ev[0] == '1') ? 1 : 0;
+    }
+    return g_attn_impl_override == 0 && kv_mode == KV_QUANT_Q4_0 && head_dim == 128 && n_head == 3 * n_head_kv;
+}
+
+// One query: split count depends only on n_pages, so a query at position p computes bit-identical
+// results whether it comes from scalar decode or from a speculative verify batch.
+static void launch_flashdec_one(const float* Q, const uint64_t* page_k_ptrs, const uint64_t* page_v_ptrs,
+                                const int32_t* page_pos0, const int32_t* page_lens, int n_pages,
+                                const float* rel_table, const float* sinks,
+                                float* split_out, float* split_ml, float* out,
+                                int n_head, int n_head_kv, int head_dim, int pos_q, int rel_extent, cudaStream_t stream) {
+    int n_splits = 1;
+    if (n_pages >= 512)      n_splits = 48;
+    else if (n_pages >= 256) n_splits = 32;
+    else if (n_pages >= 64)  n_splits = 16;
+    else if (n_pages >= 16)  n_splits = 8;
+    else if (n_pages >= 4)   n_splits = 2;
+    dim3 grid(n_head_kv, n_splits);
+    k_attn_global_flashdec_q4<<<grid, 128, 0, stream>>>(
+        Q, page_k_ptrs, page_v_ptrs, page_pos0, page_lens, n_pages, n_splits, rel_table,
+        split_out, split_ml, sinks, (n_splits == 1) ? out : nullptr,
+        n_head, n_head_kv, pos_q, rel_extent);
+    if (n_splits > 1) {
+        k_attn_global_reduce<<<n_head, 32, 0, stream>>>(split_out, split_ml, sinks, out, n_splits, n_head, head_dim);
+    }
+}
+
 void ink_cuda_attn_global_paged(
     const float* Q, const uint64_t* page_k_ptrs, const uint64_t* page_v_ptrs,
     const int32_t* page_pos0, const int32_t* page_lens, int n_pages,
@@ -2037,6 +2280,12 @@ void ink_cuda_attn_global_paged(
     int n_head, int n_head_kv, int head_dim, int pos_q, int rel_extent,
     KVQuantMode kv_mode, cudaStream_t stream)
 {
+    if (use_flashdec(kv_mode, head_dim, n_head, n_head_kv)) {
+        launch_flashdec_one(Q, page_k_ptrs, page_v_ptrs, page_pos0, page_lens, n_pages, rel_table, sinks,
+                            split_out, split_ml, out, n_head, n_head_kv, head_dim, pos_q, rel_extent, stream);
+        return;
+    }
+
     int n_splits = 1;
     if (n_pages >= 256)     n_splits = 32; // 8 * 32 = 256 blocks saturating all 24 SMs!
     else if (n_pages >= 64) n_splits = 16; // 8 * 16 = 128 blocks!
@@ -4168,6 +4417,20 @@ void ink_cuda_attn_global_paged_batch(const float* Q, const uint64_t* page_k_ptr
                                       float* split_out, float* split_ml, float* out,
                                       int B, int n_head, int n_head_kv, int head_dim, int pos0, int rel_extent,
                                       KVQuantMode kv_mode, cudaStream_t stream) {
+    if (B <= 8 && use_flashdec(kv_mode, head_dim, n_head, n_head_kv)) {
+        // Query b at position pos0+b sees exactly the pages scalar decode would list at that position
+        // (the trailing page that only holds later batch tokens is dropped), so its split partition,
+        // chunking and FP32 summation order match scalar decode bit-for-bit -> lossless speculation.
+        const int last_page = (pos0 + B - 1) / INK_PAGE_TOKENS;
+        for (int b = 0; b < B; ++b) {
+            const int n_pages_b = n_pages - (last_page - (pos0 + b) / INK_PAGE_TOKENS);
+            launch_flashdec_one(Q + (size_t)b * n_head * head_dim, page_k_ptrs, page_v_ptrs, page_pos0, page_lens,
+                                (n_pages_b < 1 ? 1 : n_pages_b), rel_table + (size_t)b * n_head * rel_extent,
+                                sinks + (size_t)b * n_head, split_out, split_ml, out + (size_t)b * n_head * head_dim,
+                                n_head, n_head_kv, head_dim, pos0 + b, rel_extent, stream);
+        }
+        return;
+    }
     int max_sp = (B <= 8) ? 16 : ((B <= 64) ? 4 : 2);
     int cap_sp = 256 / B;
     if (cap_sp < 1) cap_sp = 1;

@@ -269,6 +269,10 @@ void ink_cuda_attn_swa(
     KVQuantMode kv_mode,
     cudaStream_t stream);
 
+// v4.2: select the global-attention decode kernel: 0 = flash-decoding (default for Q4_0), 1 = v4.0 kernel.
+// Default comes from env INK_ATTN_V1=1 (forces the v4.0 kernel); tests call this directly.
+void ink_cuda_set_attn_impl(int impl);
+
 void ink_cuda_attn_global_paged(
     const float* Q,
     const uint64_t* page_k_ptrs,

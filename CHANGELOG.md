@@ -1,3 +1,19 @@
+# Changelog / PR Notes — InkEngine v4.2 addendum: flash-decoding global attention
+
+### Flash-decoding global attention kernel (`src/cuda_kernels.cu`)
+- **Problem**: The v4.0 global-attention decode kernel processed one cached token at a time per warp (three 32-lane shuffle reductions plus a serial online-softmax update per token, byte-wise Q4_0 loads). At 57K context it ran at ~61 GB/s, ~22% of the RTX 4060's bandwidth, about 1.1 ms per global layer.
+- **Fix**: `k_attn_global_flashdec_q4` (Q4_0 KV, head_dim 128, GQA 3) processes 128-token chunks: one thread per token computes all 3 head scores from 8-byte K loads; one warp per head does the chunk softmax update; 16 threads per token accumulate P x V from 4-byte V loads, 8 tokens in flight, with one cross-group reduction at the end. Other KV formats and `INK_ATTN_V1=1` use the v4.0 kernel.
+- Speculative-verify batches (B <= 8) run each query through the same single-query kernel over the same pages and split, so verify and scalar decode attention are **bit-identical** (12/12 cases in the kernel test).
+- **Measured** (standalone kernel test, 900 random Q4_0 pages): 1.10 ms -> 0.40 ms per layer at 57K tokens (**2.7x**, 164 GB/s); 2.5-2.8x from 1K tokens up; max relative difference vs v4.0 <= 7.2e-7.
+- **Measured** (`--bench 64 --profile`): 57K context **24.26 -> 27.27 tok/s (+12.4%)**, attention 17.4 -> 12.1 ms/token; 4K context unchanged.
+- **Measured** (real-session replay, contexts 1.7K-58K): decode 26.10 -> 26.59 tok/s (+1.9%, within noise; most checkpoints are under 40K where attention is a small share). The 58K checkpoint's scalar step fell 45.8 -> 39.5 ms/token. Gains grow with context.
+
+### Parity
+- Gate 2 (spec ON vs OFF) now forces full drafting (`spec_cost_model=false`) so it exercises verification deterministically; 3/3 runs exact (74-80 drafts).
+- Gate 1A (B=7 vs B=1 at the SWA wrap) is flaky independent of this change (cos 0.83-0.9998 across runs; also fails with `INK_ATTN_V1=1`). Pre-existing; likely expert-placement nondeterminism.
+
+---
+
 # Changelog / PR Notes — InkEngine v4.2 (effort `high`, thinking budget, cost-aware speculation, Coda prefetch probe)
 
 > **Suggested PR Title:** `v4.2: Default effort high, thinking budget (R2-04), cost-aware speculative drafting (R2-07), Coda expert-prefetch probe (R2-09, measured: not worth it)`

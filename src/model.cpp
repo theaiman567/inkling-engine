@@ -2623,6 +2623,7 @@ InklingEngine::GenResult InklingEngine::generate(
     double spec_delta = 0.5;     // EMA marginal verify cost per draft, in scalar-token units (prior from v4.1 telemetry)
     int spec_declined = 0;       // consecutive declined drafting opportunities (probe every 24 to refresh q)
     auto choose_draft_len = [&](int L_idx, int avail) -> int {
+        if (!cfg_.spec_cost_model) return std::min(avail, SPEC_POS); // deterministic full drafting (parity tests)
         double best_ratio = 1.0, e = 1.0, p = 1.0;
         int best_k = 0;
         for (int k = 1; k <= avail && k <= SPEC_POS; ++k) {
@@ -3272,10 +3273,14 @@ bool InklingEngine::run_parity_suite() {
         kv_tokens_ = g2_pref;
         auto res_off = generate(toks, gsp, nullptr, false, true);
 
+        // Exercise the verify path on every n-gram match: the timing-based cost model would make the set of
+        // verified steps (and so this test) depend on wall-clock measurements.
         cfg_.use_speculative = true;
+        cfg_.spec_cost_model = false;
         kv_.restore_checkpoint(ckpt_g2, stream_);
         kv_tokens_ = g2_pref;
         auto res_on = generate(toks, gsp, nullptr, false, true);
+        cfg_.spec_cost_model = true;
 
         bool exact_spec = (res_off.tokens == res_on.tokens);
         int first_diff = -1;
